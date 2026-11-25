@@ -55,6 +55,12 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
   NanumGothicCoding fallback, so Korean/CJK text works without fonts
   installed (more with the `font-path` parameter), and has copy and paste
   shortcuts and clickable links.
+- **File transfer.** SFTP in SSH sessions and a shared drive in RDP
+  sessions, with guacd's parameters: drag files onto the session to upload
+  them, browse and download in the session menu's file panel. Large files
+  stream in pieces both ways, and Chrome and Edge write downloads straight
+  to disk; per-connection switches block either direction, and molcajeted
+  can limit the file size.
 - **Video mode.** molcajeted sends busy, colourful areas (video playback,
   animations, 3D) as a video stream, encoded by hardware encoders through
   `ffmpeg` (NVENC, QSV, VA-API, AMF), VideoToolbox on macOS, or software
@@ -126,8 +132,9 @@ For containers, Kubernetes and running molcajeted natively on macOS, see
 
 ## In a session
 
-Press **Ctrl+Alt+Shift** for the menu (clipboard, scaling, Ctrl+Alt+Del,
-performance statistics, disconnect). Append `?main` to the URL to run the
+Press **Ctrl+Alt+Shift** for the menu (files, clipboard, scaling,
+Ctrl+Alt+Del, performance statistics, disconnect). Drop files on the
+session to upload them when the connection has SFTP or a drive. Append `?main` to the URL to run the
 client on the main thread instead of a worker, `?text` to keep the tunnel on
 the Guacamole text protocol (base64), and `?png` to receive lossless updates
 as PNG instead of zstd images.
@@ -174,6 +181,12 @@ session.set_event_handler((type, detail) => console.log(type, detail));
 // `ticket` from the server; it chooses the connection, so the second argument is ignored.
 const url = session.tunnel_url("wss://molcajete.example.com/websocket-tunnel", "office-pc");
 session.connect(`${url}&ticket=${encodeURIComponent(ticket)}`);
+
+// File transfer: `filesystem` events announce what can be browsed.
+const entries = await session.list(filesystem.object, "/");
+session.upload(file, { object: filesystem.object, path: "/home/me/report.pdf" });
+await session.download(filesystem.object, "/home/me/data.csv"); // from a click
+// progress arrives as `transfer` events
 ```
 
 A tunnel opened with a ticket needs no cookie and may come from another
@@ -183,9 +196,9 @@ from the gateway's own origin.
 ## Documentation
 
 - [docs/administration.md](docs/administration.md): users and passwords,
-  roles, groups, connections, folders and grants, single sign-on, session
-  recordings, active sessions and the connection history, the audit log,
-  API tokens and one-time session links, the JSON API.
+  roles, groups, connections, file transfer, folders and grants, single
+  sign-on, session recordings, active sessions and the connection history,
+  the audit log, API tokens and one-time session links, the JSON API.
 - [docs/deployment.md](docs/deployment.md): images, Docker Compose,
   Kubernetes, molcajeted on macOS, the configuration reference, reverse
   proxies, upgrading.
@@ -209,6 +222,7 @@ cargo test --workspace                       # unit tests (protocol, gateway, gu
 scripts/build-web.sh                         # then: renderer pixel, keyboard/IME, binary tunnel and playback tests
 (cd tests/browser && npm install && npm test)
 (cd tests/browser && node video.test.mjs)    # video decoding (needs ffmpeg with libx264/libsvtav1)
+(cd tests/browser && node files.e2e.mjs)     # file transfer against a running gateway (see the file)
 scripts/fuzz.sh 60                           # each fuzz target for 60 s (needs nightly and cargo-fuzz)
 ```
 
