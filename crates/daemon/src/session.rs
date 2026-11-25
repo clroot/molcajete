@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use molcajete_protocol::video::VideoCodec;
@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::display::{Display, SyncReply};
 use crate::handshake::ClientInfo;
-use crate::io::{GuacReader, Output};
+use crate::io::{GuacReader, GuacWriter, Output};
 use crate::video::VideoEncoders;
 
 /// Input from the Guacamole client, already decoded.
@@ -236,6 +236,43 @@ pub fn send_clipboard(out: &mut Output, text: &str) {
 /// arrive as [`ClientEvent::Argv`]. Requires protocol version 1.3.0 or later.
 pub fn send_required(out: &mut Output, names: &[&str]) {
     *out += &InstructionBuilder::new("required").args(names).finish();
+}
+
+/// Sends `required` for `names` and waits until the client answered every
+/// one, keeping the connection alive with `nop`s. Other input is dropped.
+/// `None` if the client left.
+pub async fn ask_required(
+    inputs: &mut mpsc::Receiver<Input>,
+    decoder: &mut InputDecoder,
+    writer: &mut GuacWriter,
+    names: &[&str],
+) -> std::io::Result<Option<Vec<(String, String)>>> {
+    const KEEPALIVE: Duration = Duration::from_secs(5);
+    send_required(writer.buffer(), names);
+    writer.flush().await?;
+    let mut answers: Vec<(String, String)> = Vec::new();
+    let mut keepalive =
+        tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
+    while answers.len() < names.len() {
+        tokio::select! {
+            ins = inputs.recv() => {
+                let Some(ins) = ins else { return Ok(None) };
+                match decoder.decode(&ins, writer.buffer()) {
+                    Some(ClientEvent::Disconnect) => return Ok(None),
+                    Some(ClientEvent::Argv { name, value }) if names.contains(&name.as_str()) => {
+                        answers.retain(|(n, _)| *n != name);
+                        answers.push((name, value));
+                    }
+                    _ => {}
+                }
+            }
+            _ = keepalive.tick() => writer.push("3.nop;"),
+        }
+        if writer.pending() > 0 {
+            writer.flush().await?;
+        }
+    }
+    Ok(Some(answers))
 }
 
 /// Sets the connection name shown by the client.

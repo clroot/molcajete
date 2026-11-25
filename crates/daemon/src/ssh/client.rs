@@ -9,22 +9,21 @@ use russh::client::{self, Handle, KeyboardInteractiveAuthResponse, Msg};
 use russh::keys::ssh_key::public::KeyData;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{Channel, ChannelWriteHalf, Pty};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::settings::Settings;
+use crate::jump::{Chain, UpstreamError};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Rounds of keyboard-interactive prompts answered before giving up.
 const MAX_KEYBOARD_INTERACTIVE_ROUNDS: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    #[error("cannot reach {0}: {1}")]
-    Unreachable(String, std::io::Error),
+    #[error(transparent)]
+    Upstream(Box<UpstreamError>),
     #[error("timed out connecting to {0}")]
     Timeout(String),
     #[error("invalid host-key parameter: {0}")]
@@ -43,12 +42,18 @@ impl ConnectError {
     /// Guacamole status reported to the client.
     pub fn status(&self) -> Status {
         match self {
-            Self::Unreachable(..) => Status::UPSTREAM_NOT_FOUND,
+            Self::Upstream(err) => err.status(),
             Self::Timeout(_) => Status::UPSTREAM_TIMEOUT,
             Self::InvalidHostKey(_) => Status::CLIENT_BAD_REQUEST,
             Self::HostKeyMismatch | Self::Handshake(_) => Status::UPSTREAM_ERROR,
             Self::InvalidPrivateKey(_) | Self::AuthFailed => Status::CLIENT_UNAUTHORIZED,
         }
+    }
+}
+
+impl From<UpstreamError> for ConnectError {
+    fn from(err: UpstreamError) -> Self {
+        Self::Upstream(Box::new(err))
     }
 }
 
@@ -122,6 +127,13 @@ pub struct ClientHandler {
     host_keys: Option<HostKeys>,
 }
 
+impl ClientHandler {
+    /// Accepts the host keys in `host_keys`, or any key when `None`.
+    pub fn new(host_keys: Option<HostKeys>) -> Self {
+        Self { host_keys }
+    }
+}
+
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -147,8 +159,9 @@ impl client::Handler for ClientHandler {
 
 pub type SshHandle = Handle<ClientHandler>;
 
-/// Opens the TCP connection and performs the SSH handshake.
-pub async fn connect(settings: &Settings) -> Result<SshHandle, ConnectError> {
+/// Connects, directly or through the jump hosts, and performs the SSH
+/// handshake.
+pub async fn connect(settings: &Settings, jump: &Chain) -> Result<SshHandle, ConnectError> {
     let host_keys = settings
         .host_key
         .as_deref()
@@ -156,14 +169,7 @@ pub async fn connect(settings: &Settings) -> Result<SshHandle, ConnectError> {
         .transpose()
         .map_err(ConnectError::InvalidHostKey)?;
     let target = format!("{}:{}", settings.hostname, settings.port);
-    let stream = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        TcpStream::connect((settings.hostname.as_str(), settings.port)),
-    )
-    .await
-    .map_err(|_| ConnectError::Timeout(target.clone()))?
-    .map_err(|err| ConnectError::Unreachable(target.clone(), err))?;
-    let _ = stream.set_nodelay(true);
+    let stream = jump.connect(&settings.hostname, settings.port).await?;
 
     let config = client::Config {
         keepalive_interval: settings.server_alive_interval,
@@ -378,7 +384,7 @@ mod tests {
     fn error_statuses() {
         let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         assert_eq!(
-            ConnectError::Unreachable("h:22".into(), io).status(),
+            ConnectError::from(UpstreamError::Unreachable("h:22".into(), io)).status(),
             Status::UPSTREAM_NOT_FOUND
         );
         assert_eq!(

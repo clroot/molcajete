@@ -1,4 +1,4 @@
-//! Connection sequence: TCP, security negotiation, TLS upgrade, CredSSP and
+//! Connection sequence: TCP (or a channel through SSH jump hosts), security negotiation, TLS upgrade, CredSSP and
 //! the rest of the RDP connection sequence, driven by IronRDP's
 //! [`ClientConnector`].
 //!
@@ -22,18 +22,18 @@ use ironrdp_pdu::rdp::capability_sets::{
 use ironrdp_pdu::rdp::client_info::TimezoneInfo;
 use ironrdp_tokio::{NetworkClient, TokioFramed, Upgraded};
 use molcajete_protocol::Status;
-use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
 use super::audio::SoundSink;
 use super::clipboard::GuacClipboard;
 use super::settings::Settings;
 use super::tls;
+use crate::jump::{Chain, Upstream, UpstreamError};
 use crate::remote::{self, CountingStream};
 
 /// The upgraded (TLS) transport of an RDP connection.
 /// Bytes read from it count towards `molcajeted_remote_received_bytes_total`.
-pub type RdpStream = TlsStream<CountingStream<TcpStream>>;
+pub type RdpStream = TlsStream<CountingStream<Upstream>>;
 pub type RdpFramed = TokioFramed<RdpStream>;
 
 /// Client build number advertised to the server (FreeRDP's). Servers treat
@@ -41,18 +41,13 @@ pub type RdpFramed = TokioFramed<RdpStream>;
 /// client whose build is 419 or lower.
 const CLIENT_BUILD: u32 = 18363;
 
-const TCP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Upper bound for each half of the connection sequence.
 const SEQUENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    #[error("unable to reach {host}:{port}: {source}")]
-    Unreachable {
-        host: String,
-        port: u16,
-        source: io::Error,
-    },
+    #[error("unable to connect to the RDP server: {0}")]
+    Upstream(Box<UpstreamError>),
     #[error("timed out while connecting to the RDP server")]
     Timeout,
     #[error("TLS handshake failed: {0}")]
@@ -69,7 +64,7 @@ impl ConnectError {
     /// Guacamole status reported to the client.
     pub fn status(&self) -> Status {
         match self {
-            Self::Unreachable { .. } => Status::UPSTREAM_NOT_FOUND,
+            Self::Upstream(err) => err.status(),
             Self::Timeout => Status::UPSTREAM_TIMEOUT,
             Self::Authentication(_) => Status::CLIENT_UNAUTHORIZED,
             Self::Tls(_) | Self::Protocol(_) | Self::Unsupported(_) => Status::UPSTREAM_ERROR,
@@ -222,33 +217,19 @@ pub struct Negotiated {
     hostname: String,
 }
 
-/// Connects, negotiates the security protocol and upgrades to TLS. Sound is
-/// redirected to `sound` if given.
+/// Connects (through the jump hosts, if any), negotiates the security
+/// protocol and upgrades to TLS. Sound is redirected to `sound` if given.
 pub async fn begin(
     settings: &Settings,
+    jump: &Chain,
     sound: Option<&SoundSink>,
 ) -> Result<Negotiated, ConnectError> {
-    let tcp = tokio::time::timeout(
-        TCP_TIMEOUT,
-        TcpStream::connect((settings.hostname.as_str(), settings.port)),
-    )
-    .await
-    .map_err(|_| ConnectError::Timeout)?
-    .map_err(|source| ConnectError::Unreachable {
-        host: settings.hostname.clone(),
-        port: settings.port,
-        source,
-    })?;
-    let _ = tcp.set_nodelay(true);
-    let client_addr = tcp
-        .local_addr()
-        .map_err(|source| ConnectError::Unreachable {
-            host: settings.hostname.clone(),
-            port: settings.port,
-            source,
-        })?;
-
-    let tcp = CountingStream::new(tcp, remote::received_bytes("rdp"));
+    let upstream = jump
+        .connect(&settings.hostname, settings.port)
+        .await
+        .map_err(|err| ConnectError::Upstream(Box::new(err)))?;
+    let client_addr = upstream.local_addr();
+    let tcp = CountingStream::new(upstream, remote::received_bytes("rdp"));
 
     let mut connector = build_connector(settings, client_addr, sound);
     let mut framed = TokioFramed::new(tcp);
@@ -440,11 +421,10 @@ mod tests {
 
     #[test]
     fn errors_map_to_guacamole_statuses() {
-        let unreachable = ConnectError::Unreachable {
-            host: "h".into(),
-            port: 1,
-            source: io::Error::from(io::ErrorKind::ConnectionRefused),
-        };
+        let unreachable = ConnectError::Upstream(Box::new(UpstreamError::Unreachable(
+            "h:1".into(),
+            io::Error::from(io::ErrorKind::ConnectionRefused),
+        )));
         assert_eq!(unreachable.status(), Status::UPSTREAM_NOT_FOUND);
         let denied = ConnectError::from_connector(ConnectorError::new(
             "CredSSP",
@@ -469,7 +449,10 @@ mod tests {
         let mut s = settings();
         s.hostname = "127.0.0.1".into();
         s.port = port;
-        let error = begin(&s, None).await.err().expect("connection must fail");
+        let error = begin(&s, &Chain::default(), None)
+            .await
+            .err()
+            .expect("connection must fail");
         assert_eq!(error.status(), Status::UPSTREAM_NOT_FOUND, "{error}");
     }
 }

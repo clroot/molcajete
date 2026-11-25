@@ -59,6 +59,12 @@ where
     (options, handle)
 }
 
+/// Connects over TCP to the server at the options' address.
+async fn connect(options: &ConnectOptions) -> Result<(RfbReader, RfbWriter, ServerInfo), RfbError> {
+    let tcp = TcpStream::connect((options.host.as_str(), options.port)).await?;
+    super::connect(crate::jump::Upstream::Tcp(tcp), options).await
+}
+
 async fn timed<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(TIMEOUT, future)
         .await

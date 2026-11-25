@@ -17,7 +17,7 @@
 
 mod boxdraw;
 mod bridge;
-mod client;
+pub(crate) mod client;
 mod color;
 mod font;
 mod keys;
@@ -36,6 +36,7 @@ use tracing::{info, warn};
 use crate::display::{Display, ImageFormats, Pacing};
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
+use crate::jump::Chain;
 use crate::send_error;
 use crate::session::{self, ClientEvent, Input, InputDecoder};
 
@@ -55,6 +56,13 @@ pub async fn run(
     params: Params,
 ) -> anyhow::Result<()> {
     let mut settings = Settings::from_params(&params, &info);
+    let mut jump = match Chain::from_params(&params) {
+        Ok(jump) => jump,
+        Err(err) => {
+            send_error(&mut writer, &err, Status::CLIENT_BAD_REQUEST).await;
+            return Ok(());
+        }
+    };
 
     let font_options = FontOptions {
         name: settings.font_name.clone(),
@@ -84,6 +92,7 @@ pub async fn run(
     let result = async {
         if !obtain_credentials(
             &mut settings,
+            &mut jump,
             &info,
             &mut inputs,
             &mut decoder,
@@ -95,7 +104,7 @@ pub async fn run(
         {
             return Ok(());
         }
-        connect_and_run(settings, renderer, display, writer, inputs, decoder).await
+        connect_and_run(settings, &jump, renderer, display, writer, inputs, decoder).await
     }
     .await;
     client_task.abort();
@@ -110,10 +119,13 @@ fn paint_background(display: &mut Display, writer: &mut GuacWriter, background: 
     display.sync(writer.buffer());
 }
 
-/// Asks the client for a missing username and password (protocol 1.3+).
-/// Returns `false` when the client left or cannot provide them.
+/// Asks the client for a missing username and password, the target's and
+/// the jump hosts' (protocol 1.3+). Returns `false` when the client left or
+/// cannot provide them.
+#[allow(clippy::too_many_arguments)]
 async fn obtain_credentials(
     settings: &mut Settings,
+    jump: &mut Chain,
     info: &ClientInfo,
     inputs: &mut mpsc::Receiver<Input>,
     decoder: &mut InputDecoder,
@@ -128,6 +140,7 @@ async fn obtain_credentials(
     if settings.password.is_none() && settings.private_key.is_none() {
         missing.push("password");
     }
+    missing.extend(jump.missing());
     if missing.is_empty() {
         return Ok(true);
     }
@@ -153,7 +166,9 @@ async fn obtain_credentials(
                         match name.as_str() {
                             "username" => settings.username = Some(value),
                             "password" => settings.password = Some(value),
-                            _ => {}
+                            _ => {
+                                jump.set(&name, value);
+                            }
                         }
                         missing.retain(|m| *m != name);
                     }
@@ -177,6 +192,7 @@ async fn obtain_credentials(
 
 async fn connect_and_run(
     settings: Settings,
+    jump: &Chain,
     renderer: Renderer,
     display: Display,
     mut writer: GuacWriter,
@@ -191,7 +207,7 @@ async fn connect_and_run(
         passphrase: settings.passphrase.as_deref(),
     };
     let connecting = async {
-        let mut handle = client::connect(&settings).await?;
+        let mut handle = client::connect(&settings, jump).await?;
         client::authenticate(&mut handle, &credentials).await?;
         Ok::<_, client::ConnectError>(handle)
     };

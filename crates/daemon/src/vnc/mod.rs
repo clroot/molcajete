@@ -11,8 +11,9 @@ use tracing::{debug, info, warn};
 use crate::display::{Display, ImageFormats, Pacing};
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
+use crate::jump::Chain;
 use crate::send_error;
-use crate::session::{self, ClientEvent, InputDecoder};
+use crate::session::{self, ClientEvent, Input, InputDecoder};
 
 /// Connection parameters, named like guacd's VNC plugin so the same
 /// configuration works with both daemons.
@@ -87,7 +88,71 @@ pub async fn run(
         disable_resize: params.bool("disable-display-resize"),
     };
 
-    let (mut rfb_reader, mut rfb_writer, server) = match rfb::connect(&options).await {
+    let mut jump = match Chain::from_params(&params) {
+        Ok(jump) => jump,
+        Err(err) => {
+            send_error(&mut writer, &err, Status::CLIENT_BAD_REQUEST).await;
+            return Ok(());
+        }
+    };
+
+    let (mut inputs, client_task) = session::spawn_reader(reader);
+    let mut decoder = InputDecoder::default();
+    let result = async {
+        let missing = jump.missing();
+        if !missing.is_empty() && info.version.supports_required() {
+            let asked = session::ask_required(&mut inputs, &mut decoder, &mut writer, &missing);
+            let Some(answers) = asked.await? else {
+                return Ok(());
+            };
+            for (name, value) in answers {
+                jump.set(&name, value);
+            }
+        }
+        run_session(
+            &jump,
+            options,
+            settings,
+            &info,
+            &params,
+            inputs,
+            decoder,
+            &mut writer,
+        )
+        .await
+    }
+    .await;
+    client_task.abort();
+    result
+}
+
+/// Connects (through the jump hosts, if any) and bridges the session.
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    jump: &Chain,
+    options: rfb::ConnectOptions,
+    settings: Settings,
+    info: &ClientInfo,
+    params: &Params,
+    mut inputs: mpsc::Receiver<Input>,
+    mut decoder: InputDecoder,
+    writer: &mut GuacWriter,
+) -> anyhow::Result<()> {
+    let (host, port) = (options.host.clone(), options.port);
+    let upstream = match jump.connect(&host, port).await {
+        Ok(upstream) => upstream,
+        Err(err) => {
+            warn!(%host, port, error = %err, "VNC connection failed");
+            send_error(
+                writer,
+                &format!("Unable to connect to VNC server: {err}"),
+                err.status(),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let (mut rfb_reader, mut rfb_writer, server) = match rfb::connect(upstream, &options).await {
         Ok(v) => v,
         Err(err) => {
             warn!(%host, port, error = %err, "VNC connection failed");
@@ -97,7 +162,7 @@ pub async fn run(
                 _ => Status::UPSTREAM_ERROR,
             };
             send_error(
-                &mut writer,
+                writer,
                 &format!("Unable to connect to VNC server: {err}"),
                 status,
             )
@@ -113,7 +178,7 @@ pub async fn run(
     )
     .with_protocol("vnc")
     .with_pacing(Pacing::DESKTOP);
-    session::enable_video(&mut display, &info);
+    session::enable_video(&mut display, info);
     session::send_name(writer.buffer(), &server.name);
     display.resize(server.width as u32, server.height as u32, writer.buffer());
     writer.flush().await?;
@@ -132,9 +197,6 @@ pub async fn run(
             }
         }
     });
-    let (mut inputs, client_task) = session::spawn_reader(reader);
-    let mut decoder = InputDecoder::default();
-
     let mut want_update = false;
     let mut frame_pending = false;
     let frame_timer = tokio::time::sleep(Duration::from_secs(3600));
@@ -156,7 +218,7 @@ pub async fn run(
                     Some(Ok(event)) => event,
                     Some(Err(err)) => {
                         warn!(error = %err, "VNC connection lost");
-                        send_error(&mut writer, "VNC connection lost", Status::UPSTREAM_ERROR).await;
+                        send_error(writer, "VNC connection lost", Status::UPSTREAM_ERROR).await;
                         break Ok(());
                     }
                     None => break Ok(()),
@@ -189,7 +251,7 @@ pub async fn run(
                         frame_pending = true;
                         let due = display.next_frame_at();
                         if tokio::time::Instant::now() >= due.into() {
-                            send_frame(&mut display, &mut writer).await?;
+                            send_frame(&mut display, writer).await?;
                             frame_pending = false;
                         } else {
                             frame_timer.as_mut().reset(due.into());
@@ -254,11 +316,11 @@ pub async fn run(
                 }
             }
             _ = &mut frame_timer, if frame_pending => {
-                send_frame(&mut display, &mut writer).await?;
+                send_frame(&mut display, writer).await?;
                 frame_pending = false;
             }
             _ = idle_wait, if idle_at.is_some() && !frame_pending => {
-                send_frame(&mut display, &mut writer).await?;
+                send_frame(&mut display, writer).await?;
             }
             _ = keepalive.tick() => {
                 // A stalled client must not stall the session forever.
@@ -275,7 +337,6 @@ pub async fn run(
     writer.push("10.disconnect;");
     let _ = writer.flush().await;
     rfb_task.abort();
-    client_task.abort();
     result
 }
 

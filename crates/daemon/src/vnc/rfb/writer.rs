@@ -3,7 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::OwnedWriteHalf;
+
+use crate::jump::UpstreamWriter;
 
 use super::{RfbError, SharedState, lock_shared, pixel};
 
@@ -17,12 +18,12 @@ const SET_DESKTOP_SIZE: u8 = 251;
 
 /// Write half of an RFB connection.
 pub struct RfbWriter {
-    output: OwnedWriteHalf,
+    output: UpstreamWriter,
     shared: Arc<Mutex<SharedState>>,
 }
 
 impl RfbWriter {
-    pub(super) fn new(output: OwnedWriteHalf, shared: Arc<Mutex<SharedState>>) -> Self {
+    pub(super) fn new(output: UpstreamWriter, shared: Arc<Mutex<SharedState>>) -> Self {
         Self { output, shared }
     }
 

@@ -32,6 +32,7 @@ use self::connect::ConnectError;
 use self::settings::Settings;
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
+use crate::jump::Chain;
 use crate::send_error;
 use crate::session::{self, ClientEvent, Input, InputDecoder};
 
@@ -50,6 +51,13 @@ pub async fn run(
             return Ok(());
         }
     };
+    let mut jump = match Chain::from_params(&params) {
+        Ok(jump) => jump,
+        Err(err) => {
+            send_error(&mut writer, &err, Status::CLIENT_BAD_REQUEST).await;
+            return Ok(());
+        }
+    };
     let (mut inputs, client_task) = session::spawn_reader(reader);
     let mut client = Client {
         inputs: &mut inputs,
@@ -57,7 +65,7 @@ pub async fn run(
         writer: &mut writer,
         early: EarlyInput::default(),
     };
-    connect_and_run(&settings, &info, &mut client).await;
+    connect_and_run(&settings, &mut jump, &info, &mut client).await;
     writer.push("10.disconnect;");
     let _ = writer.flush().await;
     client_task.abort();
@@ -136,11 +144,26 @@ impl Client<'_> {
     }
 }
 
-async fn connect_and_run(settings: &Settings, info: &ClientInfo, client: &mut Client<'_>) {
+async fn connect_and_run(
+    settings: &Settings,
+    jump: &mut Chain,
+    info: &ClientInfo,
+    client: &mut Client<'_>,
+) {
+    let missing = jump.missing();
+    if !missing.is_empty() && info.version.supports_required() {
+        let Some(answers) = client.ask(&missing).await else {
+            return;
+        };
+        for (name, value) in answers {
+            jump.set(&name, value);
+        }
+    }
     info!(
         host = %settings.hostname,
         port = settings.port,
         security = ?settings.security,
+        jump_hosts = jump.hops().len(),
         "connecting to RDP server"
     );
     let (sound, audio) = match settings.audio {
@@ -151,7 +174,7 @@ async fn connect_and_run(settings: &Settings, info: &ClientInfo, client: &mut Cl
         None => (None, None),
     };
     let mut negotiated = match client
-        .alongside(connect::begin(settings, sound.as_ref()))
+        .alongside(connect::begin(settings, jump, sound.as_ref()))
         .await
     {
         None => return,
