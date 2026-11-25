@@ -197,7 +197,15 @@ fn build_connector(
         .with_static_channel(drdynvc)
         .with_static_channel(ironrdp_cliprdr::Cliprdr::new(Box::new(clipboard)));
     match sound {
-        Some(sound) => connector.with_static_channel(sound.static_channel()),
+        // Windows only starts RDPSND once the device redirection channel
+        // (RDPDR) has completed its capability exchange, even with no
+        // devices to redirect.
+        Some(sound) => connector
+            .with_static_channel(ironrdp_rdpdr::Rdpdr::new(
+                Box::new(ironrdp_rdpdr::NoopRdpdrBackend),
+                "molcajete".to_owned(),
+            ))
+            .with_static_channel(sound.static_channel()),
         None => connector,
     }
 }
@@ -377,10 +385,16 @@ mod tests {
             ironrdp_connector::ClientConnectorState::ConnectionInitiationSendRequest
         ));
         assert!(!connector.config.enable_audio_playback);
+        assert!(
+            connector
+                .static_channels
+                .get_by_type::<ironrdp_rdpdr::Rdpdr>()
+                .is_none()
+        );
     }
 
     #[test]
-    fn audio_joins_the_rdpsnd_channel() {
+    fn audio_joins_the_rdpsnd_and_rdpdr_channels() {
         let mut s = settings();
         s.audio = Some(AudioEncoding::L16);
         let (sink, _output) = crate::rdp::audio::output(AudioEncoding::L16);
@@ -390,6 +404,13 @@ mod tests {
             connector
                 .static_channels
                 .get_by_type::<ironrdp_rdpsnd::client::Rdpsnd>()
+                .is_some()
+        );
+        // Without RDPDR, Windows never opens the audio channels.
+        assert!(
+            connector
+                .static_channels
+                .get_by_type::<ironrdp_rdpdr::Rdpdr>()
                 .is_some()
         );
     }

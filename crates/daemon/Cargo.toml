@@ -56,3 +56,4 @@ ironrdp-rdpsnd = "0.11"
 # Built-in H.264 encoder, enabled with `--features openh264`. OpenH264 is
 # compiled from source and needs a C++ compiler (`c++`, or `CXX=...`).
 openh264 = { version = "0.9", optional = true }
+ironrdp-rdpdr = "0.9"
