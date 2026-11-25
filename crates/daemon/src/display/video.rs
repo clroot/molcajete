@@ -38,6 +38,10 @@ pub(super) const VIDEO_STREAM: i32 = 101;
 pub(super) const MOTION_HOT: f32 = 8.0;
 /// Smallest busy area worth a video stream, in tiles (≈ 25k pixels).
 const MIN_TILES: usize = 6;
+/// Shortest side of a video. A strip (a taskbar animation, a progress bar)
+/// is cheap as images, and hardware encoders refuse frames this flat:
+/// VideoToolbox fails on 1216×96.
+const MIN_SIDE: u32 = 3 * TILE;
 /// Busy tiles must cover at least this share of their bounding box.
 const MIN_DENSITY: f32 = 0.5;
 /// Areas with fewer distinct colours (text, UI) are left to the lossless
@@ -266,6 +270,9 @@ impl Display {
         let (rect, count) = self.busy_area()?;
         let tiles = (rect.w.div_ceil(TILE) * rect.h.div_ceil(TILE)) as usize;
         if count < MIN_TILES || (count as f32) < MIN_DENSITY * tiles as f32 {
+            return None;
+        }
+        if rect.w < MIN_SIDE || rect.h < MIN_SIDE {
             return None;
         }
         (self.sampled_colors(&rect) > MIN_COLORS).then_some(rect)
@@ -781,6 +788,22 @@ mod tests {
             display.put(100, 70, 300, 200, &data);
             display.flush(&mut out);
             display.sync(&mut out);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(display.video.is_none());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_strip_stays_images() {
+        let (mut display, log) = display_with_video();
+        for frame in 0..30u32 {
+            let mut out = Output::text();
+            // Eight tiles wide, less than two high: a taskbar animation.
+            display.put(64, 320, 512, 96, &noise(frame, 512, 96));
+            display.flush(&mut out);
+            display.sync(&mut out);
+            assert!(!out.contains("5.video"), "frame {frame}: {out}");
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(display.video.is_none());
