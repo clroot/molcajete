@@ -7,12 +7,18 @@
 //! gateway -> guacd : connect,VERSION_1_5_0,<values...>;
 //! guacd -> gateway : ready,<connection id>;
 //! ```
+//!
+//! molcajeted lists one more parameter in `args`,
+//! [`molcajete_protocol::binary::HANDSHAKE_ARG`]. When the browser takes raw
+//! stream data, the gateway answers it with the framing version and
+//! molcajeted sends records after `ready` instead of text. Stock guacd does
+//! not list the parameter and is never asked.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use molcajete_protocol::{
-    Instruction, InstructionBuilder, Limits, Parser, ProtocolVersion, Status,
+    Instruction, InstructionBuilder, Limits, Parser, ProtocolVersion, Status, binary,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -84,16 +90,24 @@ pub struct GuacdSession {
     /// Connection ID assigned by guacd (usable for joining via `select`).
     pub id: String,
     pub version: ProtocolVersion,
+    /// The daemon agreed to send binary records
+    /// (`molcajete_protocol::binary`) from here on. The bytes left in
+    /// `parser` are then the start of the first records.
+    pub binary: bool,
 }
 
+/// Connects and performs the handshake. With `want_binary`, a daemon that
+/// offers binary records is asked for them (see [`GuacdSession::binary`]).
 pub async fn connect(
     addr: (&str, u16),
     select: &str,
     parameters: &BTreeMap<String, String>,
     info: &ClientInfo,
+    want_binary: bool,
     timeout: Duration,
 ) -> Result<GuacdSession, HandshakeError> {
-    match tokio::time::timeout(timeout, connect_inner(addr, select, parameters, info)).await {
+    let handshake = connect_inner(addr, select, parameters, info, want_binary);
+    match tokio::time::timeout(timeout, handshake).await {
         Ok(result) => result,
         Err(_) => Err(HandshakeError::Timeout),
     }
@@ -104,6 +118,7 @@ async fn connect_inner(
     select: &str,
     parameters: &BTreeMap<String, String>,
     info: &ClientInfo,
+    want_binary: bool,
 ) -> Result<GuacdSession, HandshakeError> {
     let mut stream = TcpStream::connect(addr)
         .await
@@ -127,12 +142,25 @@ async fn connect_inner(
     // support.
     let mut version = ProtocolVersion::V1_0_0;
     let mut values = Vec::with_capacity(args.args.len());
+    let mut binary = false;
     for (i, name) in args.args.iter().enumerate() {
         if i == 0
             && let Some(v) = ProtocolVersion::parse(name)
         {
             version = v.min(ProtocolVersion::LATEST);
             values.push(version.as_str().to_owned());
+            continue;
+        }
+        // The framing is the gateway's business alone: a connection
+        // parameter of that name is never passed on.
+        if name == binary::HANDSHAKE_ARG {
+            binary = want_binary;
+            let value = if binary {
+                binary::HANDSHAKE_VERSION
+            } else {
+                ""
+            };
+            values.push(value.to_owned());
             continue;
         }
         values.push(parameters.get(name).cloned().unwrap_or_default());
@@ -172,6 +200,7 @@ async fn connect_inner(
         parser,
         id,
         version,
+        binary,
     })
 }
 
@@ -279,12 +308,16 @@ mod tests {
             "vnc",
             &params,
             &info,
+            // Stock guacd does not offer binary records, so asking changes
+            // nothing.
+            true,
             Duration::from_secs(5),
         )
         .await
         .unwrap();
         assert_eq!(session.id, "$abcd");
         assert_eq!(session.version, ProtocolVersion::V1_5_0);
+        assert!(!session.binary);
         let trailing = session.parser.next_instruction().unwrap().unwrap();
         assert_eq!(trailing, Instruction::new("size", ["0", "80", "24"]));
 
@@ -298,6 +331,39 @@ mod tests {
         );
         let connect = received.last().unwrap();
         assert_eq!(connect.args, ["VERSION_1_5_0", "example", "5900", ""]);
+    }
+
+    #[tokio::test]
+    async fn asks_molcajeted_for_binary_records_only_when_wanted() {
+        // A connection parameter of the same name must not decide.
+        let mut params = BTreeMap::new();
+        params.insert("hostname".to_string(), "example".to_string());
+        params.insert(binary::HANDSHAKE_ARG.to_string(), "1".to_string());
+        for (want_binary, value) in [(true, "1"), (false, "")] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(fake_guacd(
+                listener,
+                "4.args,13.VERSION_1_5_0,8.hostname,16.molcajete-binary;",
+                // Followed by the start of a record.
+                "5.ready,5.$abcd;\0\x06\0\0",
+            ));
+            let session = connect(
+                ("127.0.0.1", port),
+                "vnc",
+                &params,
+                &ClientInfo::default(),
+                want_binary,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(session.binary, want_binary);
+            assert_eq!(session.parser.pending(), b"\0\x06\0\0");
+            let received = server.await.unwrap();
+            let connect = received.last().unwrap();
+            assert_eq!(connect.args, ["VERSION_1_5_0", "example", value]);
+        }
     }
 
     #[tokio::test]
@@ -317,6 +383,7 @@ mod tests {
             "nope",
             &BTreeMap::new(),
             &ClientInfo::default(),
+            false,
             Duration::from_secs(5),
         )
         .await
@@ -337,6 +404,7 @@ mod tests {
             "vnc",
             &BTreeMap::new(),
             &ClientInfo::default(),
+            false,
             Duration::from_secs(5),
         )
         .await

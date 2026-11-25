@@ -70,6 +70,29 @@ pub struct VideoFrame {
     pub payload: Vec<u8>,
 }
 
+/// The header in front of every frame's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+    /// Length of the payload that follows.
+    pub len: usize,
+    pub timestamp_ms: u32,
+    pub key: bool,
+}
+
+impl FrameHeader {
+    pub fn parse(header: &[u8; FRAME_HEADER_LEN]) -> Result<Self, &'static str> {
+        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        if len > FrameReader::MAX_FRAME_LEN {
+            return Err("video frame too large");
+        }
+        Ok(Self {
+            len,
+            timestamp_ms: u32::from_be_bytes([header[4], header[5], header[6], header[7]]),
+            key: header[8] & 1 != 0,
+        })
+    }
+}
+
 /// Reassembles frames from stream data arriving in arbitrary pieces.
 #[derive(Default)]
 pub struct FrameReader {
@@ -84,21 +107,29 @@ impl FrameReader {
         self.buf.extend_from_slice(data);
     }
 
+    /// No part of a frame is buffered: the next byte pushed starts a frame
+    /// header.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     /// Next complete frame, `Ok(None)` if more data is needed, `Err` if the
     /// stream is corrupt.
     pub fn next_frame(&mut self) -> Result<Option<VideoFrame>, &'static str> {
         if self.buf.len() < FRAME_HEADER_LEN {
             return Ok(None);
         }
-        let len = u32::from_be_bytes(self.buf[0..4].try_into().expect("4 bytes")) as usize;
-        if len > Self::MAX_FRAME_LEN {
-            return Err("video frame too large");
-        }
+        let header: &[u8; FRAME_HEADER_LEN] = self.buf[..FRAME_HEADER_LEN]
+            .try_into()
+            .expect("header length");
+        let FrameHeader {
+            len,
+            timestamp_ms,
+            key,
+        } = FrameHeader::parse(header)?;
         if self.buf.len() < FRAME_HEADER_LEN + len {
             return Ok(None);
         }
-        let timestamp_ms = u32::from_be_bytes(self.buf[4..8].try_into().expect("4 bytes"));
-        let key = self.buf[8] & 1 != 0;
         let payload = self.buf[FRAME_HEADER_LEN..FRAME_HEADER_LEN + len].to_vec();
         self.buf.drain(..FRAME_HEADER_LEN + len);
         Ok(Some(VideoFrame {

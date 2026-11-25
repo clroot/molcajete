@@ -173,21 +173,21 @@ fn text_row(width: u32, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-fn setup(w: u32, h: u32) -> (Display, Client, String) {
+fn setup(w: u32, h: u32) -> (Display, Client, Output) {
     let mut d = Display::new(ImageFormats { jpeg: false }, true);
-    let mut out = String::new();
+    let mut out = Output::text();
     d.resize(w, h, &mut out);
     let mut c = Client::new();
     c.apply(&out);
-    (d, c, String::new())
+    (d, c, Output::text())
 }
 
 fn flush_into(d: &mut Display, c: &mut Client) -> (FlushStats, String) {
-    let mut out = String::new();
+    let mut out = Output::text();
     let stats = d.flush(&mut out);
     c.apply(&out);
     assert!(c.pixels == d.pixels, "client diverged from the framebuffer");
-    (stats, out)
+    (stats, out.to_string())
 }
 
 #[test]
@@ -367,7 +367,7 @@ fn protocol_copy_with_pending_changes_stays_consistent() {
     flush_into(&mut d, &mut c);
     // Change the source but do not flush before the copy.
     d.put(0, 0, 32, 32, &text_row(32, 3).repeat(32));
-    let mut out = String::new();
+    let mut out = Output::text();
     d.copy(0, 0, 64, 64, 32, 32, &mut out);
     c.apply(&out);
     flush_into(&mut d, &mut c);
@@ -402,10 +402,91 @@ fn images_are_chunked_into_blobs() {
     assert!(ins.iter().all(|i| i.encode().len() < 8192 + 64));
 }
 
+/// The protocol text a binary output stands for: its instructions, with
+/// every blob record written as a `blob` instruction.
+fn records_as_text(out: &Output) -> String {
+    use molcajete_protocol::binary::{Record, records};
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut text = String::new();
+    for record in records(out.as_bytes()) {
+        match record.expect("valid records") {
+            Record::Instructions(part) => text += std::str::from_utf8(part).expect("UTF-8"),
+            Record::Blob { stream, data } => {
+                text += &InstructionBuilder::new("blob")
+                    .arg(stream)
+                    .str_arg(&b64.encode(data))
+                    .finish();
+            }
+            Record::Unknown { tag, .. } => panic!("unknown record {tag}"),
+        }
+    }
+    text
+}
+
+#[test]
+fn binary_output_carries_the_same_frame_as_raw_bytes() {
+    let mut rng = Rng(99);
+    let noise: Vec<u8> = (0..300 * 300)
+        .flat_map(|_| {
+            let v = rng.next();
+            [v as u8, (v >> 8) as u8, (v >> 16) as u8, 255]
+        })
+        .collect();
+    // The same screen, flushed once as text and once as records.
+    let frame = |mut out: Output| {
+        let mut d = Display::new(ImageFormats { jpeg: false }, true);
+        d.resize(300, 300, &mut out);
+        d.put(0, 0, 300, 300, &noise);
+        let stats = d.flush(&mut out);
+        d.sync(&mut out);
+        (d, stats, out)
+    };
+    let (_, text_stats, text) = frame(Output::text());
+    let (d, stats, binary) = frame(Output::binary());
+    assert!(binary.is_binary() && !text.is_binary());
+    assert_eq!(stats.bytes, text_stats.bytes);
+
+    // What a client draws from the records is the framebuffer.
+    let mut c = Client::new();
+    c.apply(&records_as_text(&binary));
+    assert!(c.pixels == d.pixels, "client diverged from the framebuffer");
+
+    // Same instructions and the same image data as in text mode, but the
+    // data in one blob (it fits a record) instead of 6048-byte pieces, and
+    // without base64: about a quarter fewer bytes.
+    let split = |text: &str| {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut other = Vec::new();
+        let mut data = Vec::new();
+        let mut blobs = 0;
+        for ins in parse_all(text).unwrap() {
+            if ins.opcode == "blob" {
+                data.extend(b64.decode(ins.arg(1)).unwrap());
+                blobs += 1;
+            } else if ins.opcode != "sync" {
+                other.push(ins);
+            }
+        }
+        (other, data, blobs)
+    };
+    let (text_ins, text_data, text_blobs) = split(&text);
+    let (binary_ins, binary_data, binary_blobs) = split(&records_as_text(&binary));
+    assert_eq!(binary_ins, text_ins);
+    assert_eq!(binary_data, text_data);
+    assert_eq!(binary_data.len(), stats.bytes);
+    assert!(text_blobs > 1);
+    assert_eq!(binary_blobs, binary_data.len().div_ceil(64 * 1024 - 9));
+    assert!(
+        binary.len() * 100 < text.len() * 76,
+        "binary is 25% smaller"
+    );
+}
+
 #[test]
 fn busy_areas_go_lossy_then_get_refined() {
     let mut d = Display::new(ImageFormats { jpeg: true }, false);
-    let mut out = String::new();
+    let mut out = Output::text();
     d.resize(256, 256, &mut out);
     let mut rng = Rng(5);
     let mut mime = String::new();
@@ -501,7 +582,7 @@ fn fuzz_client_always_matches_framebuffer() {
                     let (rw, rh) = (1 + rng.below(w / 2), 1 + rng.below(h / 2));
                     let (sx, sy) = (rng.below(w - rw), rng.below(h - rh));
                     let (dx, dy) = (rng.below(w - rw), rng.below(h - rh));
-                    let mut out = String::new();
+                    let mut out = Output::text();
                     d.copy(sx, sy, dx, dy, rw, rh, &mut out);
                     c.apply(&out);
                 }
@@ -535,7 +616,7 @@ fn fuzz_client_always_matches_framebuffer() {
                 7 if step % 20 == 7 => {
                     w = 64 + rng.below(200);
                     h = 64 + rng.below(160);
-                    let mut out = String::new();
+                    let mut out = Output::text();
                     d.resize(w, h, &mut out);
                     c.apply(&out);
                 }

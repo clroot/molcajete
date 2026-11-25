@@ -110,8 +110,18 @@ async fn websocket_tunnel(
         },
         None => None,
     };
-    ws.protocols(["guacamole"])
-        .max_message_size(1 << 20)
+    // Our own client offers the binary subprotocol next to `guacamole`;
+    // the first one listed here that the client offered is selected.
+    let protocols: &[&'static str] = if state.config.server.binary_tunnel {
+        &[tunnel::BINARY_SUBPROTOCOL, tunnel::TEXT_SUBPROTOCOL]
+    } else {
+        &[tunnel::TEXT_SUBPROTOCOL]
+    };
+    let ws = ws.protocols(protocols.iter().copied());
+    request.binary = ws
+        .selected_protocol()
+        .is_some_and(|selected| selected.as_bytes() == tunnel::BINARY_SUBPROTOCOL.as_bytes());
+    ws.max_message_size(1 << 20)
         .on_upgrade(move |socket| tunnel::serve(socket, state, request, connection))
 }
 
@@ -314,10 +324,15 @@ mod tests {
     /// user (`bob-password`) and the connections `granted` (bob may open
     /// it) and `secret`.
     async fn app() -> TestApp {
+        app_with("").await
+    }
+
+    /// Like [`app`], with more configuration (starting inside `[server]`).
+    async fn app_with(extra: &str) -> TestApp {
         let web = tempfile::tempdir().unwrap();
         std::fs::write(web.path().join("index.html"), "<!doctype html>").unwrap();
         let toml = format!(
-            "[server]\nstatic_dir = {:?}\n\
+            "[server]\nstatic_dir = {:?}\n{extra}\n\
              [[users]]\nusername = \"admin\"\npassword = \"admin-password\"\n\
              [[connections]]\nid = \"granted\"\nprotocol = \"vnc\"\n\
              [[connections]]\nid = \"secret\"\nprotocol = \"ssh\"\n",
@@ -676,6 +691,304 @@ mod tests {
             panic!("expected close, got {message:?}");
         };
         assert_eq!(frame.reason.as_str(), "516");
+    }
+
+    /// What a fake guacd saw: the `connect` instruction and everything the
+    /// gateway sent after the handshake.
+    type GuacdSaw = (molcajete_protocol::Instruction, Vec<u8>);
+
+    /// A guacd that answers `select` with `args`, `connect` with `ready`
+    /// followed by `payload`, and then reads until the gateway hangs up.
+    async fn fake_guacd(
+        args: &'static str,
+        payload: Vec<u8>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<GuacdSaw>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut parser = molcajete_protocol::Parser::new();
+            let mut buf = [0u8; 4096];
+            let connect = 'handshake: loop {
+                while let Some(ins) = parser.next_instruction().unwrap() {
+                    match ins.opcode.as_str() {
+                        "select" => sock.write_all(args.as_bytes()).await.unwrap(),
+                        "connect" => break 'handshake ins,
+                        _ => {}
+                    }
+                }
+                let n = sock.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "gateway hung up during the handshake");
+                parser.feed(&buf[..n]);
+            };
+            // The first bytes arrive in the same segment as `ready`, cut in
+            // the middle of a record header or an instruction: the relay
+            // has to take them over from the handshake parser.
+            let (with_ready, payload) = payload.split_at(payload.len().min(7));
+            sock.write_all(&[b"5.ready,5.$abcd;".as_slice(), with_ready].concat())
+                .await
+                .unwrap();
+            // In pieces, so that records and instructions arrive split.
+            for piece in payload.chunks(1000) {
+                sock.write_all(piece).await.unwrap();
+                sock.flush().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            let mut after = parser.pending().to_vec();
+            let _ = sock.read_to_end(&mut after).await;
+            (connect, after)
+        });
+        (addr, task)
+    }
+
+    const STOCK_ARGS: &str = "4.args,13.VERSION_1_5_0,8.hostname,4.port;";
+    const MOLCAJETED_ARGS: &str = "4.args,13.VERSION_1_5_0,8.hostname,4.port,16.molcajete-binary;";
+
+    /// Data of an image stream that base64 would not survive as text: every
+    /// byte value, and enough of it for several messages.
+    fn image_data() -> Vec<u8> {
+        (0..200_000u32).map(|i| (i ^ (i >> 8)) as u8).collect()
+    }
+
+    const IMG: &str = "3.img,1.1,2.14,1.0,9.image/png,1.0,1.0;";
+    const END: &str = "3.end,1.1;4.sync,2.42;";
+
+    /// The frame of [`image_data`] as stock guacd sends it.
+    fn text_payload() -> String {
+        use base64::Engine as _;
+
+        let mut out = String::from(IMG);
+        for chunk in image_data().chunks(6048) {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
+            out += &molcajete_protocol::InstructionBuilder::new("blob")
+                .arg(1)
+                .str_arg(&b64)
+                .finish();
+        }
+        out + END
+    }
+
+    /// The same frame as molcajeted sends it to a gateway that asked.
+    fn record_payload() -> Vec<u8> {
+        let mut writer = molcajete_protocol::binary::RecordWriter::new();
+        writer.instructions(IMG.as_bytes());
+        writer.blob(1, &image_data());
+        writer.instructions(END.as_bytes());
+        writer.take()
+    }
+
+    struct TunnelRun {
+        /// The subprotocol the gateway selected.
+        selected: String,
+        /// `Sec-WebSocket-Extensions` of the response, if any.
+        extensions: Option<String>,
+        /// Text messages, concatenated.
+        text: String,
+        /// Binary messages, one entry each.
+        binary: Vec<Vec<u8>>,
+        guacd: GuacdSaw,
+    }
+
+    impl TunnelRun {
+        /// The text messages without the tunnel's own instructions (the
+        /// UUID and the ping reply, which may arrive anywhere in between).
+        fn relayed_text(&self) -> String {
+            let uuid_len = "0.,36.;".len() + 36;
+            assert!(self.text.starts_with("0.,36."), "{}", self.text);
+            self.text[uuid_len..].replace("0.,4.ping,1.7;", "")
+        }
+
+        /// Instruction text and stream data carried by the binary messages,
+        /// each of which must hold whole records.
+        fn records(&self) -> (String, Vec<u8>) {
+            use molcajete_protocol::binary::{Record, records};
+
+            let mut text = Vec::new();
+            let mut data = Vec::new();
+            for message in &self.binary {
+                for record in records(message) {
+                    match record.expect("whole records in every message") {
+                        Record::Instructions(part) => text.extend_from_slice(part),
+                        Record::Blob { stream, data: part } => {
+                            assert_eq!(stream, 1);
+                            data.extend_from_slice(part);
+                        }
+                        Record::Unknown { tag, .. } => panic!("unknown record {tag}"),
+                    }
+                }
+            }
+            (String::from_utf8(text).unwrap(), data)
+        }
+    }
+
+    /// Opens the tunnel of connection `granted` against a fake guacd, as a
+    /// client offering `offered`, and collects what arrives up to the
+    /// `sync` that ends the payload.
+    async fn run_tunnel(
+        server: &str,
+        offered: &str,
+        args: &'static str,
+        payload: Vec<u8>,
+    ) -> TunnelRun {
+        use futures_util::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let (guacd_addr, guacd) = fake_guacd(args, payload).await;
+        let app = app_with(&format!(
+            "{server}\n[guacd]\nhost = \"127.0.0.1\"\nport = {}\n",
+            guacd_addr.port()
+        ))
+        .await;
+        let bob = app.login("bob", "bob-password").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = router(app.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, service).await });
+
+        let mut request = format!("ws://{addr}/websocket-tunnel?connection=granted")
+            .into_client_request()
+            .unwrap();
+        let headers = request.headers_mut();
+        headers.insert("sec-websocket-protocol", offered.parse().unwrap());
+        // What browsers send; the gateway must not agree to compress.
+        headers.insert(
+            "sec-websocket-extensions",
+            "permessage-deflate; client_max_window_bits"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("cookie", bob.parse().unwrap());
+        let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+
+        // Client → server stays text in every mode; pings are answered by
+        // the gateway itself.
+        socket
+            .send(Message::Text("0.,4.ping,1.7;3.nop;".into()))
+            .await
+            .unwrap();
+
+        let mut text = String::new();
+        let mut binary = Vec::new();
+        let collect = async {
+            let (mut pinged, mut synced) = (false, false);
+            while !(pinged && synced) {
+                match socket.next().await.expect("tunnel stays open").unwrap() {
+                    Message::Text(message) => {
+                        pinged |= message.contains("0.,4.ping,1.7;");
+                        synced |= message.contains("4.sync,2.42;");
+                        text += message.as_str();
+                    }
+                    Message::Binary(message) => {
+                        synced |= message.ends_with(b"4.sync,2.42;");
+                        binary.push(message.to_vec());
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), collect)
+            .await
+            .expect("the whole payload arrives");
+        socket.close(None).await.unwrap();
+        drop(socket);
+        TunnelRun {
+            selected: header("sec-websocket-protocol").unwrap_or_default(),
+            extensions: header("sec-websocket-extensions"),
+            text,
+            binary,
+            guacd: guacd.await.unwrap(),
+        }
+    }
+
+    const BOTH: &str = "molcajete-binary-v1, guacamole";
+
+    /// The tunnel's own messages, which are text in every mode.
+    fn assert_internal_only(text: &str) {
+        let instructions = molcajete_protocol::parse_all(text).unwrap();
+        assert_eq!(instructions.len(), 2, "{text}");
+        assert!(instructions.iter().all(|i| i.opcode.is_empty()), "{text}");
+        assert_eq!(instructions[0].args[0].len(), 36);
+        assert_eq!(instructions[1].args, ["ping", "7"]);
+    }
+
+    #[tokio::test]
+    async fn binary_tunnel_forwards_records_of_molcajeted() {
+        let run = run_tunnel("", BOTH, MOLCAJETED_ARGS, record_payload()).await;
+        assert_eq!(run.selected, "molcajete-binary-v1");
+        assert_eq!(run.extensions, None);
+        assert_internal_only(&run.text);
+        assert_eq!(run.records(), (format!("{IMG}{END}"), image_data()));
+        // Bytes pass through unchanged, in bounded messages.
+        assert_eq!(run.binary.concat(), record_payload());
+        assert!(run.binary.iter().all(|m| m.len() <= 64 * 1024));
+        // The daemon was asked for records; the browser's input is relayed
+        // as text, without the ping.
+        assert_eq!(run.guacd.0.args, ["VERSION_1_5_0", "", "", "1"]);
+        assert_eq!(run.guacd.1, b"3.nop;");
+    }
+
+    #[tokio::test]
+    async fn binary_tunnel_decodes_blobs_of_stock_guacd() {
+        let run = run_tunnel("", BOTH, STOCK_ARGS, text_payload().into_bytes()).await;
+        assert_eq!(run.selected, "molcajete-binary-v1");
+        assert_eq!(run.extensions, None);
+        assert_internal_only(&run.text);
+        assert_eq!(run.records(), (format!("{IMG}{END}"), image_data()));
+        assert_eq!(run.guacd.0.args, ["VERSION_1_5_0", "", ""]);
+        assert_eq!(run.guacd.1, b"3.nop;");
+    }
+
+    #[tokio::test]
+    async fn stock_client_gets_text_from_molcajeted() {
+        // molcajeted answers an empty value with the text protocol.
+        let run = run_tunnel(
+            "",
+            "guacamole",
+            MOLCAJETED_ARGS,
+            text_payload().into_bytes(),
+        )
+        .await;
+        assert_eq!(run.selected, "guacamole");
+        assert_eq!(run.extensions, None);
+        assert!(run.binary.is_empty());
+        assert!(run.relayed_text() == text_payload(), "payload unchanged");
+        assert_eq!(run.guacd.0.args, ["VERSION_1_5_0", "", "", ""]);
+        assert_eq!(run.guacd.1, b"3.nop;");
+    }
+
+    #[tokio::test]
+    async fn stock_client_gets_text_from_stock_guacd() {
+        let run = run_tunnel("", "guacamole", STOCK_ARGS, text_payload().into_bytes()).await;
+        assert_eq!(run.selected, "guacamole");
+        assert_eq!(run.extensions, None);
+        assert!(run.binary.is_empty());
+        assert!(run.relayed_text() == text_payload(), "payload unchanged");
+        assert_eq!(run.guacd.0.args, ["VERSION_1_5_0", "", ""]);
+    }
+
+    #[tokio::test]
+    async fn binary_tunnel_can_be_turned_off() {
+        let run = run_tunnel(
+            "binary_tunnel = false",
+            BOTH,
+            MOLCAJETED_ARGS,
+            text_payload().into_bytes(),
+        )
+        .await;
+        assert_eq!(run.selected, "guacamole");
+        assert_eq!(run.extensions, None);
+        assert!(run.binary.is_empty());
+        assert!(run.relayed_text() == text_payload(), "payload unchanged");
+        assert_eq!(run.guacd.0.args, ["VERSION_1_5_0", "", "", ""]);
     }
 
     #[test]

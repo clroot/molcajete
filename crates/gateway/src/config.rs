@@ -83,6 +83,11 @@ pub struct ServerConfig {
     /// Where the default SQLite database lives.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Offer the `molcajete-binary-v1` WebSocket subprotocol (stream data
+    /// as raw bytes) to clients that ask for it. `false` keeps every
+    /// tunnel on the Guacamole text protocol.
+    #[serde(default = "default_true")]
+    pub binary_tunnel: bool,
 }
 
 impl Default for ServerConfig {
@@ -91,6 +96,7 @@ impl Default for ServerConfig {
             listen: default_listen(),
             static_dir: default_static_dir(),
             data_dir: default_data_dir(),
+            binary_tunnel: true,
         }
     }
 }
@@ -101,6 +107,10 @@ fn default_listen() -> SocketAddr {
 
 fn default_static_dir() -> PathBuf {
     PathBuf::from("web/dist")
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_data_dir() -> PathBuf {

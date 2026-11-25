@@ -97,7 +97,9 @@ function timezone() {
 export class MolcajeteSession {
   /**
    * @param {HTMLElement} container element the display is placed in
-   * @param {{worker?: boolean}} options `worker: false` forces main-thread mode
+   * @param {{worker?: boolean, binary?: boolean}} options `worker: false` forces
+   *   main-thread mode; `binary: false` keeps the tunnel on the Guacamole text
+   *   protocol instead of offering the gateway raw image, video and audio data
    */
   static async create(container, options = {}) {
     const useWorker = options.worker ?? supportsWorker();
@@ -105,6 +107,7 @@ export class MolcajeteSession {
     session.#video = await supportedVideo();
     if (useWorker) await session.#startWorker();
     else await session.#startMain();
+    if (options.binary === false) session.call("set_binary_tunnel", false);
     return session;
   }
 

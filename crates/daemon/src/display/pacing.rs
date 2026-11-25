@@ -253,10 +253,11 @@ mod tests {
     #[test]
     fn a_display_paces_by_its_profile() {
         use super::super::{Display, ImageFormats};
+        use crate::io::Output;
 
         let heavy_frame = |pacing| {
             let mut d = Display::new(ImageFormats { jpeg: false }, true).with_pacing(pacing);
-            let mut out = String::new();
+            let mut out = Output::text();
             d.frame_bytes = 100_000;
             d.sync(&mut out);
             let sent = Instant::now();

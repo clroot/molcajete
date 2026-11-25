@@ -214,7 +214,7 @@ fn ms(d: Duration) -> f64 {
 fn run(name: &str, mut step: impl FnMut(u32, &mut Desktop, &mut Display)) {
     let mut desktop = Desktop::new();
     let mut display = Display::new(ImageFormats { jpeg: true }, false);
-    let mut out = String::new();
+    let mut out = Output::text();
     display.resize(WIDTH, HEIGHT, &mut out);
     step(0, &mut desktop, &mut display);
     let full = Rect::new(0, 0, WIDTH, HEIGHT);
@@ -226,12 +226,14 @@ fn run(name: &str, mut step: impl FnMut(u32, &mut Desktop, &mut Display)) {
     let (png_before, png_time_before) = display.metrics.png_total();
     let mut times = Vec::new();
     let mut stats = FlushStats::default();
+    let mut wire = Wire::default();
     for frame in 1..=FRAMES {
         step(frame, &mut desktop, &mut display);
         out.clear();
         let started = Instant::now();
         stats.add(display.flush(&mut out));
         times.push(started.elapsed());
+        wire.add(&out);
         assert!(
             display.pixels == display.sent || !display.lossless,
             "mirror diverged"
@@ -257,6 +259,57 @@ fn run(name: &str, mut step: impl FnMut(u32, &mut Desktop, &mut Display)) {
     );
     // Images sent as JPEG stay lossy; everything else must match exactly.
     let _ = png - png_before;
+
+    // The same frames once more, written as binary records, to compare what
+    // goes over the tunnel (untimed).
+    let mut desktop = Desktop::new();
+    let mut display = Display::new(ImageFormats { jpeg: true }, false);
+    let mut out = Output::binary();
+    display.resize(WIDTH, HEIGHT, &mut out);
+    step(0, &mut desktop, &mut display);
+    desktop.update(&mut display, &full);
+    display.flush(&mut out);
+    let mut binary = Wire::default();
+    let mut binary_stats = FlushStats::default();
+    for frame in 1..=FRAMES {
+        step(frame, &mut desktop, &mut display);
+        out.clear();
+        binary_stats.add(display.flush(&mut out));
+        binary.add(&out);
+    }
+    println!(
+        "wire  {name:<8} text {:8.1} kB in {:6.1} blobs | binary {:8.1} kB in {:6.1} blobs per frame ({:+.1}%) | images {:.1} / {:.1} kB per frame",
+        wire.bytes as f64 / 1024.0 / n,
+        wire.blobs as f64 / n,
+        binary.bytes as f64 / 1024.0 / n,
+        binary.blobs as f64 / n,
+        (binary.bytes as f64 / wire.bytes as f64 - 1.0) * 100.0,
+        stats.bytes as f64 / 1024.0 / n,
+        binary_stats.bytes as f64 / 1024.0 / n,
+    );
+}
+
+/// What a series of frames puts on the tunnel.
+#[derive(Default)]
+struct Wire {
+    bytes: usize,
+    /// `blob` instructions or blob records.
+    blobs: usize,
+}
+
+impl Wire {
+    fn add(&mut self, out: &Output) {
+        use molcajete_protocol::binary::{Record, records};
+
+        self.bytes += out.len();
+        self.blobs += if out.is_binary() {
+            records(out.as_bytes())
+                .filter(|record| matches!(record, Ok(Record::Blob { .. })))
+                .count()
+        } else {
+            out.matches("4.blob,").count()
+        };
+    }
 }
 
 /// A large document window scrolls by a few lines per frame.

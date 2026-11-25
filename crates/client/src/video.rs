@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use molcajete_protocol::video::{FrameReader, VideoCodec};
+use molcajete_protocol::video::{FRAME_HEADER_LEN, FrameHeader, FrameReader, VideoCodec};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
@@ -162,34 +162,67 @@ impl VideoStream {
     pub fn push(&mut self, data: &[u8]) -> Result<Vec<ImageSlot>, String> {
         self.reader.push(data);
         let mut slots = Vec::new();
-        while let Some(frame) = self.reader.next_frame().map_err(str::to_owned)? {
-            let init = js_sys::Object::new();
-            set(
-                &init,
-                "type",
-                &(if frame.key { "key" } else { "delta" }).into(),
-            );
-            set(
-                &init,
-                "timestamp",
-                &(frame.timestamp_ms as f64 * 1000.0).into(),
-            );
-            set(
-                &init,
-                "data",
-                &js_sys::Uint8Array::from(frame.payload.as_slice()).into(),
-            );
-            let chunk = JsEncodedVideoChunk::new(&init).map_err(|e| format!("{e:?}"))?;
-            let slot = ImageSlot::pending();
-            self.pending.borrow_mut().push_back(slot.clone());
-            if let Err(err) = self.decoder.decode(chunk.unchecked_ref()) {
-                self.pending.borrow_mut().pop_back();
-                slot.finish(ImageState::Failed);
-                return Err(format!("{err:?}"));
+        self.drain_reader(&mut slots)?;
+        Ok(slots)
+    }
+
+    /// Like [`VideoStream::push`], for stream data that is a view of a
+    /// received message. Frames lying whole inside `data` go to the decoder
+    /// as views, without passing through wasm memory; only a frame that
+    /// continues in the next blob is copied and reassembled.
+    pub fn push_view(&mut self, data: &js_sys::Uint8Array) -> Result<Vec<ImageSlot>, String> {
+        const HEADER: u32 = FRAME_HEADER_LEN as u32;
+        let mut slots = Vec::new();
+        let total = data.length();
+        let mut offset = 0;
+        while self.reader.is_empty() && total - offset >= HEADER {
+            let mut header = [0u8; FRAME_HEADER_LEN];
+            data.subarray(offset, offset + HEADER).copy_to(&mut header);
+            let header = FrameHeader::parse(&header)?;
+            let end = u64::from(offset + HEADER) + header.len as u64;
+            if end > u64::from(total) {
+                break;
             }
-            slots.push(slot);
+            let payload = data.subarray(offset + HEADER, end as u32);
+            slots.push(self.decode_frame(header.timestamp_ms, header.key, &payload)?);
+            offset = end as u32;
+        }
+        if offset < total {
+            self.reader.push(&data.subarray(offset, total).to_vec());
+            self.drain_reader(&mut slots)?;
         }
         Ok(slots)
+    }
+
+    fn drain_reader(&mut self, slots: &mut Vec<ImageSlot>) -> Result<(), String> {
+        while let Some(frame) = self.reader.next_frame().map_err(str::to_owned)? {
+            let payload = js_sys::Uint8Array::from(frame.payload.as_slice());
+            slots.push(self.decode_frame(frame.timestamp_ms, frame.key, &payload)?);
+        }
+        Ok(())
+    }
+
+    /// Hands one encoded frame to the decoder. The returned slot receives
+    /// the decoded picture.
+    fn decode_frame(
+        &mut self,
+        timestamp_ms: u32,
+        key: bool,
+        payload: &js_sys::Uint8Array,
+    ) -> Result<ImageSlot, String> {
+        let init = js_sys::Object::new();
+        set(&init, "type", &(if key { "key" } else { "delta" }).into());
+        set(&init, "timestamp", &(timestamp_ms as f64 * 1000.0).into());
+        set(&init, "data", payload);
+        let chunk = JsEncodedVideoChunk::new(&init).map_err(|e| format!("{e:?}"))?;
+        let slot = ImageSlot::pending();
+        self.pending.borrow_mut().push_back(slot.clone());
+        if let Err(err) = self.decoder.decode(chunk.unchecked_ref()) {
+            self.pending.borrow_mut().pop_back();
+            slot.finish(ImageState::Failed);
+            return Err(format!("{err:?}"));
+        }
+        Ok(slot)
     }
 
     /// Ends the stream: frames still being decoded are delivered, then the

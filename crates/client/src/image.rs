@@ -69,10 +69,13 @@ fn number(obj: &JsValue, key: &str) -> u32 {
         .unwrap_or(0.0) as u32
 }
 
-async fn decode_with_image_decoder(bytes: &[u8], mimetype: &str) -> Result<JsValue, JsValue> {
+async fn decode_with_image_decoder(
+    data: &js_sys::Uint8Array,
+    mimetype: &str,
+) -> Result<JsValue, JsValue> {
     let init = js_sys::Object::new();
     set(&init, "type", &mimetype.into());
-    set(&init, "data", &js_sys::Uint8Array::from(bytes).into());
+    set(&init, "data", data);
     // Remote desktop pixels must not be colour managed.
     set(&init, "colorSpaceConversion", &"none".into());
     let decoder = ImageDecoder::new(&init)?;
@@ -81,8 +84,8 @@ async fn decode_with_image_decoder(bytes: &[u8], mimetype: &str) -> Result<JsVal
     js_sys::Reflect::get(&result?, &"image".into())
 }
 
-async fn decode_with_bitmap(bytes: &[u8], mimetype: &str) -> Result<JsValue, JsValue> {
-    let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+async fn decode_with_bitmap(data: &js_sys::Uint8Array, mimetype: &str) -> Result<JsValue, JsValue> {
+    let parts = js_sys::Array::of1(data);
     let bag = web_sys::BlobPropertyBag::new();
     bag.set_type(mimetype);
     let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &bag)?;
@@ -93,8 +96,16 @@ async fn decode_with_bitmap(bytes: &[u8], mimetype: &str) -> Result<JsValue, JsV
     wasm_bindgen_futures::JsFuture::from(promise).await
 }
 
+/// How much of the start of an image [`is_opaque`] needs at most to decide
+/// in practice: a PNG header with a full palette and its transparency chunk
+/// takes about 1.1 KiB.
+pub const OPACITY_PREFIX_BYTES: u32 = 2048;
+
 /// Whether an encoded image certainly has no transparency, judged from its
 /// header. Opaque images can be uploaded straight into a layer texture.
+/// `bytes` may be just the start of the image
+/// ([`OPACITY_PREFIX_BYTES`]); if the header does not fit, the image is
+/// taken to be transparent, which is always correct.
 pub fn is_opaque(bytes: &[u8], mimetype: &str) -> bool {
     match mimetype {
         "image/jpeg" => true,
@@ -142,11 +153,15 @@ fn webp_is_opaque(bytes: &[u8]) -> bool {
     }
 }
 
-/// Decodes a complete image.
-pub async fn decode(bytes: Vec<u8>, mimetype: String) -> Result<DecodedImage, JsValue> {
-    let opaque = is_opaque(&bytes, &mimetype);
+/// Decodes a complete image. `data` may be a view of a larger buffer (a
+/// received WebSocket message); `opaque` is what [`is_opaque`] said.
+pub async fn decode(
+    data: js_sys::Uint8Array,
+    mimetype: String,
+    opaque: bool,
+) -> Result<DecodedImage, JsValue> {
     if has_image_decoder() {
-        match decode_with_image_decoder(&bytes, &mimetype).await {
+        match decode_with_image_decoder(&data, &mimetype).await {
             Ok(frame) => {
                 return Ok(DecodedImage {
                     width: number(&frame, "displayWidth"),
@@ -160,7 +175,7 @@ pub async fn decode(bytes: Vec<u8>, mimetype: String) -> Result<DecodedImage, Js
             }
         }
     }
-    let bitmap = decode_with_bitmap(&bytes, &mimetype).await?;
+    let bitmap = decode_with_bitmap(&data, &mimetype).await?;
     Ok(DecodedImage {
         width: number(&bitmap, "width"),
         height: number(&bitmap, "height"),
@@ -197,6 +212,32 @@ mod tests {
         assert!(!is_opaque(&png(3, Some(b"tRNS")), "image/png"));
         assert!(!is_opaque(&png(6, None), "image/png"));
         assert!(!is_opaque(b"not a png at all, definitely not", "image/png"));
+    }
+
+    #[test]
+    fn png_opacity_from_a_prefix() {
+        // A full palette followed by transparency, then megabytes of data.
+        let mut v = png(3, None);
+        v.truncate(33);
+        v.extend_from_slice(&768u32.to_be_bytes());
+        v.extend_from_slice(b"PLTE");
+        v.extend_from_slice(&[0; 768 + 4]);
+        let palette_end = v.len();
+        v.extend_from_slice(&256u32.to_be_bytes());
+        v.extend_from_slice(b"tRNS");
+        v.extend_from_slice(&[0; 256 + 4]);
+        assert!(v.len() + 8 < OPACITY_PREFIX_BYTES as usize);
+        let mut opaque = v[..palette_end].to_vec();
+        for image in [&mut v, &mut opaque] {
+            image.extend_from_slice(&0u32.to_be_bytes());
+            image.extend_from_slice(b"IDAT");
+            image.resize(1 << 20, 0);
+        }
+        let prefix = OPACITY_PREFIX_BYTES as usize;
+        assert!(!is_opaque(&v[..prefix], "image/png"));
+        assert!(is_opaque(&opaque[..prefix], "image/png"));
+        // Cut before the first data chunk: not known to be opaque.
+        assert!(!is_opaque(&opaque[..palette_end], "image/png"));
     }
 
     #[test]

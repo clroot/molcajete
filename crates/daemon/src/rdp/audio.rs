@@ -18,17 +18,16 @@ use std::borrow::Cow;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use base64::Engine as _;
 use ironrdp_rdpsnd::client::{Rdpsnd, RdpsndClientHandler, RdpsndDvc, RdpsndDvcState};
 use ironrdp_rdpsnd::codec::AudioDecoder;
 use ironrdp_rdpsnd::pdu::{AudioFormat, PitchPdu, VolumePdu, WaveFormat};
 use molcajete_protocol::{InstructionBuilder, Status};
 use tracing::{debug, info, warn};
 
+use crate::io::Output;
+
 /// Guacamole stream index of the audio output stream.
 const AUDIO_STREAM: i32 = 128;
-/// Largest blob payload, in bytes (guacd's `GUAC_PROTOCOL_BLOB_MAX_LENGTH`).
-const MAX_BLOB: usize = 6048;
 /// Sample rates in order of preference; others rank after these.
 const PREFERRED_RATES: [u32; 3] = [44_100, 48_000, 22_050];
 /// Formats outside these bounds are not offered to the server.
@@ -267,7 +266,7 @@ pub struct AudioOutput {
 
 impl AudioOutput {
     /// Sends the audio received since the last call.
-    pub fn pump(&mut self, out: &mut String) {
+    pub fn pump(&mut self, out: &mut Output) {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 SoundEvent::Wave { format, data } => self.wave(&format, &data, out),
@@ -293,7 +292,7 @@ impl AudioOutput {
         true
     }
 
-    fn wave(&mut self, format: &AudioFormat, data: &[u8], out: &mut String) {
+    fn wave(&mut self, format: &AudioFormat, data: &[u8], out: &mut Output) {
         if self.refused {
             return;
         }
@@ -337,19 +336,11 @@ impl AudioOutput {
         self.bytes.clear();
         self.encoding.encode(&self.samples, &mut self.bytes);
         let frame = self.encoding.bytes_per_sample() * channels;
-        let mut b64 = String::new();
-        for chunk in self.bytes.chunks(MAX_BLOB - MAX_BLOB % frame) {
-            b64.clear();
-            base64::engine::general_purpose::STANDARD.encode_string(chunk, &mut b64);
-            *out += &InstructionBuilder::new("blob")
-                .arg(AUDIO_STREAM)
-                .str_arg(&b64)
-                .finish();
-        }
+        out.blob_aligned(AUDIO_STREAM, &self.bytes, frame);
     }
 
     /// Ends the open stream; the next wave data opens a new one.
-    fn end(&mut self, out: &mut String) {
+    fn end(&mut self, out: &mut Output) {
         if self.stream.take().is_some() {
             debug!("ending audio stream");
             *out += &InstructionBuilder::new("end").arg(AUDIO_STREAM).finish();
@@ -397,6 +388,7 @@ mod tests {
     }
 
     fn blob_bytes(ins: &Instruction) -> Vec<u8> {
+        use base64::Engine as _;
         base64::engine::general_purpose::STANDARD
             .decode(ins.arg(1))
             .unwrap()
@@ -461,7 +453,7 @@ mod tests {
         let stereo = format(WaveFormat::PCM, 44_100, 2, 16);
         let samples: Vec<i16> = (0..8000).map(|i| (i * 7) as i16).collect();
         play(&sink, &stereo, &pcm16_bytes(&samples));
-        let mut out = String::new();
+        let mut out = Output::text();
         output.pump(&mut out);
 
         let ins = instructions(&out);
@@ -471,7 +463,7 @@ mod tests {
         for blob in &ins[1..] {
             assert_eq!(blob.opcode, "blob");
             let bytes = blob_bytes(blob);
-            assert!(bytes.len() <= MAX_BLOB && bytes.len().is_multiple_of(4));
+            assert!(bytes.len() <= crate::io::BLOB_MAX_BYTES && bytes.len().is_multiple_of(4));
             received.extend(bytes);
         }
         assert_eq!(received, pcm16_bytes(&samples));
@@ -488,7 +480,7 @@ mod tests {
     #[test]
     fn format_changes_and_close_reopen_the_stream() {
         let (sink, mut output) = output(AudioEncoding::L16);
-        let mut out = String::new();
+        let mut out = Output::text();
         play(&sink, &format(WaveFormat::PCM, 44_100, 2, 16), &[0; 8]);
         play(&sink, &format(WaveFormat::PCM, 22_050, 1, 16), &[0; 8]);
         sink.handler().close();
@@ -518,7 +510,7 @@ mod tests {
     #[test]
     fn other_codecs_are_decoded_and_narrowed_for_l8_clients() {
         let (sink, mut output) = output(AudioEncoding::L8);
-        let mut out = String::new();
+        let mut out = Output::text();
         // 8-bit PCM is unsigned: 0x80 is silence, 0xFF the maximum.
         play(
             &sink,
@@ -544,7 +536,7 @@ mod tests {
     fn a_refused_stream_stops_the_audio() {
         let (sink, mut output) = output(AudioEncoding::L16);
         let stereo = format(WaveFormat::PCM, 44_100, 2, 16);
-        let mut out = String::new();
+        let mut out = Output::text();
         play(&sink, &stereo, &[0; 4]);
         output.pump(&mut out);
         assert!(output.ack(AUDIO_STREAM, Status::SUCCESS));
@@ -627,7 +619,7 @@ mod tests {
             [ClientAudioOutputPdu::WaveConfirm(c)] if c.block_no == 7 && c.timestamp >= 1000
         ));
 
-        let mut out = String::new();
+        let mut out = Output::text();
         output.pump(&mut out);
         let ins = instructions(&out);
         assert_eq!(ins[0].args[1], "audio/L16;rate=44100,channels=2");

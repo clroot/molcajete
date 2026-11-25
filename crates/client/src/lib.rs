@@ -136,6 +136,19 @@ mod wasm_api {
             self.inner.borrow().tunnel_url(base, connection)
         }
 
+        /// Whether to offer the gateway the binary tunnel subprotocol, in
+        /// which image, video and audio data arrives as raw bytes instead of
+        /// base64 (on by default; takes effect at the next `connect`).
+        pub fn set_binary_tunnel(&self, enabled: bool) {
+            self.run(|inner| inner.set_binary_tunnel(enabled));
+        }
+
+        /// The WebSocket subprotocol the gateway selected: `guacamole`
+        /// (text) or `molcajete-binary-v1`. Empty before the tunnel is open.
+        pub fn tunnel_protocol(&self) -> String {
+            self.inner.borrow().tunnel_protocol()
+        }
+
         /// Opens the tunnel at `url` (see [`MolcajeteClient::tunnel_url`]).
         pub fn connect(&self, url: &str) -> Result<(), JsValue> {
             let mut result = Ok(());
