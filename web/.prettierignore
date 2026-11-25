@@ -2,3 +2,4 @@ dist
 public
 bun.lock
 src/astryx-themes.js
+.claude
