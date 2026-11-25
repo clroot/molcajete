@@ -1,6 +1,6 @@
 // Pixel-level tests of the WebGL2 renderer.
 //
-// The wasm client is loaded from web/pkg into headless Chromium (SwiftShader),
+// The wasm client is loaded from web/public/pkg into headless Chromium (SwiftShader),
 // Guacamole instructions are fed directly (no server), and layer / canvas
 // pixels are read back and compared with the values the HTML-canvas based
 // reference client would produce.
@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const web = path.join(root, "web");
+const web = path.join(root, "web/public");
 
 function findChrome() {
   if (process.env.CHROME) return process.env.CHROME;
@@ -35,7 +35,7 @@ const page = await browser.newPage({ viewport: { width: 400, height: 300 } });
 page.on("pageerror", (e) => console.error("[pageerror]", e.message));
 page.on("console", (m) => m.type() === "error" && console.error("[console]", m.text()));
 
-// Serve web/ from a fake origin so no HTTP server is needed.
+// Serve web/public/ from a fake origin so no HTTP server is needed.
 await page.route("http://guac.test/**", async (route) => {
   const url = new URL(route.request().url());
   if (url.pathname === "/") {

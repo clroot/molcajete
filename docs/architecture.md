@@ -74,7 +74,8 @@ crates/
   molcajete-gateway    Rust web gateway: static files, connection list API, WebSocket ↔ guacd relay
   molcajete-daemon     Rust guacd (molcajeted): handshake, server-side display/encoding, video mode, VNC·SSH·RDP (+audio)
   molcajete-telemetry  logging, Prometheus metrics and CPU profiling for the gateway and molcajeted
-web/              UI shell (connection list, session view, Ctrl+Alt+Shift menu)
+web/              React + Astryx UI (login, connections, users, session view, Ctrl+Alt+Shift menu);
+                  public/ holds the wasm client glue (molcajete.js, worker, pkg/)
 tests/browser/    headless Chromium pixel tests
 docker/           test targets (guacd 1.6, X11+VNC, OpenSSH, xrdp+XFCE on 127.0.0.1:3390)
 deploy/           container deployment (Compose, Kubernetes, reverse proxy, Grafana), see deployment.md
@@ -98,11 +99,11 @@ Possible combinations:
 
 ### 2.2 molcajete-gateway
 
-- Built on axum. Serves `/api/connections`, `/websocket-tunnel` and the static files (`web/`).
+- Built on axum. Serves the JSON API (`/api/auth/*`, `/api/connections`, `/api/users`), `/websocket-tunnel` and the static files (`web/dist`).
 - After the WebSocket upgrade it performs the guacd handshake; on failure it closes with the status code in the close reason (like the Java web app).
 - guacd → browser: the bytes read are cut into instructions by the parser and batched into one message of up to 64 KiB, sent immediately when the next read would block.
 - browser → guacd: validated with `Limits::STRICT` and forwarded verbatim. Internal pings are answered directly.
-- Configuration: TOML (`gateway.example.toml`). Each connection may name its own guacd. `[[users]]` turns on HTTP Basic authentication.
+- Configuration: TOML (`gateway.example.toml`) for the server itself. Users, connections (each may name its own guacd), parameters, permissions and login sessions are stored in PostgreSQL, MySQL/MariaDB or SQLite through sqlx's `Any` driver, with per-dialect migrations in `crates/gateway/migrations/`, like Guacamole's JDBC authentication extensions. Passwords are Argon2id hashes; sessions are cookies whose SHA-256 is stored.
 
 ### 2.3 molcajete-client: GPU renderer design
 
@@ -112,7 +113,7 @@ Possible combinations:
 - applying the worker's `layout` (canvas CSS size) and `cursor` (RGBA → CSS cursor) events to the DOM
 - handling UI events
 
-`web/molcajete.js` (`MolcajeteSession`) and `web/molcajete-worker.js` split these roles. Browsers without OffscreenCanvas run the same wasm client on the main thread (`?main` forces this). The reason for the split is the measurement in section 3.1.
+`web/public/molcajete.js` (`MolcajeteSession`) and `web/public/molcajete-worker.js` split these roles. Browsers without OffscreenCanvas run the same wasm client on the main thread (`?main` forces this). The reason for the split is the measurement in section 3.1.
 
 **Layers are textures.** Each layer and buffer is an RGBA8 texture (premultiplied alpha) with its own FBO. Allocations are rounded up to 64 px like the original, and resizing moves the old contents with `blitFramebuffer`. Textures are stored top row first, so inside an FBO `gl_FragCoord.xy` is the layer pixel coordinate, and the Y axis is flipped only once, when compositing into the canvas.
 

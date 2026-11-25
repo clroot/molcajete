@@ -13,7 +13,7 @@ written in Rust and compiled to WebAssembly.
 |---|---|---|
 | `molcajete-protocol` | protocol code in libguac / guacamole-common / guacamole-common-js | complete: streaming parser, encoder, typed instructions, video framing |
 | `molcajete-client` (wasm) | `guacamole-common-js` (`Guacamole.Client`, `Display`, `Keyboard`, `Mouse`, …) | WebGL2 renderer, WebCodecs video, input, clipboard, audio |
-| `molcajete-gateway` | the Java web application's tunnel (`guacamole-common`) | WebSocket tunnel, static files, TOML connections, Basic auth |
+| `molcajete-gateway` | the Java web application's tunnel (`guacamole-common`) | WebSocket tunnel, web UI, users/connections/permissions in PostgreSQL, MySQL or SQLite |
 | `molcajete-daemon` (`molcajeted`) | `guacd` + libguac + protocol plugins | VNC, SSH, RDP (incl. audio); video mode (AV1/H.265/H.264) for busy areas |
 
 The gateway is wire-compatible with the stock `guacd`, and accepts the same
@@ -52,7 +52,7 @@ Guacamole and the design of each component.
 
 Requirements: Rust (stable) with the `wasm32-unknown-unknown` target,
 `wasm-bindgen-cli` matching the `wasm-bindgen` version in `Cargo.lock`,
-and Docker for the test targets.
+[bun](https://bun.sh) for the web UI, and Docker for the test targets.
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -62,12 +62,41 @@ cargo install wasm-bindgen-cli --version 0.2.130
 # xrdp desktop (published on 127.0.0.1:3390)
 docker compose -f docker/compose.yml up -d --build
 
-# Build the wasm client into web/pkg, then start the gateway
+# Build the wasm client and the web UI into web/dist, then start the gateway
 scripts/build-web.sh
 cp gateway.example.toml gateway.toml
 cargo run -p molcajete-gateway -- --config gateway.toml
-# open http://127.0.0.1:8080
+# open http://127.0.0.1:8080 and sign in as admin / change-me
 ```
+
+### Users and connections
+
+Like Guacamole's JDBC authentication, the gateway keeps users, connections,
+their parameters and permissions in a database, managed from the web UI
+(*Connections* and *Users*). Administrators see and manage everything; other
+users see only the connections granted to them.
+
+```toml
+[database]
+url = "postgres://molcajete:secret@db/molcajete"   # or mysql://… / mariadb://…
+```
+
+Without `[database]` (or `MOLCAJETE_DATABASE_URL`) the gateway uses SQLite in
+`server.data_dir` (`MOLCAJETE_DATA_DIR`, `/var/lib/molcajete` in the image).
+The schema is created and migrated on startup.
+
+`[[users]]` and `[[connections]]` in `gateway.toml` are imported once, when
+the name or id is not in the database yet. With no user at all, an `admin`
+account is created and its random password is logged. To recover access:
+
+```sh
+echo 'new-password' | molcajete-gateway --config gateway.toml set-password admin
+```
+
+The web UI (`web/`) is React with the [Astryx](https://astryx.atmeta.com)
+design system. For UI work, run `SKIP_UI=1 scripts/build-web.sh` once and
+`bun run dev` in `web/`; it proxies the API and the tunnel to a gateway on
+127.0.0.1:8080.
 
 To use the Rust daemon instead of the stock guacd for a connection, run
 `cargo run -p molcajete-daemon -- -l 4823` and point the connection at it:

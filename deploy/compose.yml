@@ -25,6 +25,8 @@ services:
       MOLCAJETE_CLIENT_REPORTS: "true"
     volumes:
       - ./gateway.local.toml:/etc/molcajete/gateway.toml:ro
+      # Users and connections (SQLite) survive container updates.
+      - gateway-data:/var/lib/molcajete
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:9100:9100"
@@ -42,3 +44,6 @@ services:
     ports:
       - "127.0.0.1:9101:9100"
     restart: unless-stopped
+
+volumes:
+  gateway-data:

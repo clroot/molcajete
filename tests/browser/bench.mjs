@@ -4,7 +4,7 @@
 //   GUAC_COMMON_JS=/path/to/guacamole-client/guacamole-common-js/src/main/webapp/modules \
 //   node bench.mjs [connection-id] [seconds] [rounds]
 //
-// Requirements: web/pkg built (scripts/build-web.sh), target/debug/molcajete-gateway
+// Requirements: web/public/pkg built (scripts/build-web.sh), target/debug/molcajete-gateway
 // or target/release/molcajete-gateway built, gateway.toml with the connection, and
 // something animating on the remote desktop (e.g. a scrolling terminal).
 // A temporary gateway is started on a free port with its own static dir.
@@ -39,7 +39,7 @@ const files = (await readdir(modules)).filter((f) => f.endsWith(".js")).sort();
 const ordered = ["Namespace.js", ...files.filter((f) => f !== "Namespace.js")];
 const stockJs = (await Promise.all(ordered.map((f) => readFile(path.join(modules, f), "utf8")))).join("\n");
 await writeFile(path.join(dir, "guacamole-common.js"), stockJs);
-await cp(path.join(root, "web/pkg"), path.join(dir, "pkg"), { recursive: true });
+await cp(path.join(root, "web/public/pkg"), path.join(dir, "pkg"), { recursive: true });
 
 const port = await freePort();
 const host = `127.0.0.1:${port}`;
@@ -70,14 +70,25 @@ client.connect("ws://${host}/websocket-tunnel?connection=${connection}&width=128
 </script>`,
 );
 
+// The tunnel needs a session: sign in as a bench administrator, created in
+// a throwaway SQLite database next to the static files.
+const benchUser = { username: "bench", password: "bench-password" };
 const config = (await readFile(path.join(root, "gateway.toml"), "utf8"))
   .replace(/^listen\s*=.*$/m, `listen = "${host}"`)
   .replace(/^static_dir\s*=.*$/m, `static_dir = ${JSON.stringify(dir)}`)
-  .replace(/^\[\[users\]\][\s\S]*?(?=^\[)/gm, "");
+  .replace(/^\[\[users\]\][\s\S]*?(?=^\[)/gm, "")
+  .concat(`\n[[users]]\nusername = "${benchUser.username}"\npassword = "${benchUser.password}"\n`);
 await writeFile(path.join(dir, "gateway.toml"), config);
 const binary = ["release", "debug"].map((p) => path.join(root, "target", p, "molcajete-gateway")).find(existsSync);
-const gateway = spawn(binary, ["--config", path.join(dir, "gateway.toml")], { stdio: "ignore" });
+const gateway = spawn(binary, ["--config", path.join(dir, "gateway.toml"), "--data-dir", dir], { stdio: "ignore" });
 await new Promise((r) => setTimeout(r, 1000));
+const login = await fetch(`http://${host}/api/auth/login`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(benchUser),
+});
+if (!login.ok) throw new Error(`bench login failed: HTTP ${login.status}`);
+const sessionCookie = login.headers.get("set-cookie").split(";")[0].split("=");
 
 async function measure(kind) {
   const cache = path.join(process.env.HOME ?? "", ".cache/ms-playwright/chromium-1228/chrome-linux64/chrome");
@@ -86,6 +97,7 @@ async function measure(kind) {
     args: (process.env.CHROME_ARGS ?? "--use-angle=swiftshader --enable-unsafe-swiftshader --ignore-gpu-blocklist").split(" "),
   });
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await page.context().addCookies([{ name: sessionCookie[0], value: sessionCookie[1], url: `http://${host}` }]);
   page.on("console", (m) => m.type() === "error" && console.error(`[${kind}] ${m.text()}`));
   page.on("pageerror", (e) => console.error(`[${kind}] ${e.message}`));
   const cdp = await page.context().newCDPSession(page);
