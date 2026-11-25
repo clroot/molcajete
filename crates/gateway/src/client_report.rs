@@ -1,7 +1,7 @@
 //! Performance reports from the browser client.
 //!
-//! The page (`web/app.js`) collects the client's once-per-second `stats`
-//! events and posts them here in batches. Each sample is recorded into
+//! The page (`web/public/client-report.js`) collects the client's
+//! once-per-second `stats` events and posts them here in batches. Each sample is recorded into
 //! histograms and each batch is summarised in one log event, which keeps
 //! per-session history in the log store.
 //!
