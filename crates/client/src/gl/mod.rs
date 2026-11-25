@@ -314,6 +314,35 @@ struct Programs {
     t_function: Option<WebGlUniformLocation>,
 }
 
+/// What an image is uploaded from.
+#[derive(Clone, Copy)]
+pub enum ImageSource<'a> {
+    /// An image decoded by the browser (`VideoFrame` or `ImageBitmap`).
+    Decoded(&'a DecodedImage),
+    /// Opaque RGBA pixels in wasm memory, top row first (a zstd image).
+    Pixels {
+        rgba: &'a [u8],
+        width: u32,
+        height: u32,
+    },
+}
+
+impl ImageSource<'_> {
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Decoded(image) => (image.width, image.height),
+            Self::Pixels { width, height, .. } => (*width, *height),
+        }
+    }
+
+    fn opaque(&self) -> bool {
+        match self {
+            Self::Decoded(image) => image.opaque,
+            Self::Pixels { .. } => true,
+        }
+    }
+}
+
 pub struct Renderer {
     gl: GL,
     canvas: CanvasTarget,
@@ -739,7 +768,10 @@ impl Renderer {
         gl.bind_framebuffer(GL::READ_FRAMEBUFFER, None);
     }
 
-    /// Copies a decoded image into `tex` at (x, y).
+    /// Copies an image into `tex` at (x, y).
+    ///
+    /// Pixels in wasm memory are uploaded as they are, through a view of
+    /// that memory.
     ///
     /// WebGL uploads of CPU-backed sources (`VideoFrame`s from
     /// `ImageDecoder`, most `ImageBitmap`s) are copied synchronously on the
@@ -751,8 +783,36 @@ impl Renderer {
         tex: &WebGlTexture,
         x: i32,
         y: i32,
-        image: &DecodedImage,
+        image: ImageSource,
     ) -> Result<(), RendererError> {
+        let image = match image {
+            ImageSource::Decoded(image) => image,
+            ImageSource::Pixels {
+                rgba,
+                width,
+                height,
+            } => {
+                let gl = &self.gl;
+                gl.bind_texture(GL::TEXTURE_2D, Some(tex));
+                // The pixels are opaque, so they are premultiplied already;
+                // asking for it would only make the browser convert them.
+                gl.pixel_storei(GL::UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+                let result = gl
+                    .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
+                        GL::TEXTURE_2D,
+                        0,
+                        x,
+                        y,
+                        width as i32,
+                        height as i32,
+                        GL::RGBA,
+                        GL::UNSIGNED_BYTE,
+                        Some(rgba),
+                    );
+                gl.pixel_storei(GL::UNPACK_PREMULTIPLY_ALPHA_WEBGL, 1);
+                return Ok(result?);
+            }
+        };
         let (w, h) = (image.width as i32, image.height as i32);
         if self.staged_uploads {
             match self.stage(image) {
@@ -827,10 +887,10 @@ impl Renderer {
         Ok(canvas.clone().into())
     }
 
-    /// Uploads a decoded image into the shared upload texture, which is only
+    /// Uploads an image into the shared upload texture, which is only
     /// reallocated when it is too small.
-    fn upload_image(&mut self, image: &DecodedImage) -> Result<(), RendererError> {
-        let (w, h) = (image.width, image.height);
+    fn upload_image(&mut self, image: ImageSource) -> Result<(), RendererError> {
+        let (w, h) = image.size();
         let fits = self
             .upload
             .as_ref()
@@ -1211,11 +1271,11 @@ impl Renderer {
         self.draw_textured(&tex, tex_w, tex_h, src_region, dst, dx, dy, mode, ctm, clip);
     }
 
-    /// Draws a decoded image at (x, y).
+    /// Draws an image at (x, y).
     #[allow(clippy::too_many_arguments)]
     pub fn draw_image(
         &mut self,
-        image: &DecodedImage,
+        image: ImageSource,
         dst: &Surface,
         x: i32,
         y: i32,
@@ -1223,8 +1283,9 @@ impl Renderer {
         ctm: &Affine,
         clip: Clip,
     ) -> Result<(), RendererError> {
-        let (w, h) = (image.width as i32, image.height as i32);
-        let opaque = image.opaque;
+        let (w, h) = image.size();
+        let (w, h) = (w as i32, h as i32);
+        let opaque = image.opaque();
         let rect = Rect::new(x, y, w, h);
         let plain = ctm.is_identity() && !clip.use_mask && clip.rect.is_none();
         let inside = rect.intersect(&dst.bounds()) == rect;

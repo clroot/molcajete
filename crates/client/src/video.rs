@@ -108,7 +108,7 @@ impl VideoStream {
                         source: frame,
                         opaque: true,
                     };
-                    slot.finish(ImageState::Ready(image));
+                    slot.finish(ImageState::Ready(image.into()));
                 }
                 None => {
                     // More frames than requested: release it immediately.

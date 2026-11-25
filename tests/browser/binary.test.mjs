@@ -2,7 +2,9 @@
 // real WebSocket, in worker mode and in main-thread mode.
 //
 // A stand-in gateway serves the client and a tunnel that sends one frame:
-// PNG images (one larger than a record, one with transparency), a JPEG, PCM
+// PNG images (one larger than a record, one with transparency), a JPEG,
+// zstd images (molcajete_protocol::zimage, which the client decodes itself;
+// one larger than a record, and some overlapping a PNG and a JPEG), PCM
 // audio and an H.264 video stream. A client that offers the subprotocol
 // `molcajete-binary-v1` gets the stream data as raw bytes in binary messages;
 // a client told to stay on the text protocol gets the same frame as base64
@@ -21,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import zlib from "node:zlib";
 import { encode, frame, splitH264 } from "./video-stream.mjs";
+import { ZSTD_IMAGE, zstdImage } from "./zstd-image.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const web = path.join(root, "web/public");
@@ -80,6 +83,15 @@ const alphaPng = png(16, 16, 3, 1, (x) => [x < 8 ? 0 : 1], [
   pngChunk("tRNS", Buffer.from([0, 255])),
 ]);
 
+// zstd images: noise in RGB that takes several records, and flat colours.
+const ZNOISE = { x: 100, y: 136, width: 120, height: 60 };
+const zstdNoise = zstdImage(ZNOISE.width, ZNOISE.height, (x, y) => noise(x + 7, y + 3));
+assert.equal(zstdNoise[0], 1, "the zstd noise image is RGB");
+assert.ok(zstdNoise.length > 16 * 1024, "the zstd noise image takes several records");
+const zstdFlat = (color) => zstdImage(16, 16, () => color);
+assert.equal(zstdFlat([1, 2, 3])[0], 0, "a flat zstd image is indexed");
+const whitePng = png(16, 16, 2, 3, () => [255, 255, 255]);
+
 // 16x16 red, from `ffmpeg -f lavfi -i color=red:size=16x16 -frames:v 1 -f mjpeg`.
 const redJpeg = Buffer.from(
   "/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYzLjI0LjEwMAD/2wBDAAgKCgsKCw0NDQ0NDRAPEBAQEBAQEBAQEBASEhIVFRUSEhIQEBISFBQVFRcXFxUVFRUXFxkZGR4eHBwjIyQrKzP/xABMAAEBAAAAAAAAAAAAAAAAAAAABgEBAQAAAAAAAAAAAAAAAAAABgcQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAARCAAQABADASIAAhEAAxEA/9oADAMBAAIRAxEAPwCLAE1/f//Z",
@@ -126,6 +138,15 @@ function content() {
   blob(2, Buffer.alloc(4 * 441));
   image(4, "image/jpeg", 270, 40, redJpeg);
   image(5, "image/png", 270, 70, alphaPng);
+  image(6, ZSTD_IMAGE, ZNOISE.x, ZNOISE.y, zstdNoise);
+  image(8, ZSTD_IMAGE, 270, 100, zstdFlat([255, 0, 255]));
+  // Overlapping images, each covering half of the one before: a zstd image
+  // is ready at once, a PNG or a JPEG only when its decoder is done.
+  image(9, "image/png", 230, 140, greenPng);
+  image(10, ZSTD_IMAGE, 238, 140, zstdFlat([255, 0, 255]));
+  image(11, "image/jpeg", 246, 140, redJpeg);
+  image(12, ZSTD_IMAGE, 254, 140, zstdFlat([0, 255, 255]));
+  image(13, "image/png", 262, 140, whitePng);
   text(ins("end", 2));
   if (video) {
     text(ins("size", 1, 64, 64), ins("move", 1, 0, 0, 136, 1), ins("video", 7, 1, "video/h264"));
@@ -267,12 +288,13 @@ const server = createServer(async (request, response) => {
   if (url.pathname === "/") {
     const worker = url.searchParams.get("mode") === "worker";
     const binary = url.searchParams.get("tunnel") === "binary";
+    const zstd = url.searchParams.get("zstd") !== "0";
     response.writeHead(200, { "content-type": "text/html" });
     response.end(`<!doctype html><div id="c" style="width:360px;height:240px;position:relative"></div>
 <script type="module">
 import { MolcajeteSession } from "./molcajete.js";
 window.states = [];
-window.session = await MolcajeteSession.create(document.getElementById("c"), { worker: ${worker}, binary: ${binary} });
+window.session = await MolcajeteSession.create(document.getElementById("c"), { worker: ${worker}, binary: ${binary}, zstd: ${zstd} });
 window.session.set_event_handler((type, detail) => {
   if (type === "state") window.states.push(detail);
   if (type === "error") window.states.push("error: " + detail.message);
@@ -303,7 +325,8 @@ server.on("upgrade", (request, socket) => {
     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
       `Sec-WebSocket-Accept: ${accept}\r\nSec-WebSocket-Protocol: ${selected}\r\n\r\n`,
   );
-  const tunnel = { offered, selected, bytes: 0, messages: 0, received: "" };
+  const images = new URL(request.url, "http://localhost").searchParams.getAll("image");
+  const tunnel = { offered, selected, images, bytes: 0, messages: 0, received: "" };
   tunnel.synced = new Promise((resolve) => {
     readClientFrames(socket, (text) => {
       tunnel.received += text;
@@ -362,6 +385,8 @@ for (const mode of ["worker", "main"]) {
     assert.deepEqual(tunnel.offered, tunnelKind === "binary" ? [BINARY, "guacamole"] : ["guacamole"], name);
     assert.equal(tunnel.selected, expected);
     assert.equal(await page.evaluate(() => window.session.request("tunnel_protocol")), expected, name);
+    // The zstd image type is announced next to the stock ones.
+    assert.deepEqual(tunnel.images, ["image/png", "image/jpeg", "image/webp", ZSTD_IMAGE], name);
 
     // The client acknowledges the frame once everything in it is drawn.
     await Promise.race([
@@ -384,6 +409,19 @@ for (const mode of ["worker", "main"]) {
     assert.deepEqual(await pixel(273, 78), [0, 0, 255, 255], `${name}: transparent PNG pixels`);
     assert.deepEqual(await pixel(282, 78), [255, 255, 0, 255], `${name}: opaque PNG pixels`);
     assert.deepEqual(await pixel(300, 150), [0, 0, 255, 255], `${name}: background`);
+    // The zstd images, bit for bit.
+    for (const [x, y] of [[0, 0], [119, 0], [0, 59], [119, 59], [61, 33]]) {
+      const expected = [...noise(x + 7, y + 3), 255];
+      assert.deepEqual(await pixel(ZNOISE.x + x, ZNOISE.y + y), expected, `${name}: zstd noise pixel ${x},${y}`);
+    }
+    assert.deepEqual(await pixel(278, 108), [255, 0, 255, 255], `${name}: indexed zstd image`);
+    // Every image of the overlapping row covers the one before it.
+    assert.deepEqual(await pixel(233, 148), [0, 255, 0, 255], `${name}: PNG`);
+    assert.deepEqual(await pixel(241, 148), [255, 0, 255, 255], `${name}: zstd over PNG`);
+    assert.ok(near(await pixel(249, 148), [255, 0, 0, 255], 12), `${name}: JPEG over zstd`);
+    assert.deepEqual(await pixel(257, 148), [0, 255, 255, 255], `${name}: zstd over JPEG`);
+    assert.deepEqual(await pixel(265, 148), [255, 255, 255, 255], `${name}: PNG over zstd`);
+    assert.deepEqual(await pixel(275, 148), [255, 255, 255, 255], `${name}: last PNG`);
     if (video) {
       const [r, g, b] = await pixel(32, 168);
       assert.ok(g > 200 && r < 60 && b < 60, `${name}: last video frame is green, got ${[r, g, b]}`);
@@ -395,6 +433,18 @@ for (const mode of ["worker", "main"]) {
     console.log(`ok - ${name}: ${tunnel.bytes} bytes in ${tunnel.messages} messages`);
     await page.close();
   }
+}
+
+// A client told not to use zstd images does not announce the type.
+{
+  const page = await browser.newPage({ viewport: { width: 400, height: 300 } });
+  await page.goto(`${origin}/?mode=worker&tunnel=binary&zstd=0`);
+  await page.waitForFunction(() => window.ready === true);
+  for (let i = 0; i < 200 && tunnels.length === Object.keys(results).length; i++) await page.waitForTimeout(25);
+  assert.equal(tunnels.length, Object.keys(results).length + 1, "the tunnel was opened");
+  assert.deepEqual(tunnels.at(-1).images, ["image/png", "image/jpeg", "image/webp"]);
+  console.log("ok - zstd images are not announced when turned off");
+  await page.close();
 }
 
 const binaryBytes = results["worker mode, binary tunnel"].bytes;

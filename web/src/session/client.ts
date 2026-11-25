@@ -56,7 +56,10 @@ export interface MolcajeteSession {
 
 type ClientModule = {
   MolcajeteSession: {
-    create(container: HTMLElement, options?: {worker?: boolean; binary?: boolean}): Promise<MolcajeteSession>;
+    create(
+      container: HTMLElement,
+      options?: {worker?: boolean; binary?: boolean; zstd?: boolean},
+    ): Promise<MolcajeteSession>;
   };
 };
 
