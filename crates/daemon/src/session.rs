@@ -88,6 +88,15 @@ impl Deref for Input {
     }
 }
 
+/// Most streams a client may have open towards molcajeted at once (libguac
+/// allows 64 per user).
+const MAX_INBOUND_STREAMS: usize = 64;
+
+/// Most data buffered for a client's open streams together. A clipboard of
+/// a few megabytes is plausible; a stream that never ends is not, and would
+/// otherwise grow until the daemon runs out of memory.
+const MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
+
 /// Turns raw client instructions into [`ClientEvent`]s.
 #[derive(Default)]
 pub struct InputDecoder {
@@ -130,6 +139,9 @@ impl InputDecoder {
             "disconnect" => Some(ClientEvent::Disconnect),
             "clipboard" => {
                 let stream = int(0)? as i32;
+                if !self.may_open(stream, out) {
+                    return None;
+                }
                 self.streams.insert(
                     stream,
                     Inbound {
@@ -142,6 +154,9 @@ impl InputDecoder {
             }
             "argv" => {
                 let stream = int(0)? as i32;
+                if !self.may_open(stream, out) {
+                    return None;
+                }
                 let name = ins.arg(2).to_owned();
                 self.streams.insert(
                     stream,
@@ -155,13 +170,20 @@ impl InputDecoder {
             }
             "blob" => {
                 let stream = int(0)? as i32;
+                let data = ins.arg(1);
+                let buffered: usize = self.streams.values().map(|s| s.data.len()).sum();
+                // Base64 decodes to at most three bytes for every four.
+                if self.streams.contains_key(&stream)
+                    && buffered + data.len() / 4 * 3 > MAX_INBOUND_BYTES
+                {
+                    self.streams.remove(&stream);
+                    ack(out, stream, "Too much data", Status::CLIENT_OVERRUN);
+                    return None;
+                }
                 match self.streams.get_mut(&stream) {
                     Some(inbound) => {
                         let b64 = base64::engine::general_purpose::STANDARD;
-                        if b64
-                            .decode_vec(ins.arg(1).as_bytes(), &mut inbound.data)
-                            .is_ok()
-                        {
+                        if b64.decode_vec(data.as_bytes(), &mut inbound.data).is_ok() {
                             ack(out, stream, "OK", Status::SUCCESS);
                         } else {
                             ack(out, stream, "Invalid base64", Status::CLIENT_BAD_REQUEST);
@@ -188,6 +210,16 @@ impl InputDecoder {
             }
             _ => None,
         }
+    }
+
+    /// Whether the client may open (or reopen) `stream`; acknowledges the
+    /// refusal if not.
+    fn may_open(&self, stream: i32, out: &mut Output) -> bool {
+        if self.streams.len() < MAX_INBOUND_STREAMS || self.streams.contains_key(&stream) {
+            return true;
+        }
+        ack(out, stream, "Too many streams", Status::CLIENT_TOO_MANY);
+        false
     }
 }
 
@@ -412,5 +444,71 @@ mod tests {
                 value: "sec".into()
             })
         );
+    }
+
+    fn statuses(out: &Output) -> Vec<String> {
+        parse_all(out)
+            .unwrap()
+            .iter()
+            .map(|a| a.arg(2).to_owned())
+            .collect()
+    }
+
+    /// A client cannot make molcajeted buffer more than `MAX_INBOUND_BYTES`
+    /// by sending a stream that never ends.
+    #[test]
+    fn inbound_data_is_bounded() {
+        let mut d = InputDecoder::default();
+        let mut out = Output::text();
+        d.decode(&ins("9.clipboard,1.1,10.text/plain;"), &mut out);
+        // 24 KiB of base64 per blob, 18 KiB decoded.
+        let blob = format!("4.blob,1.1,24576.{};", "A".repeat(24 * 1024));
+        let mut accepted = 0;
+        loop {
+            out.clear();
+            d.decode(&ins(&blob), &mut out);
+            if statuses(&out) != ["0"] {
+                break;
+            }
+            accepted += 18 * 1024;
+        }
+        assert!(accepted <= MAX_INBOUND_BYTES, "{accepted}");
+        assert!(accepted + 18 * 1024 > MAX_INBOUND_BYTES, "{accepted}");
+        assert_eq!(statuses(&out), [Status::CLIENT_OVERRUN.code().to_string()]);
+        // The stream is gone.
+        assert_eq!(d.decode(&ins("3.end,1.1;"), &mut out), None);
+        // A new one may start.
+        out.clear();
+        d.decode(&ins("9.clipboard,1.2,10.text/plain;"), &mut out);
+        d.decode(&ins("4.blob,1.2,4.aGk=;"), &mut out);
+        assert_eq!(statuses(&out), ["0", "0"]);
+        assert_eq!(
+            d.decode(&ins("3.end,1.2;"), &mut out),
+            Some(ClientEvent::Clipboard("hi".into()))
+        );
+    }
+
+    #[test]
+    fn open_inbound_streams_are_bounded() {
+        let mut d = InputDecoder::default();
+        let mut out = Output::text();
+        for stream in 0..MAX_INBOUND_STREAMS {
+            let argv = format!(
+                "4.argv,{}.{stream},10.text/plain,4.name;",
+                stream.to_string().len()
+            );
+            d.decode(&ins(&argv), &mut out);
+        }
+        assert!(statuses(&out).iter().all(|status| status == "0"));
+        out.clear();
+        d.decode(&ins("9.clipboard,3.999,10.text/plain;"), &mut out);
+        assert_eq!(statuses(&out), [Status::CLIENT_TOO_MANY.code().to_string()]);
+        // Reopening one that is open, or opening one after another ended,
+        // is fine.
+        out.clear();
+        d.decode(&ins("9.clipboard,1.0,10.text/plain;"), &mut out);
+        d.decode(&ins("3.end,1.1;"), &mut out);
+        d.decode(&ins("9.clipboard,3.999,10.text/plain;"), &mut out);
+        assert_eq!(statuses(&out), ["0", "0"]);
     }
 }
