@@ -161,6 +161,7 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | `molcajeted_frame_flush_seconds` | histogram | protocol | CPU time to diff and encode one frame |
 | `molcajeted_flush_phase_seconds` | histogram | protocol, phase | Time per flush phase: `video`, `scroll`, `moves`, `pixels` (includes image encoding), `refine` |
 | `molcajeted_image_encode_seconds` | histogram | protocol, format | Encoding one image (`png`, `jpeg`) |
+| `molcajeted_image_encoded_bytes` | histogram | protocol, format | Size of one encoded image: many small images cost the client a decode each |
 | `molcajeted_image_bytes_total`, `molcajeted_image_pixels_total` | counter | protocol, format | Encoded size and pixels processed (compression efficiency) |
 | `molcajeted_video_encode_seconds` | histogram | codec, key | Encoding one video frame (including the ffmpeg round trip) |
 | `molcajeted_video_frame_bytes` | histogram | codec, key | Video frame size |

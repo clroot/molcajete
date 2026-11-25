@@ -367,3 +367,64 @@ fn scatter() {
         }
     });
 }
+
+/// Time and size of PNG encoding per DEFLATE setting, on the kinds of
+/// images a session sends: a page of text, single lines and a photograph.
+#[test]
+#[ignore = "benchmark"]
+fn png_levels() {
+    use png::DeflateCompression::{FdeflateUltraFast, Level};
+
+    let doc = Document::new();
+    let desktop = Desktop::new();
+    let page = doc.render(3200, 0, 2200);
+    let lines: Vec<Vec<u8>> = (0..200)
+        .map(|i| doc.render(900, i * 40 * LINE_HEIGHT, LINE_HEIGHT))
+        .collect();
+    let photo: Vec<u8> = desktop.wallpaper[..(WIDTH * 512 * 4) as usize].to_vec();
+    let mut images = vec![
+        ("page", vec![(3200, 2200, page)]),
+        (
+            "lines",
+            lines.into_iter().map(|l| (900, LINE_HEIGHT, l)).collect(),
+        ),
+        ("photo", vec![(WIDTH, 512, photo)]),
+    ];
+    // Pages are sent in tile bands rather than as one image.
+    let band = doc.render(3200, 0, 2200);
+    images.push((
+        "bands",
+        band.chunks(3200 * 64 * 4)
+            .map(|b| (3200, (b.len() / (3200 * 4)) as u32, b.to_vec()))
+            .collect(),
+    ));
+    for (name, set) in &images {
+        for compression in [
+            FdeflateUltraFast,
+            Level(1),
+            Level(2),
+            Level(3),
+            Level(4),
+            Level(6),
+        ] {
+            let started = Instant::now();
+            let mut bytes = 0;
+            for (width, height, rgba) in set {
+                let region = Region {
+                    width: *width,
+                    height: *height,
+                    rgba,
+                };
+                bytes += encode::encode_png_with(&region, compression)
+                    .expect("png")
+                    .len();
+            }
+            println!(
+                "png {name:<6} {:<18} {:8.2} ms {:9.1} kB",
+                format!("{compression:?}"),
+                ms(started.elapsed()),
+                bytes as f64 / 1024.0
+            );
+        }
+    }
+}

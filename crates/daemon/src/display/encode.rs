@@ -4,7 +4,11 @@
 //! most 256 colours (typical for UI and text) and RGB otherwise. Frequently
 //! updated, colourful regions may use JPEG when the client supports it.
 
-use std::collections::HashMap;
+/// DEFLATE setting of display updates. On text, level 4 is 4 to 5 times
+/// faster than zlib's default (6) for 5% more bytes; level 1 saves another
+/// third of the time for 17% more bytes, and fdeflate is 2.5 to 3 times larger
+/// (see `display::bench::png_levels`).
+const PNG_COMPRESSION: png::DeflateCompression = png::DeflateCompression::Level(4);
 
 /// Pixel region extracted from the framebuffer (RGBA8, tightly packed).
 pub struct Region<'a> {
@@ -25,33 +29,35 @@ pub fn solid_color(region: &Region) -> Option<[u8; 4]> {
 /// Builds a palette (RGB triplets) and the index image, or `None` when the
 /// region has more than 256 colours.
 fn palettize(region: &Region) -> Option<(Vec<u8>, Vec<u8>)> {
-    let mut lookup: HashMap<u32, u8> = HashMap::with_capacity(64);
+    // Open-addressed table of the colours seen so far. Anti-aliased text
+    // changes colour at nearly every pixel, so the lookup has to be cheap.
+    const SLOTS: usize = 1024;
+    const EMPTY: u32 = u32::MAX;
+    let mut keys = [EMPTY; SLOTS];
+    let mut values = [0u8; SLOTS];
     let mut palette = Vec::with_capacity(256 * 3);
     let mut indices = Vec::with_capacity((region.width * region.height) as usize);
-    let mut last: Option<(u32, u8)> = None;
-    for p in region.rgba.chunks_exact(4) {
+    let mut last = (EMPTY, 0u8);
+    for p in region.rgba.as_chunks::<4>().0 {
         let key = u32::from_le_bytes([p[0], p[1], p[2], 0]);
-        // Runs of identical pixels are common; skip the hash lookup for them.
-        let index = match last {
-            Some((k, i)) if k == key => i,
-            _ => {
-                let i = match lookup.get(&key) {
-                    Some(&i) => i,
-                    None => {
-                        if lookup.len() >= 256 {
-                            return None;
-                        }
-                        let i = lookup.len() as u8;
-                        lookup.insert(key, i);
-                        palette.extend_from_slice(&p[..3]);
-                        i
-                    }
-                };
-                last = Some((key, i));
-                i
+        // Runs of identical pixels are common; skip the lookup for them.
+        if key != last.0 {
+            let mut slot = (key.wrapping_mul(0x9e37_79b1) >> 22) as usize;
+            while keys[slot] != key && keys[slot] != EMPTY {
+                slot = (slot + 1) % SLOTS;
             }
-        };
-        indices.push(index);
+            if keys[slot] == EMPTY {
+                let colors = palette.len() / 3;
+                if colors == 256 {
+                    return None;
+                }
+                keys[slot] = key;
+                values[slot] = colors as u8;
+                palette.extend_from_slice(&p[..3]);
+            }
+            last = (key, values[slot]);
+        }
+        indices.push(last.1);
     }
     Some((palette, indices))
 }
@@ -78,12 +84,18 @@ fn pack_indices(indices: &[u8], width: u32, height: u32, bits: u8) -> Vec<u8> {
 /// palette images with the smallest bit depth; regions with transparency keep
 /// their alpha channel.
 pub fn encode_png(region: &Region) -> Result<Vec<u8>, png::EncodingError> {
+    encode_png_with(region, PNG_COMPRESSION)
+}
+
+/// [`encode_png`] with a given DEFLATE setting.
+pub fn encode_png_with(
+    region: &Region,
+    compression: png::DeflateCompression,
+) -> Result<Vec<u8>, png::EncodingError> {
     let mut out = Vec::with_capacity(region.rgba.len() / 4);
     let mut encoder = png::Encoder::new(&mut out, region.width, region.height);
-    // `Balanced` is ~2.4x smaller than `Fast` on typical desktop/terminal
-    // updates at ~0.1 ms per image.
-    encoder.set_compression(png::Compression::Balanced);
-    let opaque = region.rgba.chunks_exact(4).all(|p| p[3] == 255);
+    encoder.set_deflate_compression(compression);
+    let opaque = super::is_opaque(region.rgba);
     if !opaque {
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
