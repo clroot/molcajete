@@ -4,7 +4,9 @@
 //! streams), and a few common outbound messages.
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use base64::Engine;
 use molcajete_protocol::video::VideoCodec;
@@ -45,8 +47,13 @@ pub enum ClientEvent {
         name: String,
         value: String,
     },
-    /// The client finished drawing the frame with this timestamp.
-    Sync(i64),
+    /// The client finished drawing the frame with this timestamp. `received`
+    /// is when that reached us, which can be well before the session loop
+    /// gets to it (while it builds the next frame, for example).
+    Sync {
+        timestamp: i64,
+        received: Instant,
+    },
     /// The client acknowledged (or rejected) data of an outbound stream.
     Ack {
         stream: i32,
@@ -65,6 +72,20 @@ struct Inbound {
     data: Vec<u8>,
 }
 
+/// An instruction from the client and when it was read from the socket.
+pub struct Input {
+    pub instruction: Instruction,
+    pub received: Instant,
+}
+
+impl Deref for Input {
+    type Target = Instruction;
+
+    fn deref(&self) -> &Instruction {
+        &self.instruction
+    }
+}
+
 /// Turns raw client instructions into [`ClientEvent`]s.
 #[derive(Default)]
 pub struct InputDecoder {
@@ -74,7 +95,7 @@ pub struct InputDecoder {
 impl InputDecoder {
     /// Decodes one instruction. Acknowledgements owed to the client are
     /// appended to `out`.
-    pub fn decode(&mut self, ins: &Instruction, out: &mut String) -> Option<ClientEvent> {
+    pub fn decode(&mut self, ins: &Input, out: &mut String) -> Option<ClientEvent> {
         let int = |i: usize| ins.arg(i).trim().parse::<i64>().ok();
         match ins.opcode.as_str() {
             "mouse" => Some(ClientEvent::Mouse {
@@ -93,7 +114,10 @@ impl InputDecoder {
                     height: h.min(8192) as u32,
                 })
             }
-            "sync" => int(0).map(ClientEvent::Sync),
+            "sync" => int(0).map(|timestamp| ClientEvent::Sync {
+                timestamp,
+                received: ins.received,
+            }),
             "ack" => Some(ClientEvent::Ack {
                 stream: int(0)? as i32,
                 status: Status::parse(ins.arg(2))?,
@@ -164,11 +188,15 @@ impl InputDecoder {
 
 /// Reads client instructions in a background task. The channel closes when
 /// the client disconnects.
-pub fn spawn_reader(mut reader: GuacReader) -> (mpsc::Receiver<Instruction>, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<Instruction>(512);
+pub fn spawn_reader(mut reader: GuacReader) -> (mpsc::Receiver<Input>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<Input>(512);
     let task = tokio::spawn(async move {
-        while let Ok(Some(ins)) = reader.next().await {
-            if tx.send(ins).await.is_err() {
+        while let Ok(Some(instruction)) = reader.next().await {
+            let input = Input {
+                instruction,
+                received: Instant::now(),
+            };
+            if tx.send(input).await.is_err() {
                 break;
             }
         }
@@ -263,8 +291,11 @@ mod tests {
     use super::*;
     use molcajete_protocol::parse_all;
 
-    fn ins(text: &str) -> Instruction {
-        parse_all(text).unwrap().remove(0)
+    fn ins(text: &str) -> Input {
+        Input {
+            instruction: parse_all(text).unwrap().remove(0),
+            received: Instant::now(),
+        }
     }
 
     #[test]
@@ -286,9 +317,13 @@ mod tests {
                 pressed: true
             })
         );
+        let sync = ins("4.sync,3.123;");
         assert_eq!(
-            d.decode(&ins("4.sync,3.123;"), &mut out),
-            Some(ClientEvent::Sync(123))
+            d.decode(&sync, &mut out),
+            Some(ClientEvent::Sync {
+                timestamp: 123,
+                received: sync.received
+            })
         );
         assert_eq!(d.decode(&ins("4.size,1.0,3.768;"), &mut out), None);
         assert!(out.is_empty());

@@ -19,7 +19,7 @@ use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_tokio::{FramedWrite as _, TokioFramed, single_sequence_step_read, split_tokio_framed};
-use molcajete_protocol::{Instruction, Status};
+use molcajete_protocol::Status;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::sleep_until;
@@ -38,7 +38,7 @@ use crate::display::{Display, ImageFormats};
 use crate::handshake::ClientInfo;
 use crate::io::GuacWriter;
 use crate::send_error;
-use crate::session::{self, ClientEvent, InputDecoder};
+use crate::session::{self, ClientEvent, Input, InputDecoder};
 
 /// Frames the client may lag behind before frames are held back.
 const MAX_UNACKED_FRAMES: u32 = 2;
@@ -143,7 +143,7 @@ impl<'a> Session<'a> {
     /// are reported to the client as an upstream error.
     pub async fn run(
         mut self,
-        inputs: &mut mpsc::Receiver<Instruction>,
+        inputs: &mut mpsc::Receiver<Input>,
         decoder: &mut InputDecoder,
         early: EarlyInput,
     ) {
@@ -155,7 +155,7 @@ impl<'a> Session<'a> {
 
     async fn event_loop(
         &mut self,
-        inputs: &mut mpsc::Receiver<Instruction>,
+        inputs: &mut mpsc::Receiver<Input>,
         decoder: &mut InputDecoder,
         early: EarlyInput,
     ) -> anyhow::Result<()> {
@@ -459,7 +459,7 @@ impl<'a> Session<'a> {
 
     async fn client_instruction(
         &mut self,
-        ins: &Instruction,
+        ins: &Input,
         decoder: &mut InputDecoder,
     ) -> anyhow::Result<Flow> {
         match decoder.decode(ins, self.writer.buffer()) {
@@ -492,7 +492,10 @@ impl<'a> Session<'a> {
             ClientEvent::Clipboard(text) if !self.settings.disable_paste => {
                 self.client_clipboard(text).await?;
             }
-            ClientEvent::Sync(timestamp) => self.display.ack(timestamp),
+            ClientEvent::Sync {
+                timestamp,
+                received,
+            } => self.display.ack(timestamp, received),
             ClientEvent::Ack { stream, status } => {
                 let audio = self.audio.as_mut().is_some_and(|a| a.ack(stream, status));
                 if !audio {

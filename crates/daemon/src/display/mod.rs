@@ -1560,16 +1560,21 @@ impl Display {
         *out += &InstructionBuilder::new("sync").arg(ts).arg(1).finish();
     }
 
-    /// Handles a `sync` reply from the client.
-    pub fn ack(&mut self, timestamp: i64) {
+    /// Handles a `sync` reply from the client, which arrived at `received`.
+    ///
+    /// The frame's lag is counted up to that moment, not up to now: the
+    /// reply may have waited while this session built the next frame, and
+    /// that wait says nothing about the client or the network. Counting it
+    /// would slow the frame rate down by our own CPU time.
+    pub fn ack(&mut self, timestamp: i64, received: Instant) {
         while let Some(&(ts, sent_at)) = self.pending_syncs.front() {
             if ts > timestamp {
                 break;
             }
             self.pending_syncs.pop_front();
             if ts == timestamp {
-                let elapsed = sent_at.elapsed();
-                self.metrics.acked(elapsed);
+                let elapsed = received.saturating_duration_since(sent_at);
+                self.metrics.acked(elapsed, received.elapsed());
                 let sample = elapsed.min(MAX_LAG_COMPENSATION);
                 self.lag = (self.lag * 3 + sample) / 4;
             }

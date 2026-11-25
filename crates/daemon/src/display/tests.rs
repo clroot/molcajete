@@ -389,11 +389,22 @@ fn sync_and_ack_track_lag() {
     d.sync(&mut out);
     assert_eq!(d.unacked_frames(), 2);
     let last = d.last_sync.unwrap();
-    d.ack(last - 1);
+    d.ack(last - 1, Instant::now());
     assert_eq!(d.unacked_frames(), 1);
-    d.ack(last);
+    d.ack(last, Instant::now());
     assert_eq!(d.unacked_frames(), 0);
     assert!(d.next_frame_at() > Instant::now());
+}
+
+#[test]
+fn time_an_ack_waited_unread_is_not_lag() {
+    let (mut d, _, mut out) = setup(4, 4);
+    d.sync(&mut out);
+    let received = Instant::now();
+    // The session was busy (building the next frame) before it read the ack.
+    std::thread::sleep(Duration::from_millis(40));
+    d.ack(d.last_sync.unwrap(), received);
+    assert!(d.processing_lag() < Duration::from_millis(5));
 }
 
 /// Random mixes of puts, fills, protocol copies, scrolls and resizes: after

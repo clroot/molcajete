@@ -11,6 +11,13 @@ export type SessionStats = {
   instructionsPerSecond: number;
   bytesPerSecond: number;
   frameLagMs: number;
+  frameLagMsAvg?: number;
+  frameLagMsMax?: number;
+  frameReceiveMsAvg?: number;
+  frameReceiveMsMax?: number;
+  imagesPerSecond?: number;
+  imageDecodeMsAvg?: number;
+  imageDecodeMsMax?: number;
   rttMs: number | null;
   queuedOps: number;
 };

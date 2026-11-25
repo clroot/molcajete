@@ -24,6 +24,22 @@ fn call(name: &str, args: &[&JsValue]) -> Result<JsValue, JsValue> {
     f.apply(&global(), &array)
 }
 
+/// Milliseconds on the monotonic, sub-millisecond clock (`performance.now()`,
+/// available on the main thread and in workers), for measuring intervals.
+pub fn performance_now() -> f64 {
+    let now = || {
+        let performance = js_sys::Reflect::get(&global(), &"performance".into()).ok()?;
+        js_sys::Reflect::get(&performance, &"now".into())
+            .ok()?
+            .dyn_into::<js_sys::Function>()
+            .ok()?
+            .call0(&performance)
+            .ok()?
+            .as_f64()
+    };
+    now().unwrap_or_else(js_sys::Date::now)
+}
+
 /// Whether we run on the main thread (with a DOM).
 pub fn has_document() -> bool {
     web_sys::window().is_some_and(|w| w.document().is_some())

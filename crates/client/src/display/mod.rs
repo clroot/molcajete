@@ -344,12 +344,44 @@ struct SoftwareCursor {
     visible: bool,
 }
 
+/// Sum and maximum of a duration measured several times, in milliseconds.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Span {
+    pub count: u32,
+    pub total_ms: f64,
+    pub max_ms: f64,
+}
+
+impl Span {
+    fn add(&mut self, ms: f64) {
+        self.count += 1;
+        self.total_ms += ms;
+        self.max_ms = self.max_ms.max(ms);
+    }
+
+    pub fn average_ms(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.total_ms / self.count as f64
+        }
+    }
+}
+
 #[derive(Default, Clone, Copy, Debug)]
 pub struct RenderStats {
     pub frames_applied: u32,
     pub composites: u32,
     pub draw_calls: u32,
     pub queued_ops: usize,
+    /// Per frame: from its first instruction to its `sync` (the time its
+    /// data took to arrive and be parsed).
+    pub receive: Span,
+    /// Per frame: from its `sync` to being applied (waiting for its images
+    /// and for the frames before it).
+    pub lag: Span,
+    /// Per image: from handing the bytes to the decoder to the decoded image.
+    pub decode: Span,
 }
 
 pub struct Display {
@@ -367,6 +399,8 @@ pub struct Display {
     needs_composite: bool,
     events: Vec<DisplayEvent>,
     stats: RenderStats,
+    /// When the first instruction of the frame being received arrived.
+    frame_started: Option<f64>,
     /// Source of layer generations (unique across layers and re-creations).
     generation_counter: u64,
     /// Identity of the last cursor read back: (src, rect, hotspot, generation).
@@ -405,6 +439,7 @@ impl Display {
             needs_composite: true,
             events: Vec::new(),
             stats: RenderStats::default(),
+            frame_started: None,
             generation_counter: 0,
             last_cursor: None,
             pending_cursor: None,
@@ -475,10 +510,23 @@ impl Display {
     // ------------------------------------------------------------------
 
     pub fn enqueue(&mut self, op: Op) {
-        if matches!(op, Op::Sync { .. }) {
-            self.queued_syncs += 1;
+        match op {
+            Op::Sync { received_at, .. } => {
+                self.queued_syncs += 1;
+                let started = self.frame_started.take().unwrap_or(received_at);
+                self.stats.receive.add(received_at - started);
+            }
+            _ => {
+                self.frame_started
+                    .get_or_insert_with(crate::scope::performance_now);
+            }
         }
         self.queue.push_back(op);
+    }
+
+    /// Records how long decoding one image took.
+    pub fn image_decoded(&mut self, ms: f64) {
+        self.stats.decode.add(ms);
     }
 
     /// Executes every complete frame whose images are ready.
@@ -502,7 +550,8 @@ impl Display {
                         self.queued_syncs -= 1;
                         self.stats.frames_applied += 1;
                         self.needs_composite = true;
-                        let lag_ms = js_sys::Date::now() - received_at;
+                        let lag_ms = crate::scope::performance_now() - received_at;
+                        self.stats.lag.add(lag_ms);
                         self.events.push(DisplayEvent::FrameComplete {
                             timestamp,
                             frames,
