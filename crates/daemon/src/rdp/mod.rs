@@ -7,6 +7,7 @@
 //!   resize)
 //! - [`keyboard`], [`mouse`], [`slow_path`]: input translation
 //! - [`graphics`], [`clipboard`], [`audio`], [`pacing`]: output helpers
+//! - [`gfx`]: graphics over the graphics pipeline, for servers that have it
 
 mod active;
 mod audio;
@@ -15,6 +16,7 @@ mod bench;
 mod clipboard;
 mod connect;
 mod display_control;
+mod gfx;
 mod graphics;
 mod keyboard;
 mod mouse;

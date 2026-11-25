@@ -26,10 +26,12 @@ use tokio_rustls::client::TlsStream;
 
 use super::audio::SoundSink;
 use super::clipboard::GuacClipboard;
+use super::gfx::GraphicsChannel;
 use super::settings::Settings;
 use super::tls;
 use crate::jump::{Chain, Upstream, UpstreamError};
 use crate::remote::{self, CountingStream};
+use crate::video;
 
 /// The upgraded (TLS) transport of an RDP connection.
 /// Bytes read from it count towards `molcajeted_remote_received_bytes_total`.
@@ -173,7 +175,7 @@ fn connector_config(settings: &Settings) -> ironrdp_connector::Config {
         enable_server_pointer: true,
         pointer_software_rendering: false,
         multitransport_flags: None,
-        support_dyn_vc_gfx_protocol: false,
+        support_dyn_vc_gfx_protocol: settings.gfx,
     }
 }
 
@@ -188,6 +190,15 @@ fn build_connector(
         DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     if let Some(sound) = sound {
         drdynvc = drdynvc.with_dynamic_channel(sound.dynamic_channel());
+    }
+    if settings.gfx {
+        // A server without the graphics pipeline never opens the channel and
+        // keeps sending bitmap updates. One that has it may close the
+        // channel and open it again, starting over each time, hence the
+        // factory instead of a channel that can be opened once.
+        drdynvc = drdynvc.with_dynamic_channel_factory(ironrdp_egfx::CHANNEL_NAME, || {
+            GraphicsChannel::new(video::h264_decoder())
+        });
     }
     let clipboard = GuacClipboard::new(!settings.disable_copy);
     let connector = ClientConnector::new(connector_config(settings), client_addr)
@@ -376,6 +387,27 @@ mod tests {
                 .get_by_type::<ironrdp_rdpdr::Rdpdr>()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn the_graphics_pipeline_is_offered_unless_disabled() {
+        let registered = |settings: &Settings| {
+            let connector = build_connector(settings, "127.0.0.1:1".parse().unwrap(), None);
+            let offered = connector.config.support_dyn_vc_gfx_protocol;
+            let channel = connector
+                .static_channels
+                .get_by_type::<DrdynvcClient>()
+                .and_then(|channel| channel.channel_processor_downcast_ref::<DrdynvcClient>())
+                .expect("drdynvc")
+                .has_registered_dvc::<GraphicsChannel>();
+            (offered, channel)
+        };
+        let mut s = settings();
+        assert_eq!(registered(&s), (true, true));
+        // Bitmap updates stay available for servers that do not take it up.
+        assert!(connector_config(&s).bitmap.is_some());
+        s.gfx = false;
+        assert_eq!(registered(&s), (false, false));
     }
 
     #[test]

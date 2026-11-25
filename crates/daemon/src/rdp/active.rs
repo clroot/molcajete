@@ -30,6 +30,7 @@ use super::audio::AudioOutput;
 use super::clipboard::{self, GuacClipboard};
 use super::connect::{RdpFramed, RdpStream};
 use super::display_control::{self, DisplayControlStatus};
+use super::gfx::GraphicsChannel;
 use super::graphics::{self, Area, Cursor};
 use super::keyboard::Keyboard;
 use super::mouse::Mouse;
@@ -192,6 +193,7 @@ impl<'a> Session<'a> {
             width = self.image.width(),
             height = self.image.height(),
             fastpath_input = self.fastpath_input,
+            graphics_pipeline_offered = self.settings.gfx,
             "RDP session active"
         );
         session::send_name(self.writer.buffer(), &self.settings.hostname);
@@ -334,6 +336,7 @@ impl<'a> Session<'a> {
         };
         let decoded = started.elapsed();
         let flow = self.stage_outputs(outputs).await?;
+        self.pipeline_frames();
         self.decode_time
             .record(decoded + std::mem::take(&mut self.copy_time));
         if let Flow::End = flow {
@@ -410,6 +413,36 @@ impl<'a> Session<'a> {
             }
         }
         Ok(Flow::Continue)
+    }
+
+    /// Moves the frames the graphics pipeline completed with this PDU into
+    /// the display. The pipeline hands over nothing of a frame before the
+    /// server ended it, so what arrives here is always whole frames.
+    fn pipeline_frames(&mut self) {
+        let Some(frames) = self
+            .stage
+            .get_dvc_mut::<GraphicsChannel>()
+            .and_then(|mut channel| channel.processor_mut().take_frames())
+        else {
+            return;
+        };
+        let started = Instant::now();
+        // The server announces the output size of the pipeline separately
+        // from the desktop size of the reactivation; they are the same
+        // unless the pipeline spans more than the one monitor asked for.
+        if let Some((width, height)) = frames.resized
+            && (width, height) != (self.image.width(), self.image.height())
+        {
+            info!(width, height, "RDP graphics pipeline output resized");
+            self.image = DecodedImage::new(PixelFormat::RgbA32, width, height);
+            self.display
+                .resize(u32::from(width), u32::from(height), self.writer.buffer());
+        }
+        frames.draw(&mut self.display);
+        let now = Instant::now();
+        self.copy_time += now - started;
+        // A frame of the server ended here.
+        self.pacer.mark_dirty(now);
     }
 
     /// Runs the Deactivation-Reactivation Sequence (e.g. after a resize).

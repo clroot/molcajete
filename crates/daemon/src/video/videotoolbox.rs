@@ -16,6 +16,10 @@
 
 #![allow(non_upper_case_globals, non_camel_case_types)]
 
+mod decode;
+
+pub(crate) use decode::VideoToolboxDecoder;
+
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Mutex, PoisonError};
