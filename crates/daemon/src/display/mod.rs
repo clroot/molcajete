@@ -20,6 +20,7 @@
 pub mod encode;
 mod metrics;
 mod pacing;
+mod source;
 mod video;
 
 use std::collections::HashMap;
@@ -35,6 +36,7 @@ use encode::Region;
 use metrics::{DisplayMetrics, ImageKind, Phase, timed};
 use pacing::FrameClock;
 pub use pacing::{Pacing, SyncReply};
+pub use source::{ChannelOrder, SourceImage};
 
 /// Granularity of change tracking and of the heat map.
 const TILE: u32 = 64;
@@ -741,6 +743,28 @@ impl Display {
             let src = dy * w as usize * 4;
             let dst = self.offset(rect.x, rect.y + dy as u32);
             self.pixels[dst..dst + row].copy_from_slice(&rgba[src..src + row]);
+        }
+        self.touch(&rect);
+    }
+
+    /// Writes a `w`×`h` rectangle of `source` into the framebuffer at
+    /// (`x`, `y`) as opaque RGBA, converting the channels in the same pass
+    /// (one copy, unlike converting into a buffer for [`Self::put`]). The
+    /// rectangle is clipped to the framebuffer; nothing is written if
+    /// `source` is too short for the part that remains.
+    pub fn put_image(&mut self, x: u32, y: u32, w: u32, h: u32, source: &SourceImage<'_>) {
+        let rect = Rect::new(x, y, w, h).clip(self.width, self.height);
+        if rect.is_empty() || !source.holds(rect.w, rect.h) {
+            return;
+        }
+        let row = rect.w as usize * 4;
+        for dy in 0..rect.h as usize {
+            let src = dy * source.stride;
+            let dst = self.offset(rect.x, rect.y + dy as u32);
+            source.channels.convert_row(
+                &source.data[src..src + row],
+                &mut self.pixels[dst..dst + row],
+            );
         }
         self.touch(&rect);
     }

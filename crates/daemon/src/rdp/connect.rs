@@ -29,9 +29,11 @@ use super::audio::SoundSink;
 use super::clipboard::GuacClipboard;
 use super::settings::Settings;
 use super::tls;
+use crate::remote::{self, CountingStream};
 
 /// The upgraded (TLS) transport of an RDP connection.
-pub type RdpStream = TlsStream<TcpStream>;
+/// Bytes read from it count towards `molcajeted_remote_received_bytes_total`.
+pub type RdpStream = TlsStream<CountingStream<TcpStream>>;
 pub type RdpFramed = TokioFramed<RdpStream>;
 
 /// Client build number advertised to the server (FreeRDP's). Servers treat
@@ -245,6 +247,8 @@ pub async fn begin(
             port: settings.port,
             source,
         })?;
+
+    let tcp = CountingStream::new(tcp, remote::received_bytes("rdp"));
 
     let mut connector = build_connector(settings, client_addr, sound);
     let mut framed = TokioFramed::new(tcp);

@@ -5,6 +5,8 @@ use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::geometry::InclusiveRectangle;
 
+use crate::display::{ChannelOrder, SourceImage};
+
 /// A rectangle in desktop pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Area {
@@ -31,8 +33,28 @@ impl Area {
     }
 }
 
+/// The part of a decoded image (`stride` bytes per row, pixels in `format`)
+/// that starts at the top-left corner of `area`, for
+/// [`crate::display::Display::put_image`]. `None` if the format does not
+/// have 4 bytes per pixel or `area` starts past the end of `data`.
+pub fn source_at(
+    data: &[u8],
+    stride: usize,
+    format: PixelFormat,
+    area: Area,
+) -> Option<SourceImage<'_>> {
+    if format.bytes_per_pixel() != 4 {
+        return None;
+    }
+    let [r, g, b, _] = format.channel_offsets();
+    let channels = ChannelOrder::new(r as u8, g as u8, b as u8);
+    SourceImage::at(data, stride, channels, area.x, area.y)
+}
+
 /// Copies `area` out of a decoded image (`stride` bytes per row, pixels in
-/// `format`) as opaque RGBA, top row first.
+/// `format`) as opaque RGBA, top row first: the copy made for every update
+/// before [`source_at`], kept as the reference for tests and the benchmark.
+#[cfg(test)]
 pub fn extract_rgba(data: &[u8], stride: usize, format: PixelFormat, area: Area) -> Vec<u8> {
     let bpp = usize::from(format.bytes_per_pixel());
     let [r, g, b, _] = format.channel_offsets();
@@ -211,6 +233,60 @@ mod tests {
         ] {
             let rgba = extract_rgba(&image(format), 12, format, area);
             assert_eq!(rgba, expected, "{format:?}");
+        }
+    }
+
+    /// Copying straight from the decoded image gives the framebuffer the
+    /// previous `extract_rgba` + `Display::put` gave it, in every format,
+    /// with a padded stride and with rectangles that leave the display.
+    #[test]
+    fn copies_match_extract_and_put() {
+        use crate::display::{Display, ImageFormats};
+        use crate::io::Output;
+
+        let (width, height, stride) = (37u32, 23u32, 37 * 4 + 12);
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let data: Vec<u8> = (0..stride * height as usize)
+            .map(|_| next() as u8)
+            .collect();
+        let new_display = || {
+            let mut display = Display::new(ImageFormats::default(), true);
+            // Narrower than the image, so that rectangles get clipped.
+            display.resize(width - 5, height - 3, &mut Output::text());
+            display
+        };
+        for format in [
+            PixelFormat::RgbA32,
+            PixelFormat::RgbX32,
+            PixelFormat::BgrA32,
+            PixelFormat::BgrX32,
+            PixelFormat::ARgb32,
+            PixelFormat::XRgb32,
+            PixelFormat::ABgr32,
+            PixelFormat::XBgr32,
+        ] {
+            let (mut old, mut new) = (new_display(), new_display());
+            for _ in 0..200 {
+                let left = (next() % u64::from(width)) as u16;
+                let top = (next() % u64::from(height)) as u16;
+                let right = left + (next() % 12) as u16;
+                let bottom = top + (next() % 12) as u16;
+                let Some(area) = Area::clipped(&rect(left, top, right, bottom), width, height)
+                else {
+                    continue;
+                };
+                let rgba = extract_rgba(&data, stride, format, area);
+                old.put(area.x, area.y, area.width, area.height, &rgba);
+                let source = source_at(&data, stride, format, area).unwrap();
+                new.put_image(area.x, area.y, area.width, area.height, &source);
+            }
+            assert!(old.framebuffer() == new.framebuffer(), "{format:?}");
         }
     }
 

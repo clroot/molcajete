@@ -30,7 +30,7 @@ use super::audio::AudioOutput;
 use super::clipboard::{self, GuacClipboard};
 use super::connect::{RdpFramed, RdpStream};
 use super::display_control::{self, DisplayControlStatus};
-use super::graphics::{Area, Cursor, extract_rgba};
+use super::graphics::{self, Area, Cursor};
 use super::keyboard::Keyboard;
 use super::mouse::Mouse;
 use super::pacing::FramePacer;
@@ -39,6 +39,7 @@ use super::slow_path;
 use crate::display::{Display, ImageFormats, Pacing};
 use crate::handshake::ClientInfo;
 use crate::io::GuacWriter;
+use crate::remote::DecodeTime;
 use crate::send_error;
 use crate::session::{self, ClientEvent, Input, InputDecoder};
 
@@ -95,6 +96,10 @@ pub struct Session<'a> {
     scale: u32,
     display_control: DisplayControlStatus,
     audio: Option<AudioOutput>,
+    decode_time: DecodeTime,
+    /// Time spent copying graphics updates into the display since the
+    /// last server PDU was decoded.
+    copy_time: Duration,
 }
 
 impl<'a> Session<'a> {
@@ -158,6 +163,8 @@ impl<'a> Session<'a> {
             scale: settings.desktop_scale_factor(),
             display_control: DisplayControlStatus::new(dynamic_channels, Instant::now()),
             audio,
+            decode_time: DecodeTime::new("rdp"),
+            copy_time: Duration::ZERO,
         }
     }
 
@@ -313,6 +320,7 @@ impl<'a> Session<'a> {
 
     async fn server_pdu(&mut self, action: Action, payload: &[u8]) -> anyhow::Result<Flow> {
         let received_at = self.rdp_reader.last_read_at();
+        let started = Instant::now();
         let outputs = match self
             .stage
             .process(&mut self.image, action, payload, received_at)
@@ -324,7 +332,10 @@ impl<'a> Session<'a> {
                 return Ok(Flow::End);
             }
         };
+        let decoded = started.elapsed();
         let flow = self.stage_outputs(outputs).await?;
+        self.decode_time
+            .record(decoded + std::mem::take(&mut self.copy_time));
         if let Flow::End = flow {
             return Ok(flow);
         }
@@ -354,16 +365,20 @@ impl<'a> Session<'a> {
                         u32::from(self.image.width()),
                         u32::from(self.image.height()),
                     );
-                    if let Some(area) = Area::clipped(&rect, width, height) {
-                        let rgba = extract_rgba(
+                    if let Some(area) = Area::clipped(&rect, width, height)
+                        && let Some(source) = graphics::source_at(
                             self.image.data(),
                             self.image.stride(),
                             self.image.pixel_format(),
                             area,
-                        );
+                        )
+                    {
+                        let started = Instant::now();
                         self.display
-                            .put(area.x, area.y, area.width, area.height, &rgba);
-                        self.pacer.mark_dirty(Instant::now());
+                            .put_image(area.x, area.y, area.width, area.height, &source);
+                        let now = Instant::now();
+                        self.copy_time += now - started;
+                        self.pacer.mark_dirty(now);
                     }
                 }
                 ActiveStageOutput::PointerDefault => self.set_cursor(&Cursor::arrow()),
