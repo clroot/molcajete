@@ -8,7 +8,9 @@
 // audio and an H.264 video stream. A client that offers the subprotocol
 // `molcajete-binary-v1` gets the stream data as raw bytes in binary messages;
 // a client told to stay on the text protocol gets the same frame as base64
-// `blob` instructions. Both must draw the same pixels.
+// `blob` instructions. Both must draw the same pixels. The frame's `sync`
+// must be answered as by a stock client, and a following `sync` that asks
+// for the apply time (molcajete_protocol::apply_time) with that time.
 //
 //   SKIP_UI=1 scripts/build-web.sh && (cd tests/browser && npm ci && node binary.test.mjs)
 //
@@ -341,9 +343,11 @@ server.on("upgrade", (request, socket) => {
   };
   // The tunnel's own messages are text under both subprotocols.
   socket.write(wsFrame(1, Buffer.from(ins("", "00000000-0000-0000-0000-000000000000"))));
-  const parts = content();
-  if (selected === BINARY) for (const message of binaryMessages(parts)) send(2, message);
-  else for (const message of textMessages(parts)) send(1, Buffer.from(message));
+  tunnel.sendParts = (parts) => {
+    if (selected === BINARY) for (const message of binaryMessages(parts)) send(2, message);
+    else for (const message of textMessages(parts)) send(1, Buffer.from(message));
+  };
+  tunnel.sendParts(content());
   socket.on("error", () => {});
 });
 
@@ -426,11 +430,22 @@ for (const mode of ["worker", "main"]) {
       const [r, g, b] = await pixel(32, 168);
       assert.ok(g > 200 && r < 60 && b < 60, `${name}: last video frame is green, got ${[r, g, b]}`);
     }
+    // The frame's `sync` did not ask for the apply time
+    // (molcajete_protocol::apply_time): the stock reply. A `sync` that asks
+    // gets the frame count and the time in microseconds (an empty frame
+    // here, so close to nothing).
+    assert.match(tunnel.received, /(^|;)4\.sync,1\.1;/, `${name}: stock reply`);
+    tunnel.sendParts([{ text: ins("sync", 2, 1, "apply-us") }]);
+    const applyReply = /(^|;)4\.sync,1\.2,1\.1,\d+\.(\d+);/;
+    for (let i = 0; i < 200 && !applyReply.test(tunnel.received); i++) await page.waitForTimeout(25);
+    const [, , micros] = tunnel.received.match(applyReply) ?? [];
+    assert.ok(micros !== undefined, `${name}: apply time reported, got ${tunnel.received}`);
+    assert.ok(Number(micros) < 15e6, `${name}: apply time ${micros} µs`);
     assert.deepEqual(await page.evaluate(() => window.states.filter((s) => s.startsWith("error"))), [], name);
     assert.deepEqual(errors, [], `${name}: no errors or warnings in the page`);
 
     results[name] = { bytes: tunnel.bytes, messages: tunnel.messages };
-    console.log(`ok - ${name}: ${tunnel.bytes} bytes in ${tunnel.messages} messages`);
+    console.log(`ok - ${name}: ${tunnel.bytes} bytes in ${tunnel.messages} messages, an empty frame applied in ${micros} µs`);
     await page.close();
   }
 }

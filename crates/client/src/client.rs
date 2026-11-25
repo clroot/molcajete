@@ -12,7 +12,7 @@ use std::rc::{Rc, Weak};
 
 use base64::Engine;
 use molcajete_protocol::server::ServerInstruction as S;
-use molcajete_protocol::{InstructionBuilder, MouseButtons, Parser, Status};
+use molcajete_protocol::{InstructionBuilder, MouseButtons, Parser, Status, apply_time};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
@@ -1070,11 +1070,16 @@ impl Inner {
                     self.free_out_stream(stream);
                 }
             }
-            S::Sync { timestamp, frames } => {
+            S::Sync {
+                timestamp,
+                frames,
+                apply_time,
+            } => {
                 self.display.enqueue(Op::Sync {
                     timestamp,
                     frames,
                     received_at: scope::performance_now(),
+                    apply_time,
                 });
             }
             S::Mouse { x, y } => self.display.show_software_cursor(x, y),
@@ -1744,12 +1749,26 @@ impl Inner {
                     );
                 }
                 DisplayEvent::FrameComplete {
-                    timestamp, lag_ms, ..
+                    timestamp,
+                    frames,
+                    lag_ms,
+                    apply_ms,
                 } => {
                     self.last_lag_ms = lag_ms;
                     if self.last_sync_ack != Some(timestamp) {
                         self.last_sync_ack = Some(timestamp);
-                        self.send(&InstructionBuilder::new("sync").arg(timestamp).finish());
+                        // A server that asked how long the frame took to
+                        // apply (molcajeted) gets that; any other the stock
+                        // reply.
+                        let reply = match apply_ms {
+                            Some(ms) => {
+                                let apply = std::time::Duration::try_from_secs_f64(ms / 1000.0)
+                                    .unwrap_or_default();
+                                apply_time::sync_reply(timestamp, frames, apply)
+                            }
+                            None => InstructionBuilder::new("sync").arg(timestamp).finish(),
+                        };
+                        self.send(&reply);
                     }
                     if self.state == State::Waiting {
                         self.set_state(State::Connected);

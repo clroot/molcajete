@@ -11,6 +11,7 @@
 //! This crate is shared by the server (guacd replacement), the gateway and the
 //! wasm client, so it has no platform-specific dependencies.
 
+pub mod apply_time;
 pub mod binary;
 mod instruction;
 mod parser;
