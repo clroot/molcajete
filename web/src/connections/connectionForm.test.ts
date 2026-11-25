@@ -7,6 +7,7 @@ import {
   toConnection,
   toConnectionForm,
 } from './connectionForm';
+import {requiredLabel} from './jumpHosts';
 
 const rdp = {
   id: 'office',
@@ -110,5 +111,33 @@ describe('connection form', () => {
     expect(toConnection({...form, parentId: ''})).not.toMatchObject({
       connection: {parentId: expect.anything()},
     });
+  });
+});
+
+describe('jump hosts', () => {
+  const ssh = {
+    ...rdp,
+    protocol: 'ssh',
+    parameters: {
+      hostname: 'db',
+      'jump-hosts': 'admin@bastion',
+      'jump-host-password': 'pw',
+      'jump-host-2-password': 'other',
+    },
+  };
+
+  test('shared jump host values are fields for every protocol; per-hop ones are extras', () => {
+    const form = toConnectionForm(ssh);
+    expect(form.fields).toEqual({hostname: 'db', 'jump-hosts': 'admin@bastion', 'jump-host-password': 'pw'});
+    expect(form.extras.map(e => e.name)).toEqual(['jump-host-2-password']);
+    const vnc = changeProtocol(form, 'vnc');
+    expect(vnc.fields['jump-hosts']).toBe('admin@bastion');
+    expect(toConnection(vnc)).toMatchObject({ok: true, connection: {parameters: ssh.parameters}});
+  });
+
+  test('prompts get readable labels', () => {
+    expect(requiredLabel('jump-host-password')).toBe('Jump host password');
+    expect(requiredLabel('jump-host-2-password')).toBe('Jump host 2 password');
+    expect(requiredLabel('password')).toBe('password');
   });
 });

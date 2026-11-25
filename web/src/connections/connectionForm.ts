@@ -2,6 +2,7 @@
 // Kept free of React so the rules can be tested directly.
 import {ATTRIBUTES, type Connection} from '../api';
 import {protocolInfo} from './protocols';
+import {JUMP_HOST_PARAMETERS} from './jumpHosts';
 
 export type ExtraParameter = {key: number; name: string; value: string};
 
@@ -13,7 +14,7 @@ export type ConnectionForm = {
   guacdPort: string;
   /** Folder id, '' for the top level; only used when creating. */
   parentId: string;
-  /** Values of the fields the current protocol shows. */
+  /** Values of the fields the current protocol shows, and of the jump host fields. */
   fields: Record<string, string>;
   /** Every other guacd parameter, edited as free name/value pairs. */
   extras: ExtraParameter[];
@@ -56,9 +57,9 @@ function toAttributes(r: RecordingChoices): Record<string, string> {
 let nextExtraKey = 1;
 export const extraParameter = (name = '', value = ''): ExtraParameter => ({key: nextExtraKey++, name, value});
 
-/** Splits parameters into the protocol's own fields and free extras. */
+/** Splits parameters into the protocol's own fields (and the jump host fields) and free extras. */
 function splitParameters(protocol: string, parameters: Record<string, string>) {
-  const known = new Set(protocolInfo(protocol).fields.map(f => f.name));
+  const known = new Set([...protocolInfo(protocol).fields.map(f => f.name), ...JUMP_HOST_PARAMETERS]);
   const fields: Record<string, string> = {};
   const extras: ExtraParameter[] = [];
   for (const [name, value] of Object.entries(parameters)) {
