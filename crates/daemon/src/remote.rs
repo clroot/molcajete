@@ -20,6 +20,13 @@ pub fn received_bytes(protocol: &'static str) -> Counter {
     counter!("molcajeted_remote_received_bytes_total", "protocol" => protocol)
 }
 
+/// `molcajeted_remote_frames_total{protocol}`: frames the remote server
+/// marked the end of. It stays at zero for a server that does not mark its
+/// frames, whose updates are then cut wherever frame pacing falls.
+pub fn frames(protocol: &'static str) -> Counter {
+    counter!("molcajeted_remote_frames_total", "protocol" => protocol)
+}
+
 /// `molcajeted_remote_decode_seconds{protocol}`: time to decode one message
 /// from the remote server and apply it to the framebuffer.
 pub struct DecodeTime(Histogram);

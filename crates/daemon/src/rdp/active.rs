@@ -98,6 +98,8 @@ pub struct Session<'a> {
     display_control: DisplayControlStatus,
     audio: Option<AudioOutput>,
     decode_time: DecodeTime,
+    /// Frames the server marked the end of.
+    server_frames: metrics::Counter,
     /// Time spent copying graphics updates into the display since the
     /// last server PDU was decoded.
     copy_time: Duration,
@@ -165,6 +167,7 @@ impl<'a> Session<'a> {
             display_control: DisplayControlStatus::new(dynamic_channels, Instant::now()),
             audio,
             decode_time: DecodeTime::new("rdp"),
+            server_frames: crate::remote::frames("rdp"),
             copy_time: Duration::ZERO,
         }
     }
@@ -335,8 +338,16 @@ impl<'a> Session<'a> {
             }
         };
         let decoded = started.elapsed();
+        let frame_ended = ends_server_frame(action, &outputs);
         let flow = self.stage_outputs(outputs).await?;
         self.pipeline_frames();
+        if frame_ended {
+            if !self.pacer.marks_frames() {
+                info!("the RDP server marks its frames; frames follow its boundaries");
+            }
+            self.pacer.server_frame_ended();
+            self.server_frames.increment(1);
+        }
         self.decode_time
             .record(decoded + std::mem::take(&mut self.copy_time));
         if let Flow::End = flow {
@@ -381,7 +392,7 @@ impl<'a> Session<'a> {
                             .put_image(area.x, area.y, area.width, area.height, &source);
                         let now = Instant::now();
                         self.copy_time += now - started;
-                        self.pacer.mark_dirty(now);
+                        self.pacer.graphics_updated(now);
                     }
                 }
                 ActiveStageOutput::PointerDefault => self.set_cursor(&Cursor::arrow()),
@@ -752,6 +763,65 @@ impl<'a> Session<'a> {
     }
 }
 
+/// Whether the PDU that produced `outputs` ended a frame of the server.
+///
+/// IronRDP handles Frame Marker surface commands itself and reports nothing
+/// about them, but it answers every frame end with a Frame Acknowledge, and
+/// that is the only response a fast-path update ever produces.
+fn ends_server_frame(action: Action, outputs: &[ActiveStageOutput]) -> bool {
+    matches!(action, Action::FastPath)
+        && outputs
+            .iter()
+            .any(|o| matches!(o, ActiveStageOutput::ResponseFrame(frame) if !frame.is_empty()))
+}
+
 fn supports_fastpath(flags: InputFlags) -> bool {
     flags.intersects(InputFlags::FASTPATH_INPUT | InputFlags::FASTPATH_INPUT_2)
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_svc::StaticChannelSet;
+
+    use super::*;
+
+    /// A fast-path update PDU holding one Frame Marker surface command.
+    fn frame_marker(end: bool, frame_id: u32) -> Vec<u8> {
+        // Surface command: cmdType (frame marker), frameAction, frameId.
+        let mut command = vec![0x04, 0x00, u8::from(end), 0x00];
+        command.extend_from_slice(&frame_id.to_le_bytes());
+        // Update: code (surface commands, not fragmented or compressed), size.
+        let mut update = vec![0x04];
+        update.extend_from_slice(&(command.len() as u16).to_le_bytes());
+        update.extend_from_slice(&command);
+        // PDU: fast-path action, total length.
+        let mut pdu = vec![0x00, (update.len() + 2) as u8];
+        pdu.extend_from_slice(&update);
+        pdu
+    }
+
+    #[test]
+    fn a_frame_end_is_told_from_a_frame_begin() {
+        let mut stage = ActiveStageBuilder {
+            static_channels: StaticChannelSet::new(),
+            user_channel_id: 1001,
+            io_channel_id: 1003,
+            message_channel_id: None,
+            share_id: 1,
+            compression_type: None,
+            enable_server_pointer: true,
+            pointer_software_rendering: false,
+        }
+        .build();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 64, 64);
+        let mut process = |pdu: &[u8]| {
+            let outputs = stage
+                .process(&mut image, Action::FastPath, pdu, None)
+                .expect("valid PDU");
+            ends_server_frame(Action::FastPath, &outputs)
+        };
+        assert!(!process(&frame_marker(false, 7)));
+        assert!(process(&frame_marker(true, 7)));
+        assert!(!process(&frame_marker(false, 8)));
+    }
 }
