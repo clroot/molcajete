@@ -30,7 +30,7 @@ use super::audio::AudioOutput;
 use super::clipboard::{self, GuacClipboard};
 use super::connect::{RdpFramed, RdpStream};
 use super::display_control::{self, DisplayControlStatus};
-use super::graphics::{Area, Cursor, extract_rgba};
+use super::graphics::{self, Area, Cursor};
 use super::keyboard::Keyboard;
 use super::mouse::Mouse;
 use super::pacing::FramePacer;
@@ -354,15 +354,16 @@ impl<'a> Session<'a> {
                         u32::from(self.image.width()),
                         u32::from(self.image.height()),
                     );
-                    if let Some(area) = Area::clipped(&rect, width, height) {
-                        let rgba = extract_rgba(
+                    if let Some(area) = Area::clipped(&rect, width, height)
+                        && let Some(source) = graphics::source_at(
                             self.image.data(),
                             self.image.stride(),
                             self.image.pixel_format(),
                             area,
-                        );
+                        )
+                    {
                         self.display
-                            .put(area.x, area.y, area.width, area.height, &rgba);
+                            .put_image(area.x, area.y, area.width, area.height, &source);
                         self.pacer.mark_dirty(Instant::now());
                     }
                 }

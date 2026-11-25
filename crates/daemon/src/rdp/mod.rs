@@ -10,6 +10,8 @@
 
 mod active;
 mod audio;
+#[cfg(test)]
+mod bench;
 mod clipboard;
 mod connect;
 mod display_control;
