@@ -25,16 +25,15 @@ mod video;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use molcajete_protocol::InstructionBuilder;
+
+use crate::io::Output;
 
 use encode::Region;
 use metrics::{DisplayMetrics, ImageKind, Phase, timed};
 use pacing::FrameClock;
 pub use pacing::Pacing;
 
-/// Largest raw chunk carried by one `blob` (same as libguac).
-const BLOB_MAX_BYTES: usize = 6048;
 /// Granularity of change tracking and of the heat map.
 const TILE: u32 = 64;
 /// Changed rows separated by fewer unchanged rows share one image.
@@ -619,7 +618,7 @@ impl Display {
 
     /// Resizes the default layer, preserving the overlapping content (the
     /// client does the same with its layer).
-    pub fn resize(&mut self, width: u32, height: u32, out: &mut String) {
+    pub fn resize(&mut self, width: u32, height: u32, out: &mut Output) {
         self.stop_video(out);
         let resized = |old: &[u8], old_w: u32, old_h: u32| {
             let mut buf = vec![0u8; (width * height * 4) as usize];
@@ -732,7 +731,7 @@ impl Display {
         dy: u32,
         w: u32,
         h: u32,
-        out: &mut String,
+        out: &mut Output,
     ) -> FlushStats {
         let src = Rect::new(sx, sy, w, h).clip(self.width, self.height);
         let dst = Rect::new(dx, dy, src.w, src.h).clip(self.width, self.height);
@@ -772,7 +771,7 @@ impl Display {
     // ------------------------------------------------------------------
 
     /// Sends everything that differs between the framebuffer and the client.
-    pub fn flush(&mut self, out: &mut String) -> FlushStats {
+    pub fn flush(&mut self, out: &mut Output) -> FlushStats {
         let started = Instant::now();
         let mut stats = FlushStats::default();
         self.decay();
@@ -937,7 +936,7 @@ impl Display {
     /// block of anything that moved across it, and the displacements found
     /// are then tried on every changed block. Only things smaller than the
     /// grid spacing can slip through, and those are cheap to send as pixels.
-    fn detect_moves(&mut self, regions: &[Rect], out: &mut String) -> FlushStats {
+    fn detect_moves(&mut self, regions: &[Rect], out: &mut Output) -> FlushStats {
         let mut stats = FlushStats::default();
         let (areas, owner) = cluster(regions, MOVE_SEARCH_GAP);
         let weights = row_weights();
@@ -1138,7 +1137,7 @@ impl Display {
 
     /// Finds content that moved vertically inside `rect` (relative to what
     /// the client shows) and emits `copy` instructions for it.
-    fn detect_scroll(&mut self, rect: &Rect, out: &mut String) -> FlushStats {
+    fn detect_scroll(&mut self, rect: &Rect, out: &mut Output) -> FlushStats {
         let (x0, x1) = (rect.x, rect.right());
 
         // Index the client's rows around the region by hash.
@@ -1365,7 +1364,7 @@ impl Display {
     }
 
     /// Re-sends lossy areas losslessly once they stopped changing.
-    fn refine_lossy(&mut self, out: &mut String) -> FlushStats {
+    fn refine_lossy(&mut self, out: &mut Output) -> FlushStats {
         let mut stats = FlushStats::default();
         if self.lossless {
             return stats;
@@ -1413,7 +1412,7 @@ impl Display {
     }
 
     /// Sends `rect` of the framebuffer and records it in the mirror.
-    fn emit_rect(&mut self, rect: Rect, out: &mut String) -> FlushStats {
+    fn emit_rect(&mut self, rect: Rect, out: &mut Output) -> FlushStats {
         let mut stats = FlushStats::default();
         let rect = rect.clip(self.width, self.height);
         if rect.is_empty() {
@@ -1502,7 +1501,7 @@ impl Display {
         }
     }
 
-    fn emit_fill(&mut self, rect: &Rect, color: [u8; 4], mode: u8, out: &mut String) {
+    fn emit_fill(&mut self, rect: &Rect, color: [u8; 4], mode: u8, out: &mut Output) {
         *out += &InstructionBuilder::new("rect")
             .arg(0)
             .arg(rect.x)
@@ -1524,7 +1523,7 @@ impl Display {
     }
 
     /// Emits a layer-0 copy and replays it on the mirror.
-    fn emit_copy(&mut self, src: &Rect, dx: u32, dy: u32, out: &mut String) {
+    fn emit_copy(&mut self, src: &Rect, dx: u32, dy: u32, out: &mut Output) {
         *out += &InstructionBuilder::new("copy")
             .arg(0)
             .arg(src.x)
@@ -1548,7 +1547,7 @@ impl Display {
         x: i32,
         y: i32,
         bytes: &[u8],
-        out: &mut String,
+        out: &mut Output,
     ) {
         let stream = self.next_stream;
         self.next_stream = (self.next_stream + 1) % 64;
@@ -1560,13 +1559,7 @@ impl Display {
             .arg(x)
             .arg(y)
             .finish();
-        let b64 = base64::engine::general_purpose::STANDARD;
-        for chunk in bytes.chunks(BLOB_MAX_BYTES) {
-            *out += &InstructionBuilder::new("blob")
-                .arg(stream)
-                .str_arg(&b64.encode(chunk))
-                .finish();
-        }
+        out.blob(stream, bytes);
         *out += &InstructionBuilder::new("end").arg(stream).finish();
     }
 
@@ -1582,7 +1575,7 @@ impl Display {
         width: u32,
         height: u32,
         rgba: &[u8],
-        out: &mut String,
+        out: &mut Output,
     ) {
         if width == 0 || height == 0 || rgba.len() < (width * height * 4) as usize {
             return;
@@ -1622,7 +1615,7 @@ impl Display {
     }
 
     /// Ends a frame.
-    pub fn sync(&mut self, out: &mut String) {
+    pub fn sync(&mut self, out: &mut Output) {
         let mut ts = now_ms();
         if let Some(last) = self.last_sync
             && ts <= last

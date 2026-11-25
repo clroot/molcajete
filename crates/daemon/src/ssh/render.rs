@@ -435,6 +435,7 @@ impl Pointer {
 mod tests {
     use super::*;
     use crate::display::ImageFormats;
+    use crate::io::Output;
     use crate::ssh::font::FontOptions;
     use crate::ssh::terminal::Terminal;
 
@@ -449,7 +450,7 @@ mod tests {
         let m = renderer.metrics();
         let mut display = Display::new(ImageFormats::default(), true);
         let (w, h) = (cols as u32 * m.width + 3, rows as u32 * m.height + 5);
-        display.resize(w, h, &mut String::new());
+        display.resize(w, h, &mut Output::text());
         let size = renderer.grid_size(w, h);
         assert_eq!(size, Size { cols, rows });
         renderer.invalidate(size);
@@ -520,7 +521,7 @@ mod tests {
         let (mut r, mut t, mut d) = setup(4, 2);
         t.feed(b"\x1b[?25l\x1b[42m \x1b[0m");
         r.render(t.term(), &mut d);
-        let mut out = String::new();
+        let mut out = Output::text();
         d.flush(&mut out);
         // Cell (0,0) has a green background: its image or fill is sent.
         assert!(out.contains("img") || out.contains("cfill"), "{out}");

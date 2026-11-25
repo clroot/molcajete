@@ -15,12 +15,12 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use molcajete_protocol::video::{VideoCodec, encode_frame};
 use molcajete_protocol::{InstructionBuilder, Status};
 use tracing::{debug, info, warn};
 
-use super::{BLOB_MAX_BYTES, Display, FlushStats, Rect, TILE};
+use super::{Display, FlushStats, Rect, TILE};
+use crate::io::Output;
 use crate::video::{EncoderConfig, VideoEncoder, VideoError};
 
 /// Creates encoders for the codec chosen at connection time.
@@ -152,7 +152,7 @@ impl Display {
 
     /// Handles an `ack` from the client: an error for the video stream means
     /// the client cannot play it, so video mode is turned off for good.
-    pub fn stream_ack(&mut self, stream: i32, status: Status, out: &mut String) {
+    pub fn stream_ack(&mut self, stream: i32, status: Status, out: &mut Output) {
         if stream == VIDEO_STREAM && status.is_error() && self.video.is_some() {
             warn!(
                 status = status.code(),
@@ -215,7 +215,7 @@ impl Display {
 
     /// Starts, feeds or stops the video. Runs first in every flush; tiles
     /// inside the video area are then skipped by the image diff.
-    pub(super) fn update_video(&mut self, out: &mut String) -> FlushStats {
+    pub(super) fn update_video(&mut self, out: &mut Output) -> FlushStats {
         if self.video_support.is_none() {
             return FlushStats::default();
         }
@@ -244,7 +244,7 @@ impl Display {
         self.video_frame(now, false, out)
     }
 
-    fn start_video(&mut self, rect: Rect, now: Instant, out: &mut String) -> FlushStats {
+    fn start_video(&mut self, rect: Rect, now: Instant, out: &mut Output) -> FlushStats {
         let Some(support) = &mut self.video_support else {
             return FlushStats::default();
         };
@@ -313,7 +313,7 @@ impl Display {
 
     /// Ends the video stream and disposes its layer. The default layer
     /// underneath is re-compared in full at this flush.
-    pub(super) fn stop_video(&mut self, out: &mut String) {
+    pub(super) fn stop_video(&mut self, out: &mut Output) {
         let Some(video) = self.video.take() else {
             return;
         };
@@ -351,7 +351,7 @@ impl Display {
     }
 
     /// Encodes the video area if it changed (always when `key` is set).
-    fn video_frame(&mut self, now: Instant, key: bool, out: &mut String) -> FlushStats {
+    fn video_frame(&mut self, now: Instant, key: bool, out: &mut Output) -> FlushStats {
         let Some(video) = &self.video else {
             return FlushStats::default();
         };
@@ -405,13 +405,7 @@ impl Display {
         video.bytes += framed.len();
         self.metrics
             .video_frame(codec, encoded.key, encode_time, framed.len());
-        let b64 = base64::engine::general_purpose::STANDARD;
-        for chunk in framed.chunks(BLOB_MAX_BYTES) {
-            *out += &InstructionBuilder::new("blob")
-                .arg(VIDEO_STREAM)
-                .str_arg(&b64.encode(chunk))
-                .finish();
-        }
+        out.blob(VIDEO_STREAM, &framed);
         FlushStats {
             images: 1,
             bytes: framed.len(),
@@ -505,7 +499,7 @@ mod tests {
                 }))
             }),
         );
-        let mut out = String::new();
+        let mut out = Output::text();
         display.resize(640, 480, &mut out);
         display.flush(&mut out);
         (display, log)
@@ -530,7 +524,7 @@ mod tests {
         let (mut display, log) = display_with_video();
         let mut started_at = None;
         for frame in 0..40u32 {
-            let mut out = String::new();
+            let mut out = Output::text();
             display.put(100, 70, 300, 200, &noise(frame, 300, 200));
             display.flush(&mut out);
             display.sync(&mut out);
@@ -558,7 +552,7 @@ mod tests {
 
         // Once idle, the video ends and the area is sent losslessly.
         std::thread::sleep(IDLE + Duration::from_millis(50));
-        let mut out = String::new();
+        let mut out = Output::text();
         display.flush(&mut out);
         assert!(out.contains("3.end,3.101;"), "{out}");
         assert!(out.contains("7.dispose,1.1;"), "{out}");
@@ -572,7 +566,7 @@ mod tests {
     fn text_like_content_stays_lossless() {
         let (mut display, log) = display_with_video();
         for frame in 0..30u32 {
-            let mut out = String::new();
+            let mut out = Output::text();
             // Two-colour content changing every frame (e.g. a terminal).
             let data: Vec<u8> = noise(frame, 300, 200)
                 .chunks_exact(4)
@@ -596,7 +590,7 @@ mod tests {
     #[test]
     fn rejected_stream_disables_video() {
         let (mut display, log) = display_with_video();
-        let mut out = String::new();
+        let mut out = Output::text();
         for frame in 0..30u32 {
             display.put(0, 0, 256, 256, &noise(frame, 256, 256));
             display.flush(&mut out);
@@ -604,7 +598,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(display.video.is_some());
-        let mut out = String::new();
+        let mut out = Output::text();
         display.stream_ack(VIDEO_STREAM, Status::CLIENT_BAD_TYPE, &mut out);
         assert!(out.contains("7.dispose,1.1;"));
         assert!(display.video.is_none());

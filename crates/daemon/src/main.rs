@@ -159,6 +159,7 @@ async fn session(
         dpi = info.dpi,
         image = ?info.image,
         video = ?info.video,
+        binary = info.binary,
         "connection established"
     );
     let active = metrics::gauge!("molcajeted_connections_active", "protocol" => protocol);

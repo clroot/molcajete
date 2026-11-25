@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::display::Display;
 use crate::handshake::ClientInfo;
-use crate::io::GuacReader;
+use crate::io::{GuacReader, Output};
 use crate::video::VideoEncoders;
 
 /// Input from the Guacamole client, already decoded.
@@ -95,7 +95,7 @@ pub struct InputDecoder {
 impl InputDecoder {
     /// Decodes one instruction. Acknowledgements owed to the client are
     /// appended to `out`.
-    pub fn decode(&mut self, ins: &Input, out: &mut String) -> Option<ClientEvent> {
+    pub fn decode(&mut self, ins: &Input, out: &mut Output) -> Option<ClientEvent> {
         let int = |i: usize| ins.arg(i).trim().parse::<i64>().ok();
         match ins.opcode.as_str() {
             "mouse" => Some(ClientEvent::Mouse {
@@ -204,7 +204,7 @@ pub fn spawn_reader(mut reader: GuacReader) -> (mpsc::Receiver<Input>, JoinHandl
     (rx, task)
 }
 
-pub fn ack(out: &mut String, stream: i32, message: &str, status: Status) {
+pub fn ack(out: &mut Output, stream: i32, message: &str, status: Status) {
     *out += &InstructionBuilder::new("ack")
         .arg(stream)
         .str_arg(message)
@@ -216,18 +216,12 @@ pub fn ack(out: &mut String, stream: i32, message: &str, status: Status) {
 const CLIPBOARD_STREAM: i32 = 100;
 
 /// Sends text to the client clipboard.
-pub fn send_clipboard(out: &mut String, text: &str) {
-    let b64 = base64::engine::general_purpose::STANDARD;
+pub fn send_clipboard(out: &mut Output, text: &str) {
     *out += &InstructionBuilder::new("clipboard")
         .arg(CLIPBOARD_STREAM)
         .str_arg("text/plain")
         .finish();
-    for chunk in text.as_bytes().chunks(4096) {
-        *out += &InstructionBuilder::new("blob")
-            .arg(CLIPBOARD_STREAM)
-            .str_arg(&b64.encode(chunk))
-            .finish();
-    }
+    out.blob(CLIPBOARD_STREAM, text.as_bytes());
     *out += &InstructionBuilder::new("end")
         .arg(CLIPBOARD_STREAM)
         .finish();
@@ -235,12 +229,12 @@ pub fn send_clipboard(out: &mut String, text: &str) {
 
 /// Asks the client for missing parameters (e.g. credentials); the answers
 /// arrive as [`ClientEvent::Argv`]. Requires protocol version 1.3.0 or later.
-pub fn send_required(out: &mut String, names: &[&str]) {
+pub fn send_required(out: &mut Output, names: &[&str]) {
     *out += &InstructionBuilder::new("required").args(names).finish();
 }
 
 /// Sets the connection name shown by the client.
-pub fn send_name(out: &mut String, name: &str) {
+pub fn send_name(out: &mut Output, name: &str) {
     *out += &InstructionBuilder::new("name").str_arg(name).finish();
 }
 
@@ -301,7 +295,7 @@ mod tests {
     #[test]
     fn decodes_input_events() {
         let mut d = InputDecoder::default();
-        let mut out = String::new();
+        let mut out = Output::text();
         assert_eq!(
             d.decode(&ins("5.mouse,2.10,2.20,1.5;"), &mut out),
             Some(ClientEvent::Mouse {
@@ -332,7 +326,7 @@ mod tests {
     #[test]
     fn reassembles_clipboard_and_argv_streams() {
         let mut d = InputDecoder::default();
-        let mut out = String::new();
+        let mut out = Output::text();
         assert_eq!(
             d.decode(&ins("9.clipboard,1.3,10.text/plain;"), &mut out),
             None
