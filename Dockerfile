@@ -10,6 +10,9 @@
 
 ARG RUST_VERSION=1.94
 ARG DEBIAN_SUITE=trixie
+ARG BUN_VERSION=1.4.0
+
+FROM oven/bun:${BUN_VERSION} AS bun
 
 # ---------------------------------------------------------------------------
 FROM rust:${RUST_VERSION}-${DEBIAN_SUITE} AS toolchain
@@ -18,6 +21,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends binaryen \
  && rm -rf /var/lib/apt/lists/*
 RUN rustup target add wasm32-unknown-unknown
+# bun builds the React UI (web/) after the wasm package.
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked
 
@@ -34,7 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     scripts/build-web.sh; \
     mkdir -p /out/bin; \
     cp "target/${CARGO_PROFILE}/molcajete-gateway" "target/${CARGO_PROFILE}/molcajeted" /out/bin/; \
-    cp -r web /out/web; \
+    cp -r web/dist /out/web; \
     chmod -R a+rX /out
 
 # ---------------------------------------------------------------------------
@@ -64,9 +69,14 @@ CMD ["molcajeted"]
 FROM runtime-base AS gateway
 COPY --from=build /out/bin/molcajete-gateway /usr/local/bin/molcajete-gateway
 COPY --from=build /out/web /usr/share/molcajete/web
+# Without MOLCAJETE_DATABASE_URL, users and connections are kept in SQLite
+# under MOLCAJETE_DATA_DIR: mount a volume there to keep them.
+RUN install -d -o molcajete -g molcajete /var/lib/molcajete
 ENV MOLCAJETE_CONFIG=/etc/molcajete/gateway.toml \
     MOLCAJETE_LISTEN=0.0.0.0:8080 \
-    MOLCAJETE_STATIC_DIR=/usr/share/molcajete/web
+    MOLCAJETE_STATIC_DIR=/usr/share/molcajete/web \
+    MOLCAJETE_DATA_DIR=/var/lib/molcajete
+VOLUME /var/lib/molcajete
 USER molcajete
 EXPOSE 8080 9100
 CMD ["molcajete-gateway"]

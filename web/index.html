@@ -1,78 +1,15 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>molcajete</title>
-  <link rel="stylesheet" href="style.css">
-  <link rel="icon" href="favicon.ico" sizes="48x48">
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="apple-touch-icon.png">
-</head>
-<body>
-  <main id="home" class="home" hidden>
-    <header class="home-header">
-      <h1>molcajete</h1>
-      <p class="muted">Remote desktop gateway · WebGL2 renderer</p>
-    </header>
-    <ul id="connections" class="connections" aria-label="Connections"></ul>
-    <p id="home-message" class="muted" role="status"></p>
-  </main>
-
-  <section id="session" class="session" hidden>
-    <div id="display" class="display"></div>
-
-    <div id="overlay" class="overlay" hidden>
-      <div class="overlay-card">
-        <div id="overlay-spinner" class="spinner" aria-hidden="true"></div>
-        <p id="overlay-title" class="overlay-title"></p>
-        <p id="overlay-detail" class="muted"></p>
-        <div class="overlay-actions">
-          <button id="overlay-reconnect" type="button" hidden>Reconnect</button>
-          <button id="overlay-home" type="button" class="secondary">Back to connections</button>
-        </div>
-      </div>
-    </div>
-
-    <form id="required" class="overlay" hidden>
-      <div class="overlay-card">
-        <p class="overlay-title">Credentials required</p>
-        <div id="required-fields" class="fields"></div>
-        <div class="overlay-actions">
-          <button type="submit">Continue</button>
-        </div>
-      </div>
-    </form>
-
-    <aside id="menu" class="menu" hidden aria-label="Session menu">
-      <div class="menu-header">
-        <strong id="menu-title">Session</strong>
-        <span class="muted">Ctrl+Alt+Shift</span>
-      </div>
-      <label class="field">
-        <span>Clipboard</span>
-        <textarea id="clipboard" rows="5" spellcheck="false"></textarea>
-      </label>
-      <label class="field inline">
-        <span>Scale</span>
-        <select id="scale-mode">
-          <option value="fit">Fit to window</option>
-          <option value="native">Native (1:1)</option>
-        </select>
-      </label>
-      <label class="field inline">
-        <input id="show-stats" type="checkbox">
-        <span>Show performance stats</span>
-      </label>
-      <div class="menu-actions">
-        <button id="cad" type="button" class="secondary">Ctrl+Alt+Del</button>
-        <button id="disconnect" type="button" class="danger">Disconnect</button>
-      </div>
-    </aside>
-
-    <pre id="stats" class="stats" hidden></pre>
-  </section>
-
-  <script type="module" src="app.js"></script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>molcajete</title>
+    <link rel="icon" href="./favicon.ico" sizes="48x48" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>

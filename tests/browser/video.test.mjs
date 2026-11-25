@@ -92,7 +92,7 @@ window.ready = true;
 </script>`,
     });
   }
-  const file = path.join(root, "web", p);
+  const file = path.join(root, "web/public", p);
   return route.fulfill({ contentType: file.endsWith(".wasm") ? "application/wasm" : "text/javascript", body: await readFile(file) });
 });
 await page.goto("http://localhost:9/");

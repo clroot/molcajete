@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Builds the wasm client and generates JS bindings into web/pkg.
-#   PROFILE=dev scripts/build-web.sh      # fast, unoptimized
+# Builds the web client into web/dist: the wasm client and its JS bindings
+# (web/public/pkg), then the React UI (bun).
+#   PROFILE=dev scripts/build-web.sh      # fast, unoptimized wasm
 #   scripts/build-web.sh                  # optimized (default)
+#   SKIP_UI=1 scripts/build-web.sh        # wasm only (e.g. for `bun run dev`)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -12,13 +14,17 @@ case "$PROFILE" in
   *) TARGET_DIR="$PROFILE" ;;
 esac
 
+PKG=web/public/pkg
 cargo build -p molcajete-client --target wasm32-unknown-unknown --profile "$PROFILE"
-wasm-bindgen --target web --no-typescript --out-dir web/pkg \
+wasm-bindgen --target web --no-typescript --out-dir "$PKG" \
   "target/wasm32-unknown-unknown/$TARGET_DIR/molcajete_client.wasm"
 
 if command -v wasm-opt >/dev/null 2>&1 && [ "$PROFILE" != dev ]; then
   wasm-opt -Os --enable-bulk-memory --enable-nontrapping-float-to-int \
-    -o web/pkg/molcajete_client_bg.wasm web/pkg/molcajete_client_bg.wasm
+    -o "$PKG/molcajete_client_bg.wasm" "$PKG/molcajete_client_bg.wasm"
 fi
+ls -l "$PKG"
 
-ls -l web/pkg
+if [ -z "${SKIP_UI:-}" ]; then
+  (cd web && bun install --frozen-lockfile && bun run build)
+fi

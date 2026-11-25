@@ -1,6 +1,9 @@
 .git
 target
-web/pkg
 tests/browser/node_modules
 gateway.toml
 **/.DS_Store
+web/node_modules
+web/dist
+web/public/pkg
+molcajete.db*

@@ -114,7 +114,7 @@ async function run(kind) {
     }
     if (p === "/recording.json") return route.fulfill({ contentType: "application/json", body: await recording });
     if (p === "/guacamole-common.js") return route.fulfill({ contentType: "text/javascript", body: stockJs });
-    const file = path.join(root, "web", p);
+    const file = path.join(root, "web/public", p);
     const type = file.endsWith(".wasm") ? "application/wasm" : "text/javascript";
     return route.fulfill({ contentType: type, body: await readFile(file) });
   });

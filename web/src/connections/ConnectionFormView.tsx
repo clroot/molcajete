@@ -1,0 +1,115 @@
+import {useState, type FormEvent} from 'react';
+import {VStack} from '@astryxdesign/core/Stack';
+import {TextInput} from '@astryxdesign/core/TextInput';
+import {Selector} from '@astryxdesign/core/Selector';
+import {Banner} from '@astryxdesign/core/Banner';
+import {Divider} from '@astryxdesign/core/Divider';
+import {Heading} from '@astryxdesign/core/Heading';
+import {api, errorMessage, type Connection} from '../api';
+import {FormActions, FormDrawerLayout} from '../shell/FormDrawer';
+import {PROTOCOLS, protocolInfo} from './protocols';
+import {changeProtocol, slugify, toConnection, type ConnectionForm} from './connectionForm';
+import ParameterInput from './ParameterInput';
+import AdvancedSettings from './AdvancedSettings';
+
+const FORM_ID = 'connection-form';
+
+type Props = {
+  isNew: boolean;
+  initial: ConnectionForm;
+  onClose: () => void;
+  onSaved: (connection: Connection) => void;
+};
+
+export default function ConnectionFormView({isNew, initial, onClose, onSaved}: Props) {
+  const [form, setForm] = useState(initial);
+  const [isIdEdited, setIsIdEdited] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const update = (patch: Partial<ConnectionForm>) => setForm(f => ({...f, ...patch}));
+  // A new connection's id follows its name until the id is edited by hand.
+  const changeName = (name: string) => update(isNew && !isIdEdited ? {name, id: slugify(name)} : {name});
+  const protocol = protocolInfo(form.protocol);
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    const result = toConnection(form);
+    if (!result.ok) {
+      setError(result.reason);
+      return;
+    }
+    setError('');
+    setIsSaving(true);
+    try {
+      const request = isNew ? api.createConnection : api.updateConnection;
+      onSaved(await request(result.connection));
+    } catch (err) {
+      setError(errorMessage(err));
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <FormDrawerLayout
+      title={isNew ? 'New connection' : 'Edit connection'}
+      subtitle={isNew ? undefined : form.id}
+      onClose={onClose}
+      footer={
+        <FormActions
+          formId={FORM_ID}
+          submitLabel={isNew ? 'Create connection' : 'Save'}
+          isSaving={isSaving}
+          onCancel={onClose}
+        />
+      }>
+      <form id={FORM_ID} onSubmit={save} noValidate>
+        <VStack gap={5}>
+          {error && <Banner status="error" title={error} />}
+
+          <VStack gap={4}>
+            <TextInput label="Name" value={form.name} onChange={changeName} isRequired hasAutoFocus={isNew} />
+            {isNew && (
+              <TextInput
+                label="Id"
+                description="Used in the connection's address. Letters, digits, '-', '_' and '.'."
+                value={form.id}
+                onChange={id => {
+                  setIsIdEdited(true);
+                  update({id});
+                }}
+                autoCapitalize="none"
+                hasSpellCheck={false}
+                isRequired
+              />
+            )}
+            <Selector
+              label="Protocol"
+              value={form.protocol}
+              onChange={value => value && setForm(f => changeProtocol(f, value))}
+              options={PROTOCOLS.map(p => ({value: p.value, label: p.label}))}
+            />
+          </VStack>
+
+          <Divider />
+
+          <VStack gap={4}>
+            <Heading level={3}>{protocol.label} settings</Heading>
+            {protocol.fields.map(field => (
+              <ParameterInput
+                key={`${form.protocol}:${field.name}`}
+                field={field}
+                value={form.fields[field.name] ?? ''}
+                onChange={value => update({fields: {...form.fields, [field.name]: value}})}
+              />
+            ))}
+          </VStack>
+
+          <Divider />
+
+          <AdvancedSettings form={form} onChange={update} />
+        </VStack>
+      </form>
+    </FormDrawerLayout>
+  );
+}

@@ -2,16 +2,27 @@
 
 [server]
 listen = "127.0.0.1:8080"
-static_dir = "web"
+static_dir = "web/dist"
 
 [guacd]
 host = "127.0.0.1"
 port = 4822
 
-# Uncomment to require HTTP Basic authentication.
-# [[users]]
-# username = "admin"
-# password = "change-me"
+# Users and connections are stored in a database. Without a [database]
+# section the gateway uses SQLite (<server.data_dir>/molcajete.db).
+# [database]
+# url = "postgres://molcajete:secret@127.0.0.1/molcajete"
+# url = "mysql://molcajete:secret@127.0.0.1/molcajete"
+
+# Created as an administrator on startup if the username does not exist
+# yet; afterwards, manage users (and passwords) in the web UI. Without any
+# user, an "admin" account with a random password is created and logged.
+[[users]]
+username = "admin"
+password = "change-me"
+
+# Connections below are imported once, when their id is not in the
+# database yet; afterwards, edit them in the web UI.
 
 # Targets below match docker/compose.yml (hostnames are resolved by guacd).
 [[connections]]

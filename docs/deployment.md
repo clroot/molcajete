@@ -8,7 +8,7 @@ How to run molcajete in containers, and how to find bottlenecks from the logs, m
 browser
   -> https://molcajete.example.com      public HTTPS (reverse proxy, deploy/nas-nginx.conf)
   -> https://molcajete.<tailnet>.ts.net Tailnet-only ingress (deploy/k8s/ingress.yaml)
-  -> gateway:8080                       static files, /api, /websocket-tunnel, Basic auth
+  -> gateway:8080                       web UI, /api, /websocket-tunnel, login sessions
   -> molcajeted:4822 (same pod)         VNC / RDP / SSH -> remote desktops
 ```
 
@@ -66,6 +66,7 @@ curl -s http://127.0.0.1:9101/metrics | head      # molcajeted
 
 3. Uncomment `sealed-secret.yaml` in `kustomization.yaml` and set the image names and tags.
 4. With Argo CD, add the Application and allow the `molcajete` namespace in its AppProject.
+5. Users and connections live in a database. Either set `MOLCAJETE_DATABASE_URL` (PostgreSQL or MySQL; keep the URL in a Secret) or mount a PersistentVolume at `/var/lib/molcajete` for the default SQLite file. Without either, everything created in the web UI is lost when the pod restarts.
 
 If the remote desktops are on the LAN, check first that pods can reach LAN addresses. On a single-node cluster on a Mac (OrbStack), `host.orb.internal` is the Mac itself, and its port 5900 is macOS Screen Sharing, not a test VNC server.
 
@@ -76,7 +77,8 @@ If the remote desktops are on the LAN, check first that pods can reach LAN addre
 - `/websocket-tunnel` passes the WebSocket upgrade headers, disables buffering and allows 1 hour of idleness.
 - `X-Real-IP` and `X-Forwarded-For` are overwritten with `$remote_addr`, not appended to. The Tailscale ingress in between replaces `X-Forwarded-For` with its own peer address, so the gateway logs `X-Real-IP` first.
 - If nginx runs in Docker with published ports, `$remote_addr` may be the Docker bridge gateway for every client; use host networking to see real client addresses.
-- Authentication is the gateway's `[[users]]` (HTTP Basic). Once public, all remote desktops depend on that one password: use a long one, and restrict client addresses at the proxy or put single sign-on in front.
+- Authentication is the gateway's login page: users and their Argon2id password hashes are in the database, sessions are `HttpOnly`, `SameSite=Strict` cookies (`Secure` behind `X-Forwarded-Proto: https`). Once public, the remote desktops depend on those passwords: use long ones, and restrict client addresses at the proxy or put single sign-on in front.
+- The proxy must pass `Host` (or `X-Forwarded-Host`) through unchanged: the gateway refuses state-changing requests and tunnels whose `Origin` does not match it.
 
 ## Observability options
 

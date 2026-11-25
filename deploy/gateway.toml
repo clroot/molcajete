@@ -11,7 +11,13 @@
 host = "molcajeted"
 port = 4822
 
-# Required as soon as the gateway is reachable from outside (reverse proxy).
+# Users and connections are kept in a database: PostgreSQL or MySQL here,
+# otherwise SQLite in MOLCAJETE_DATA_DIR (/var/lib/molcajete; mount a volume).
+# [database]
+# url = "postgres://molcajete:change-me@postgres/molcajete"
+
+# Created as an administrator on first start; afterwards manage users and
+# connections in the web UI. The entries below are only imported once.
 [[users]]
 username = "admin"
 password = "change-me"

@@ -7,3 +7,4 @@
 node_modules/
 /deploy/gateway.local.toml
 .idea
+/molcajete.db*
