@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  molcajeted as a launchd agent, so it can use VideoToolbox (see
+  docs/deployment.md, "molcajeted on macOS"). Replace /Users/USER and copy to
+  ~/Library/LaunchAgents/, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.molcajete.molcajeted.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.molcajete.molcajeted</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USER/.local/bin/molcajeted</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- The Guacamole protocol has no authentication: keep it on loopback.
+         OrbStack containers still reach it as host.orb.internal:4822. -->
+    <key>MOLCAJETED_BIND_HOST</key>
+    <string>127.0.0.1</string>
+    <key>MOLCAJETED_BIND_PORT</key>
+    <string>4822</string>
+    <!-- VideoToolbox has no AV1 encoder: prefer the hardware codecs over
+         software AV1. -->
+    <key>MOLCAJETED_VIDEO</key>
+    <string>h265,h264,av1</string>
+    <!-- launchd's PATH does not include Homebrew. -->
+    <key>MOLCAJETED_FFMPEG</key>
+    <string>/opt/homebrew/bin/ffmpeg</string>
+    <key>MOLCAJETE_LOG_FORMAT</key>
+    <string>json</string>
+    <key>MOLCAJETE_TELEMETRY_LISTEN</key>
+    <string>127.0.0.1:9101</string>
+    <key>MOLCAJETE_PROFILING</key>
+    <string>true</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/Users/USER/Library/Logs/molcajete/molcajeted.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USER/Library/Logs/molcajete/molcajeted.log</string>
+</dict>
+</plist>

@@ -128,7 +128,9 @@ video stream into a separate layer, using the first codec of `--video`
 encode. Encoders come from `ffmpeg` (found in `PATH`, or `--ffmpeg <path>`),
 which runs as a child process: hardware encoders (NVENC, QSV, VA-API, AMF)
 when a trial encode works, otherwise libsvtav1, libx265 and libx264.
-Nothing is linked, so GPL encoders are fine. Areas too large for software
+Nothing is linked, so GPL encoders are fine. On macOS, H.265 and H.264 are
+encoded in hardware with VideoToolbox, called directly rather than through
+ffmpeg. Areas too large for software
 AV1 in real time fall back to H.265/H.264. `--features openh264` adds a
 built-in H.264 encoder (needs a C++ compiler). `--video none` always sends
 images. Lossless (`force-lossless`) and SSH sessions never use video, and

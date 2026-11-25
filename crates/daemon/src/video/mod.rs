@@ -1,8 +1,9 @@
 //! Low-latency video encoders for busy screen regions.
 //!
 //! Backends, in order of preference for a codec:
-//! 1. hardware encoders through ffmpeg (NVENC, QSV, VA-API, AMF), when
-//!    `ffmpeg -encoders` lists them and a trial encode works;
+//! 1. hardware encoders: VideoToolbox on macOS (H.265, H.264; see
+//!    [`videotoolbox`]), and through ffmpeg NVENC, QSV, VA-API and AMF, when
+//!    `ffmpeg -encoders` lists them; each must pass a trial encode;
 //! 2. software encoders through ffmpeg: libsvtav1 (AV1), libx265 (H.265),
 //!    libx264 (H.264);
 //! 3. the built-in OpenH264 encoder (cargo feature `openh264`).
@@ -17,6 +18,8 @@ mod bitstream;
 #[cfg(feature = "openh264")]
 mod builtin;
 mod ffmpeg;
+#[cfg(target_os = "macos")]
+mod videotoolbox;
 mod yuv;
 
 #[cfg(test)]
@@ -118,6 +121,8 @@ pub(crate) enum Backend {
         path: PathBuf,
         profile: &'static ffmpeg::Profile,
     },
+    #[cfg(target_os = "macos")]
+    VideoToolbox(VideoCodec),
     #[cfg(feature = "openh264")]
     OpenH264,
 }
@@ -126,6 +131,8 @@ impl Backend {
     pub(crate) fn codec(&self) -> VideoCodec {
         match self {
             Self::Ffmpeg { profile, .. } => profile.codec,
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(codec) => *codec,
             #[cfg(feature = "openh264")]
             Self::OpenH264 => VideoCodec::H264,
         }
@@ -135,6 +142,8 @@ impl Backend {
     fn rank(&self) -> u8 {
         match self {
             Self::Ffmpeg { profile, .. } if profile.hardware => 0,
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(_) => 0,
             Self::Ffmpeg { .. } => 1,
             #[cfg(feature = "openh264")]
             Self::OpenH264 => 2,
@@ -147,6 +156,8 @@ impl Backend {
                 format!("ffmpeg {} (hardware)", profile.name)
             }
             Self::Ffmpeg { profile, .. } => format!("ffmpeg {}", profile.name),
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(_) => "VideoToolbox (hardware)".into(),
             #[cfg(feature = "openh264")]
             Self::OpenH264 => "built-in OpenH264".into(),
         }
@@ -160,6 +171,8 @@ impl Backend {
             Self::Ffmpeg { path, profile } => {
                 Ok(Box::new(ffmpeg::FfmpegEncoder::new(path, profile, config)?))
             }
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(_) => Ok(Box::new(videotoolbox::VideoToolboxEncoder::new(config)?)),
             #[cfg(feature = "openh264")]
             Self::OpenH264 => Ok(Box::new(builtin::OpenH264Encoder::new(config)?)),
         }
@@ -224,6 +237,20 @@ impl VideoEncoders {
                 Err(err) => found.ffmpeg_error = Some(err.to_string()),
             }
         }
+        #[cfg(target_os = "macos")]
+        for codec in [VideoCodec::H265, VideoCodec::H264] {
+            match videotoolbox::probe(codec) {
+                Ok(()) => found.backends.push(Backend::VideoToolbox(codec)),
+                Err(err) => {
+                    debug!(?codec, error = %err, "VideoToolbox encoder unusable");
+                    let name = match codec {
+                        VideoCodec::H264 => "VideoToolbox H.264",
+                        _ => "VideoToolbox H.265",
+                    };
+                    found.rejected.push((name, err.to_string()));
+                }
+            }
+        }
         #[cfg(feature = "openh264")]
         found.backends.push(Backend::OpenH264);
         // Stable: keeps the profile order within a rank.
@@ -274,6 +301,8 @@ impl VideoEncoders {
         match self.backends_for(codec).next() {
             None => 0,
             Some(Backend::Ffmpeg { profile, .. }) if profile.hardware => u64::MAX,
+            #[cfg(target_os = "macos")]
+            Some(Backend::VideoToolbox(_)) => u64::MAX,
             Some(_) => match codec {
                 VideoCodec::Av1 => 1280 * 736,
                 VideoCodec::H265 => 1920 * 1088,
