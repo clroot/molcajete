@@ -162,6 +162,19 @@ Resizing an RDP desktop to the window and choosing its scale ([architecture.md](
 - Existing RDP connections keep what they have: without `resize-method` the desktop does not follow the window. Turn the switch on in the connection form, or in the session menu for one browser.
 - molcajeted logs `Display Control availability` with `available=` once it knows, and the client's changes as `client changed the resize method` and `client changed the DPI`. The gateway logs the overrides a browser asked for in `opening tunnel`.
 
+### Frame pacing by apply time and mixed versions
+
+molcajeted asks in every `sync` how long the client took to apply the frame, and our web client answers it in its `sync` reply ([architecture.md](architecture.md), section 2.9). The interval between frames then follows that time instead of the whole round trip, which the window of unacknowledged frames already covers: a slow client, or one far away, gets more frames without its queue growing. Nothing is negotiated in the handshake and the gateway passes both directions through unchanged:
+
+| Web client | Daemon | Frame pacing |
+| --- | --- | --- |
+| new | new molcajeted | by the reported apply time (median of the last 8 frames, forgotten after 1 s) |
+| new | older molcajeted, or stock guacd | as before: neither asks, and the client sends the stock reply |
+| older, or stock guacamole-common-js, or the stock web application | new molcajeted | as before, by the smoothed round trip: these clients ignore the extra `sync` argument and reply without a time |
+
+- The gateway needs no change: an older gateway relays the extra arguments over the text and the binary tunnel alike. As with the other client changes, a tab opened before the gateway (and with it the web client) was upgraded keeps the old pacing until it is reloaded.
+- `molcajeted_client_apply_seconds` records the reported times; it stays empty for sessions of clients that do not report them. `molcajeted_unacked_frames` must stay within the window (3 for RDP and VNC, 2 for SSH).
+
 ## Observability options
 
 Everything is off by default and costs nothing unless enabled (metrics calls are no-ops without a recorder).
@@ -216,6 +229,7 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | `molcajeted_frame_encoded_bytes` | histogram | protocol | Encoded image bytes per frame |
 | `molcajeted_client_ack_seconds` | histogram | protocol | From sending a frame to the client's ack arriving: network round trip + the time the frame's data takes to arrive (`molcajete_client_frame_receive_seconds`) + browser processing |
 | `molcajeted_client_ack_wait_seconds` | histogram | protocol | How long an ack then waited for the session loop (busy building a frame or handling server data); not part of `client_ack` |
+| `molcajeted_client_apply_seconds` | histogram | protocol | How long the client says it took to apply a frame (decoding and drawing, without waiting behind earlier frames); only molcajete clients report it, and it sets the frame interval for them |
 | `molcajeted_unacked_frames` | histogram | protocol | Frames still unacknowledged when a frame is sent |
 | `molcajeted_socket_write_seconds` | histogram | protocol | Time blocked in `write_all`; grows when the gateway or browser cannot keep up (backpressure) |
 | `molcajeted_sent_bytes_total` | counter | protocol | Bytes sent to the gateway |
