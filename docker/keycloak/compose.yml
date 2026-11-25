@@ -1,0 +1,26 @@
+# Test identity provider for single sign-on (GH-45): Keycloak with the
+# `molcajete` realm from realm.json.
+#   docker compose -f docker/keycloak/compose.yml up -d
+#
+# Issuer:  http://localhost:18180/realms/molcajete
+# Client:  molcajete / molcajete-secret, redirect
+#          http://localhost:18083/api/auth/oidc/callback
+# Users:   alice / alice-password (group molcajete-admins)
+#          bob / bob-password (group staff)
+# Console: http://localhost:18180/admin (admin / admin)
+#
+# gateway.keycloak.toml next to this file runs a gateway against it on
+# port 18083.
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: "18180"
+      KC_HOSTNAME: http://localhost:18180
+    volumes:
+      - ./realm.json:/opt/keycloak/data/import/realm.json:ro
+    ports:
+      - "127.0.0.1:18180:18180"

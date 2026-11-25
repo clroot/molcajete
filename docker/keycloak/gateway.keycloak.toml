@@ -1,0 +1,22 @@
+# Gateway for trying single sign-on against docker/keycloak/compose.yml:
+#   cargo run -p molcajete-gateway -- --config docker/keycloak/gateway.keycloak.toml
+# then open http://localhost:18083 (localhost, not 127.0.0.1: the redirect
+# URL registered at Keycloak uses it).
+
+[server]
+listen = "127.0.0.1:18083"
+static_dir = "web/dist"
+data_dir = "target/keycloak-test"
+
+[[users]]
+username = "admin"
+password = "admin-password"
+
+[oidc]
+issuer = "http://localhost:18180/realms/molcajete"
+client_id = "molcajete"
+client_secret = "molcajete-secret"
+redirect_url = "http://localhost:18083/api/auth/oidc/callback"
+post_logout_redirect_url = "http://localhost:18083/"
+display_name = "Keycloak"
+admin_groups = ["molcajete-admins"]
