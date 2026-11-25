@@ -3,17 +3,19 @@
 use base64::Engine as _;
 use molcajete_protocol::binary::RecordWriter;
 use molcajete_protocol::{Instruction, InstructionBuilder, Limits, Parser};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-pub struct GuacReader {
-    socket: OwnedReadHalf,
+/// Reads instructions from a client. Generic over the input only so that the
+/// fuzz targets can feed it from memory.
+pub struct GuacReader<R = OwnedReadHalf> {
+    socket: R,
     parser: Parser,
     buf: Box<[u8]>,
 }
 
-impl GuacReader {
-    pub fn new(socket: OwnedReadHalf) -> Self {
+impl<R: AsyncRead + Unpin> GuacReader<R> {
+    pub fn new(socket: R) -> Self {
         Self {
             socket,
             // Data from clients is untrusted: enforce guacd's limits.
@@ -162,8 +164,8 @@ impl std::fmt::Display for Output {
 }
 
 /// Accumulates encoded instructions and writes them in one go.
-pub struct GuacWriter {
-    socket: OwnedWriteHalf,
+pub struct GuacWriter<W = OwnedWriteHalf> {
+    socket: W,
     buf: Output,
     bytes: metrics::Counter,
     /// Time spent in `write_all`: grows when the gateway / browser cannot
@@ -171,8 +173,8 @@ pub struct GuacWriter {
     write_time: metrics::Histogram,
 }
 
-impl GuacWriter {
-    pub fn new(socket: OwnedWriteHalf) -> Self {
+impl<W: AsyncWrite + Unpin> GuacWriter<W> {
+    pub fn new(socket: W) -> Self {
         Self {
             socket,
             buf: Output::text(),

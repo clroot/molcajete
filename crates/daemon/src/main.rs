@@ -4,31 +4,12 @@
 //! Java web application), performs the handshake and bridges to the remote
 //! desktop protocol selected by the client.
 
-// Pixel loops iterate RGBA quadruplets with `chunks_exact(4)` throughout;
-// switching every one to `as_chunks::<4>()` would only be churn.
-#![allow(clippy::chunks_exact_to_as_chunks)]
-
-mod display;
-mod handshake;
-mod io;
-mod jump;
-mod rdp;
-mod remote;
-mod session;
-mod ssh;
-mod video;
-mod vnc;
-
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Instant;
 
 use clap::Parser as _;
-use molcajete_protocol::{InstructionBuilder, Status};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{Instrument as _, info, info_span, warn};
-
-use crate::io::{GuacReader, GuacWriter};
+use molcajete_daemon::{VideoCodec, VideoEncoders, handle};
+use tokio::net::TcpListener;
+use tracing::info;
 
 #[derive(clap::Parser, Debug)]
 #[command(version, about)]
@@ -81,152 +62,29 @@ struct Cli {
     telemetry: molcajete_telemetry::TelemetryArgs,
 }
 
-/// Sends an `error` instruction and flushes.
-pub async fn send_error(writer: &mut GuacWriter, message: &str, status: Status) {
-    writer.push(
-        &InstructionBuilder::new("error")
-            .str_arg(message)
-            .arg(status.code())
-            .finish(),
-    );
-    let _ = writer.flush().await;
-}
-
-/// Counts a finished (or refused) connection.
-fn connection_done(protocol: &'static str, result: &'static str) {
-    metrics::counter!(
-        "molcajeted_connections_total",
-        "protocol" => protocol,
-        "result" => result,
-    )
-    .increment(1);
-}
-
-async fn handle(stream: TcpStream, peer: SocketAddr) {
-    let _ = stream.set_nodelay(true);
-    let (rd, wr) = stream.into_split();
-    let mut reader = GuacReader::new(rd);
-    let mut writer = GuacWriter::new(wr);
-
-    let selected = match handshake::read_select(&mut reader).await {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(%peer, error = %err, "handshake failed");
-            connection_done("unknown", "handshake_failed");
-            return;
-        }
-    };
-
-    if selected.starts_with('$') {
-        send_error(
-            &mut writer,
-            "Joining existing connections is not supported yet",
-            Status::RESOURCE_NOT_FOUND,
-        )
-        .await;
-        return;
-    }
-
-    let connection_id = format!("${}", uuid::Uuid::new_v4());
-    let (protocol, args) = match selected.as_str() {
-        "vnc" => ("vnc", vnc::ARGS),
-        "ssh" => ("ssh", ssh::ARGS),
-        "rdp" => ("rdp", rdp::ARGS),
-        other => {
-            warn!(%peer, protocol = other, "unsupported protocol requested");
-            connection_done("unknown", "unsupported");
-            send_error(
-                &mut writer,
-                &format!("Protocol \"{other}\" is not supported"),
-                Status::UNSUPPORTED,
-            )
-            .await;
-            return;
-        }
-    };
-    // Everything logged for this connection carries its id, which the
-    // gateway logs as `guacd_id`.
-    let span = info_span!("connection", id = %connection_id, protocol, %peer);
-    // Every protocol can go through SSH jump hosts.
-    let args: Vec<&str> = args.iter().chain(jump::ARGS).copied().collect();
-    session(reader, writer, protocol, &args, connection_id)
-        .instrument(span)
-        .await;
-}
-
-async fn session(
-    mut reader: GuacReader,
-    mut writer: GuacWriter,
-    protocol: &'static str,
-    args: &[&str],
-    connection_id: String,
-) {
-    writer.record_metrics(protocol);
-    let (info, params) =
-        match handshake::negotiate(&mut reader, &mut writer, args, &connection_id).await {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(error = %err, "handshake failed");
-                connection_done(protocol, "handshake_failed");
-                return;
-            }
-        };
-    info!(
-        width = info.width,
-        height = info.height,
-        dpi = info.dpi,
-        image = ?info.image,
-        video = ?info.video,
-        binary = info.binary,
-        "connection established"
-    );
-    let active = metrics::gauge!("molcajeted_connections_active", "protocol" => protocol);
-    active.increment(1.0);
-    let started = Instant::now();
-    let result = match protocol {
-        "vnc" => vnc::run(reader, writer, info, params).await,
-        "ssh" => ssh::run(reader, writer, info, params).await,
-        "rdp" => rdp::run(reader, writer, info, params).await,
-        _ => unreachable!("protocol validated above"),
-    };
-    active.decrement(1.0);
-    let duration = started.elapsed();
-    metrics::histogram!("molcajeted_session_duration_seconds", "protocol" => protocol)
-        .record(duration);
-    match result {
-        Ok(()) => connection_done(protocol, "ok"),
-        Err(err) => {
-            connection_done(protocol, "error");
-            warn!(error = %err, "session ended with error");
-        }
-    }
-    info!(duration_s = duration.as_secs_f64(), "connection closed");
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     molcajete_telemetry::init_logging(cli.telemetry.log_format, "info,pprof=warn");
     molcajete_telemetry::start(&cli.telemetry, "molcajeted").await?;
-    display::set_zstd_images(cli.image_zstd);
-    display::set_encode_threads(cli.encode_threads);
+    molcajete_daemon::set_zstd_images(cli.image_zstd);
+    molcajete_daemon::set_encode_threads(cli.encode_threads);
     let allowed: Vec<_> = cli
         .video
         .iter()
         .filter_map(|name| match name.trim() {
-            "av1" => Some(video::VideoCodec::Av1),
-            "h265" | "hevc" => Some(video::VideoCodec::H265),
-            "h264" | "avc" => Some(video::VideoCodec::H264),
+            "av1" => Some(VideoCodec::Av1),
+            "h265" | "hevc" => Some(VideoCodec::H265),
+            "h264" | "avc" => Some(VideoCodec::H264),
             _ => None,
         })
         .collect();
     if !allowed.is_empty() {
         let ffmpeg = cli.ffmpeg.clone();
         let encoders =
-            tokio::task::spawn_blocking(move || video::VideoEncoders::detect(ffmpeg.as_deref()))
-                .await?;
+            tokio::task::spawn_blocking(move || VideoEncoders::detect(ffmpeg.as_deref())).await?;
         info!(encoders = %encoders.describe(), "video encoders");
-        session::init_video(encoders, allowed);
+        molcajete_daemon::init_video(encoders, allowed);
     }
     let listener = TcpListener::bind((cli.bind_host.as_str(), cli.bind_port)).await?;
     info!(addr = %listener.local_addr()?, "molcajeted listening");

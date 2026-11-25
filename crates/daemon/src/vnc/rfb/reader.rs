@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tracing::{debug, trace, warn};
 
 use super::pixel::{self, BYTES_PER_PIXEL};
@@ -24,9 +24,10 @@ const MAX_CUT_TEXT_LEN: usize = 16 * 1024 * 1024;
 /// Larger cursor images are discarded.
 const MAX_CURSOR_SIZE: u16 = 1024;
 
-/// Read half of an RFB connection, including all decoder state.
-pub struct RfbReader {
-    input: BufReader<CountingStream<UpstreamReader>>,
+/// Read half of an RFB connection, including all decoder state. Generic over
+/// the input only so that the fuzz targets can feed it from memory.
+pub struct RfbReader<R = BufReader<CountingStream<UpstreamReader>>> {
+    input: R,
     width: u16,
     height: u16,
     /// Rectangles left in the FramebufferUpdate being processed, if one is in progress.
@@ -44,13 +45,8 @@ enum RectOutcome {
     LastRect,
 }
 
-impl RfbReader {
-    pub(super) fn new(
-        input: BufReader<CountingStream<UpstreamReader>>,
-        width: u16,
-        height: u16,
-        shared: Arc<Mutex<SharedState>>,
-    ) -> Self {
+impl<R: AsyncRead + Unpin> RfbReader<R> {
+    pub(super) fn new(input: R, width: u16, height: u16, shared: Arc<Mutex<SharedState>>) -> Self {
         Self {
             input,
             width,
