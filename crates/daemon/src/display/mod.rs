@@ -20,6 +20,7 @@
 pub mod encode;
 mod metrics;
 mod pacing;
+mod pool;
 mod source;
 mod video;
 
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use molcajete_protocol::InstructionBuilder;
 use molcajete_protocol::{apply_time, zimage};
+use rayon::prelude::*;
 
 use crate::io::Output;
 
@@ -36,6 +38,7 @@ use encode::Region;
 use metrics::{DisplayMetrics, ImageKind, Phase, timed};
 use pacing::FrameClock;
 pub use pacing::{Pacing, SyncReply};
+pub use pool::set_threads as set_encode_threads;
 pub use source::{ChannelOrder, SourceImage};
 
 /// Granularity of change tracking and of the heat map.
@@ -239,8 +242,12 @@ pub struct Display {
     last_decay: Instant,
     last_flush: Instant,
     formats: ImageFormats,
-    /// Encoder of zstd images, for a client that accepts them.
-    zstd: Option<encode::ZstdEncoder>,
+    /// Whether zstd images are sent (the client accepts them). Every
+    /// encoding thread has its own encoder ([`pool::with_zstd`]).
+    zstd: bool,
+    /// Where the images of a frame are encoded side by side, or `None` to
+    /// encode them one after another on the session's thread.
+    pool: Option<&'static rayon::ThreadPool>,
     lossless: bool,
     next_stream: i32,
     last_sync: Option<i64>,
@@ -615,10 +622,8 @@ impl Display {
             last_decay: Instant::now(),
             last_flush: Instant::now(),
             formats,
-            zstd: formats
-                .zstd
-                .then(|| encode::ZstdEncoder::new().ok())
-                .flatten(),
+            zstd: formats.zstd,
+            pool: pool::shared(),
             lossless,
             next_stream: 0,
             last_sync: None,
@@ -644,32 +649,19 @@ impl Display {
         self
     }
 
-    /// Encodes `region` (timed), returning the bytes.
-    fn encode_image(&mut self, kind: ImageKind, region: &Region) -> Option<Vec<u8>> {
-        let (bytes, elapsed) = timed(|| match kind {
-            ImageKind::Png => encode::encode_png(region).ok(),
-            ImageKind::Jpeg => encode::encode_jpeg(region, 80).ok(),
-            ImageKind::Zstd => self.zstd.as_mut().and_then(|z| z.encode(region)),
-        });
-        let bytes = bytes?;
-        let pixels = region.width as u64 * region.height as u64;
-        self.metrics.image(kind, elapsed, bytes.len(), pixels);
-        Some(bytes)
+    /// Records the images encoded for one rectangle of `pixels` pixels.
+    fn record_images(&mut self, encoded: &[EncodedImage], pixels: u64) {
+        for &(kind, elapsed, bytes) in encoded {
+            self.metrics.image(kind, elapsed, bytes, pixels);
+        }
     }
 
-    /// Encodes `region` losslessly, returning the mimetype and the bytes: a
-    /// zstd image if the client accepts them, the region is opaque (the
-    /// format has no alpha) and the encoder takes it, otherwise PNG.
-    fn encode_lossless(
-        &mut self,
-        region: &Region,
-        opaque: bool,
-    ) -> Option<(&'static str, Vec<u8>)> {
-        if opaque && let Some(bytes) = self.encode_image(ImageKind::Zstd, region) {
-            return Some((zimage::MIMETYPE, bytes));
+    /// Runs `f` on the encoding pool, or here without one.
+    fn on_pool<T: Send>(&self, f: impl FnOnce() -> T + Send) -> T {
+        match self.pool {
+            Some(pool) => pool.install(f),
+            None => f(),
         }
-        self.encode_image(ImageKind::Png, region)
-            .map(|bytes| ("image/png", bytes))
     }
 
     pub fn width(&self) -> u32 {
@@ -902,20 +894,24 @@ impl Display {
         self.metrics.copies(Phase::Moves, found.copies);
         stats.add(found);
         phase_done(&mut self.metrics, Phase::Moves);
-        // 3. Whatever still differs is sent as pixels.
+        // 3. Whatever still differs is sent as pixels. (Regions do not
+        // overlap, so sending the rectangles of one does not change those
+        // of another.)
+        let mut rects = Vec::new();
         for diff in &diffs {
             if let Some(changed) = diff.bounds() {
-                for rect in self.changed_rects(&changed, diff) {
-                    let (cols, rows) = self.tiles_of(&rect);
-                    for ty in rows {
-                        for tx in cols.clone() {
-                            sent_tiles[(ty * self.tile_cols + tx) as usize] = true;
-                        }
-                    }
-                    stats.add(self.emit_rect(rect, out));
+                rects.extend(self.changed_rects(&changed, diff));
+            }
+        }
+        for rect in &rects {
+            let (cols, rows) = self.tiles_of(rect);
+            for ty in rows {
+                for tx in cols.clone() {
+                    sent_tiles[(ty * self.tile_cols + tx) as usize] = true;
                 }
             }
         }
+        stats.add(self.emit_rects(rects, out));
         for (motion, sent) in self.motion.iter_mut().zip(sent_tiles) {
             if sent {
                 *motion += 1.0;
@@ -1579,7 +1575,11 @@ impl Display {
                     rgba: &data,
                 };
                 let opaque = is_opaque(&data);
-                if let Some((mimetype, bytes)) = self.encode_lossless(&region, opaque) {
+                let zstd = self.zstd;
+                let mut images = Vec::new();
+                let encoded = self.on_pool(|| encode_lossless(&region, opaque, zstd, &mut images));
+                self.record_images(&images, tile.area());
+                if let Some((mimetype, bytes)) = encoded {
                     stats.images += 1;
                     stats.bytes += bytes.len();
                     stats.pixels += tile.area();
@@ -1599,73 +1599,90 @@ impl Display {
     }
 
     fn extract(&self, buf: &[u8], rect: &Rect) -> Vec<u8> {
-        let mut data = Vec::with_capacity(rect.area() as usize * 4);
-        for y in rect.y..rect.bottom() {
-            data.extend_from_slice(self.segment(buf, y, rect.x, rect.right()));
-        }
-        data
+        extract(buf, self.width, rect)
     }
 
-    /// Sends `rect` of the framebuffer and records it in the mirror.
-    fn emit_rect(&mut self, rect: Rect, out: &mut Output) -> FlushStats {
-        let mut stats = FlushStats::default();
-        let rect = rect.clip(self.width, self.height);
-        if rect.is_empty() {
-            return stats;
-        }
-        let data = self.extract(&self.pixels, &rect);
-        let region = Region {
-            width: rect.w,
-            height: rect.h,
-            rgba: &data,
+    /// Sends `rects` of the framebuffer, in this order, and records them in
+    /// the mirror.
+    ///
+    /// The rectangles are encoded side by side on the encoding pool: that
+    /// reads only the framebuffer. Writing the instructions and updating
+    /// the mirror then happen here, one rectangle after the other in the
+    /// original order, so the output is the same as encoding them one by
+    /// one.
+    fn emit_rects(&mut self, rects: Vec<Rect>, out: &mut Output) -> FlushStats {
+        let jobs: Vec<(Rect, bool)> = rects
+            .into_iter()
+            .map(|rect| rect.clip(self.width, self.height))
+            .filter(|rect| !rect.is_empty())
+            .map(|rect| {
+                // JPEG only for large, busy, colourful, opaque areas (the
+                // last two are up to the encoding).
+                let jpeg = !self.lossless
+                    && self.formats.jpeg
+                    && rect.area() >= 128 * 128
+                    && self.average_heat(&rect) >= HOT;
+                (rect, jpeg)
+            })
+            .collect();
+        let (pixels, width, zstd) = (&self.pixels[..], self.width, self.zstd);
+        let encode = |&(rect, jpeg): &(Rect, bool)| encode_rect(pixels, width, rect, jpeg, zstd);
+        let encoded: Vec<EncodedRect> = match self.pool {
+            Some(pool) if jobs.len() > 1 => pool.install(|| jobs.par_iter().map(encode).collect()),
+            _ => self.on_pool(|| jobs.iter().map(encode).collect()),
         };
-        stats.pixels = rect.area();
-        let opaque = is_opaque(&data);
+        let mut stats = FlushStats::default();
+        for rect in encoded {
+            stats.add(self.emit_encoded(rect, out));
+        }
+        stats
+    }
+
+    /// Sends a rectangle encoded by [`encode_rect`] and records it in the
+    /// mirror.
+    fn emit_encoded(&mut self, encoded: EncodedRect, out: &mut Output) -> FlushStats {
+        let EncodedRect {
+            rect,
+            data,
+            opaque,
+            content,
+            images,
+        } = encoded;
+        let mut stats = FlushStats {
+            pixels: rect.area(),
+            ..FlushStats::default()
+        };
+        self.record_images(&images, rect.area());
         if !opaque {
             // Source-over would blend with what is there: clear first.
             self.emit_fill(&rect, [0, 0, 0, 255], MODE_ROUT, out);
         }
-
-        if let Some(color) = encode::solid_color(&region)
-            && color[3] == 255
-        {
-            self.emit_fill(&rect, color, MODE_OVER, out);
-            stats.fills += 1;
-            self.store(&rect, &data, false);
-            return stats;
+        match content {
+            Content::Fill(color) => {
+                self.emit_fill(&rect, color, MODE_OVER, out);
+                stats.fills += 1;
+                self.store(&rect, &data, false);
+            }
+            Content::Image {
+                mimetype,
+                bytes,
+                lossy,
+            } => {
+                stats.images += 1;
+                stats.bytes += bytes.len();
+                self.emit_image(
+                    0,
+                    MODE_OVER,
+                    mimetype,
+                    rect.x as i32,
+                    rect.y as i32,
+                    &bytes,
+                    out,
+                );
+                self.store(&rect, &data, lossy);
+            }
+            Content::Failed => {}
         }
-
-        // JPEG only for large, busy, colourful, opaque areas.
-        let lossy = !self.lossless
-            && self.formats.jpeg
-            && opaque
-            && rect.area() >= 128 * 128
-            && self.average_heat(&rect) >= HOT
-            && encode::color_complexity(&region) > 256;
-        let encoded = if lossy {
-            self.encode_image(ImageKind::Jpeg, &region)
-                .map(|b| ("image/jpeg", b, true))
-        } else {
-            None
-        };
-        let Some((mimetype, bytes, is_lossy)) = encoded.or_else(|| {
-            self.encode_lossless(&region, opaque)
-                .map(|(mimetype, b)| (mimetype, b, false))
-        }) else {
-            return stats;
-        };
-        stats.images += 1;
-        stats.bytes += bytes.len();
-        self.emit_image(
-            0,
-            MODE_OVER,
-            mimetype,
-            rect.x as i32,
-            rect.y as i32,
-            &bytes,
-            out,
-        );
-        self.store(&rect, &data, is_lossy);
         stats
     }
 
@@ -1904,6 +1921,128 @@ impl Display {
             .next_frame_at(slowest)
             .unwrap_or_else(Instant::now)
     }
+}
+
+/// Image encoded for a rectangle, for the metrics: (format, time, bytes).
+type EncodedImage = (ImageKind, Duration, usize);
+
+/// What a rectangle of the pixel phase is sent as.
+enum Content {
+    /// A solid, opaque colour.
+    Fill([u8; 4]),
+    Image {
+        mimetype: &'static str,
+        bytes: Vec<u8>,
+        lossy: bool,
+    },
+    /// No encoder took it; nothing is sent.
+    Failed,
+}
+
+/// A rectangle of the framebuffer, encoded ([`encode_rect`]).
+struct EncodedRect {
+    rect: Rect,
+    /// Its pixels, for the mirror.
+    data: Vec<u8>,
+    opaque: bool,
+    content: Content,
+    /// Images encoded on the way (a JPEG or zstd attempt may be followed
+    /// by another format).
+    images: Vec<EncodedImage>,
+}
+
+/// The pixels of `rect` of `buf`, a surface `width` pixels wide.
+fn extract(buf: &[u8], width: u32, rect: &Rect) -> Vec<u8> {
+    let stride = width as usize * 4;
+    let row = rect.w as usize * 4;
+    let mut data = Vec::with_capacity(rect.area() as usize * 4);
+    for y in rect.y as usize..rect.bottom() as usize {
+        let start = y * stride + rect.x as usize * 4;
+        data.extend_from_slice(&buf[start..start + row]);
+    }
+    data
+}
+
+/// Encodes `rect` of the framebuffer `pixels` (`width` pixels wide): as a
+/// fill if it is one opaque colour, as JPEG if `jpeg` allows it and it is
+/// opaque and colourful, otherwise losslessly. Reads nothing else, so that
+/// the rectangles of a frame can be encoded on several threads.
+fn encode_rect(pixels: &[u8], width: u32, rect: Rect, jpeg: bool, zstd: bool) -> EncodedRect {
+    let data = extract(pixels, width, &rect);
+    let opaque = is_opaque(&data);
+    let mut images = Vec::new();
+    let content = {
+        let region = Region {
+            width: rect.w,
+            height: rect.h,
+            rgba: &data,
+        };
+        if let Some(color) = encode::solid_color(&region)
+            && color[3] == 255
+        {
+            Content::Fill(color)
+        } else if jpeg
+            && opaque
+            && encode::color_complexity(&region) > 256
+            && let Some(bytes) = encode_image(ImageKind::Jpeg, &region, &mut images)
+        {
+            Content::Image {
+                mimetype: "image/jpeg",
+                bytes,
+                lossy: true,
+            }
+        } else if let Some((mimetype, bytes)) = encode_lossless(&region, opaque, zstd, &mut images)
+        {
+            Content::Image {
+                mimetype,
+                bytes,
+                lossy: false,
+            }
+        } else {
+            Content::Failed
+        }
+    };
+    EncodedRect {
+        rect,
+        data,
+        opaque,
+        content,
+        images,
+    }
+}
+
+/// Encodes `region` (timed, recorded in `images`), returning the bytes.
+fn encode_image(
+    kind: ImageKind,
+    region: &Region,
+    images: &mut Vec<EncodedImage>,
+) -> Option<Vec<u8>> {
+    let (bytes, elapsed) = timed(|| match kind {
+        ImageKind::Png => encode::encode_png(region).ok(),
+        ImageKind::Jpeg => encode::encode_jpeg(region, 80).ok(),
+        ImageKind::Zstd => pool::with_zstd(|z| z.encode(region)),
+    });
+    let bytes = bytes?;
+    images.push((kind, elapsed, bytes.len()));
+    Some(bytes)
+}
+
+/// Encodes `region` losslessly, returning the mimetype and the bytes: a
+/// zstd image if `zstd` images are sent, the region is opaque (the format
+/// has no alpha) and the encoder takes it, otherwise PNG.
+fn encode_lossless(
+    region: &Region,
+    opaque: bool,
+    zstd: bool,
+    images: &mut Vec<EncodedImage>,
+) -> Option<(&'static str, Vec<u8>)> {
+    if zstd
+        && opaque
+        && let Some(bytes) = encode_image(ImageKind::Zstd, region, images)
+    {
+        return Some((zimage::MIMETYPE, bytes));
+    }
+    encode_image(ImageKind::Png, region, images).map(|bytes| ("image/png", bytes))
 }
 
 /// Merges `TILE`-aligned blocks (sorted by row, then column) into rectangles:
