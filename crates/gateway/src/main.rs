@@ -1527,16 +1527,30 @@ mod tests {
             assert_eq!(recording.size_bytes as usize, text.len());
 
             // The daemon's stream, blobs as guacd sends them, whatever the
-            // tunnel; the mouse with its time, and no keys.
+            // tunnel; the mouse with its time, and no keys. Times never go
+            // back: the sync (42, long ago) follows the mouse, whose time is
+            // the gateway's until a sync tells the daemon's clock apart.
             let instructions = molcajete_protocol::parse_all(&text).unwrap();
             let (mouse, from_daemon): (Vec<_>, Vec<_>) =
                 instructions.into_iter().partition(|i| i.opcode == "mouse");
+            let (syncs, from_daemon): (Vec<_>, Vec<_>) =
+                from_daemon.into_iter().partition(|i| i.opcode == "sync");
             let from_daemon: String = from_daemon.iter().map(|i| i.encode()).collect();
-            assert!(from_daemon == text_payload(), "{offered} {args}");
+            assert!(
+                from_daemon + "4.sync,2.42;" == text_payload(),
+                "{offered} {args}"
+            );
             assert_eq!(mouse.len(), 1);
             assert_eq!(mouse[0].args[..3], ["10", "20", "1"]);
-            let at: i64 = mouse[0].args[3].parse().unwrap();
-            assert!(at >= started && at <= db::now_millis());
+            let mouse_at: i64 = mouse[0].args[3].parse().unwrap();
+            let sync_at: i64 = syncs[0].args[0].parse().unwrap();
+            let mouse_first = text.find("5.mouse") < text.find("4.sync");
+            if mouse_first {
+                assert!(mouse_at >= started && sync_at == mouse_at);
+            } else {
+                assert_eq!(sync_at, 42);
+                assert!(mouse_at >= 42);
+            }
 
             // Recording changes nothing for guacd but the formats offered.
             assert_eq!(run.guacd.1, INPUT.as_bytes());

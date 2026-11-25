@@ -35,7 +35,7 @@ use tracing::{Instrument as _, debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::db::{ConnectionRecord, attributes};
+use crate::db::{ConnectionRecord, attributes, now_millis};
 use crate::guacd::{self, ClientInfo, GuacdSession};
 use crate::recording::{self, RecordedUser, Recorder};
 
@@ -492,7 +492,7 @@ impl Upstream<'_> {
                     match parser.next_raw() {
                         Ok(Some(raw)) => {
                             message.push_str(raw.as_str());
-                            self.record(|e| e.server_instruction(&raw));
+                            self.record(|e| e.server_instruction(&raw, now_millis()));
                             if message.len() >= MAX_MESSAGE_BYTES {
                                 let chunk = std::mem::replace(
                                     &mut message,
@@ -545,7 +545,7 @@ impl Upstream<'_> {
                                 self.send(Message::Binary(chunk.into())).await?;
                             }
                             message.extend_from_slice(bytes);
-                            self.record(|e| e.server_record(record.record()));
+                            self.record(|e| e.server_record(record.record(), now_millis()));
                         }
                         Ok(None) => break,
                         Err(err) => {
@@ -579,7 +579,7 @@ impl Upstream<'_> {
                     match parser.next_raw() {
                         Ok(Some(raw)) => {
                             push_record(&mut message, &raw, &mut data);
-                            self.record(|e| e.server_instruction(&raw));
+                            self.record(|e| e.server_instruction(&raw, now_millis()));
                             if message.len() >= MAX_MESSAGE_BYTES {
                                 self.send(Message::Binary(message.take().into())).await?;
                             }
@@ -659,7 +659,7 @@ async fn browser_to_guacd(
                 }
                 Ok(Some(raw)) => {
                     if let Some(recorder) = recorder {
-                        let now = crate::db::now_millis();
+                        let now = now_millis();
                         recorder.record(|e| e.client_instruction(&raw, now));
                     }
                     forward.extend_from_slice(raw.as_bytes());

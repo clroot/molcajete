@@ -14,6 +14,13 @@
 //! base64 `blob` instructions of at most 6048 bytes, as guacd sends them, so
 //! a recording does not depend on the tunnel the browser used.
 //!
+//! Times in a recording never go back: guacenc fills the gap between two
+//! times with frames and never ends on a negative one. Frames carry the
+//! daemon's clock and the gateway sees the input on its own, so input is
+//! timed on the daemon's clock as of the last `sync` (the two may be on
+//! different hosts), and a `sync` timed before input written ahead of it
+//! is moved up to that input's time.
+//!
 //! molcajeted's own formats (zstd images, video streams) are unknown to the
 //! stock tools. Unless a connection asks to keep them
 //! ([`attributes::RECORD_MOLCAJETE_FORMATS`]), a recorded session does not
@@ -44,7 +51,6 @@ pub const EXTENSION: &str = "guac";
 const RETENTION_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Turns the traffic of a tunnel into recording text.
-#[derive(Debug)]
 pub struct Encoder {
     out: Vec<u8>,
     include_mouse: bool,
@@ -55,6 +61,14 @@ pub struct Encoder {
     /// of the size guacd writes.
     partial: Vec<u8>,
     partial_stream: i32,
+    /// The latest time written: times in a recording never go back, which
+    /// guacenc relies on.
+    last_time: i64,
+    /// The daemon's clock minus the gateway's, as of the last `sync`: the
+    /// user's input is timed on the daemon's clock, like its frames.
+    clock_offset: i64,
+    /// Cuts the instruction records of the binary framing into instructions.
+    records: molcajete_protocol::Parser,
 }
 
 impl Encoder {
@@ -66,24 +80,57 @@ impl Encoder {
             base64: String::new(),
             partial: Vec::new(),
             partial_stream: 0,
+            last_time: 0,
+            clock_offset: 0,
+            records: molcajete_protocol::Parser::with_limits(molcajete_protocol::Limits::LENIENT),
         }
     }
 
     /// An instruction from the daemon. The tunnel's own instructions (empty
     /// opcode) are not part of the session.
-    pub fn server_instruction(&mut self, raw: &RawInstruction<'_>) {
-        if !raw.opcode().is_empty() {
-            self.end_blob();
+    /// `now_ms` is when it reached the gateway (Unix milliseconds).
+    pub fn server_instruction(&mut self, raw: &RawInstruction<'_>, now_ms: i64) {
+        match raw.opcode() {
+            "" => {}
+            "sync" => self.sync(raw, now_ms),
+            _ => {
+                self.end_blob();
+                self.out.extend_from_slice(raw.as_bytes());
+            }
+        }
+    }
+
+    /// A frame's end, with its time moved forward when input written
+    /// before it was timed later.
+    fn sync(&mut self, raw: &RawInstruction<'_>, now_ms: i64) {
+        self.end_blob();
+        let Ok(time) = raw.arg(0).parse::<i64>() else {
             self.out.extend_from_slice(raw.as_bytes());
+            return;
+        };
+        self.clock_offset = time - now_ms;
+        if time >= self.last_time {
+            self.last_time = time;
+            self.out.extend_from_slice(raw.as_bytes());
+        } else {
+            let sync = molcajete_protocol::InstructionBuilder::new("sync")
+                .arg(self.last_time)
+                .args(raw.args().skip(1))
+                .finish();
+            self.out.extend_from_slice(sync.as_bytes());
         }
     }
 
     /// A record of the binary framing from molcajeted.
-    pub fn server_record(&mut self, record: Record<'_>) {
+    pub fn server_record(&mut self, record: Record<'_>, now_ms: i64) {
         match record {
             Record::Instructions(text) => {
-                self.end_blob();
-                self.out.extend_from_slice(text);
+                let mut parser = std::mem::take(&mut self.records);
+                parser.feed(text);
+                while let Ok(Some(raw)) = parser.next_raw() {
+                    self.server_instruction(&raw, now_ms);
+                }
+                self.records = parser;
             }
             Record::Blob { stream, data } => self.blob(stream, data),
             Record::Unknown { .. } => {}
@@ -161,8 +208,10 @@ impl Encoder {
             _ => return,
         };
         self.end_blob();
+        let time = now_ms.saturating_add(self.clock_offset).max(self.last_time);
+        self.last_time = time;
         self.out
-            .extend_from_slice(builder.arg(now_ms).finish().as_bytes());
+            .extend_from_slice(builder.arg(time).finish().as_bytes());
     }
 
     /// The text encoded since the last call. The start of a blob may be
@@ -510,7 +559,7 @@ mod tests {
         let mut encoder = Encoder::new(true, false);
         raw_all(
             "0.,36.00000000-0000-0000-0000-000000000000;4.size,1.0,3.640,3.480;4.sync,2.42,1.1;",
-            |raw| encoder.server_instruction(raw),
+            |raw| encoder.server_instruction(raw, 0),
         );
         assert_eq!(encoder.take(), b"4.size,1.0,3.640,3.480;4.sync,2.42,1.1;");
         assert!(encoder.take().is_empty());
@@ -527,7 +576,7 @@ mod tests {
 
         let mut encoder = Encoder::new(true, false);
         for record in molcajete_protocol::binary::records(&bytes) {
-            encoder.server_record(record.unwrap());
+            encoder.server_record(record.unwrap(), 0);
         }
         encoder.blob(4, &[]);
         let text = String::from_utf8(encoder.take()).unwrap();
@@ -563,6 +612,33 @@ mod tests {
         let mut encoder = Encoder::new(false, true);
         raw_all(input, |raw| encoder.client_instruction(raw, 1234));
         assert_eq!(encoder.take(), b"3.key,5.65307,1.1,4.1234;");
+    }
+
+    #[test]
+    fn times_input_on_the_daemon_clock_and_never_goes_back() {
+        let mut encoder = Encoder::new(true, true);
+        // The daemon's clock is 4 s behind the gateway's.
+        raw_all("4.sync,4.1000;", |raw| {
+            encoder.server_instruction(raw, 5000)
+        });
+        raw_all("5.mouse,1.1,1.2,1.0;", |raw| {
+            encoder.client_instruction(raw, 5010)
+        });
+        // A frame the daemon timed before the mouse arrived.
+        raw_all("4.sync,4.1005,1.2;", |raw| {
+            encoder.server_instruction(raw, 5012)
+        });
+        raw_all("3.key,2.97,1.1;", |raw| {
+            encoder.client_instruction(raw, 5011)
+        });
+        raw_all("4.sync,4.1020;", |raw| {
+            encoder.server_instruction(raw, 5030)
+        });
+        assert_eq!(
+            String::from_utf8(encoder.take()).unwrap(),
+            "4.sync,4.1000;5.mouse,1.1,1.2,1.0,4.1010;4.sync,4.1010,1.2;\
+             3.key,2.97,1.1,4.1010;4.sync,4.1020;"
+        );
     }
 
     #[test]
