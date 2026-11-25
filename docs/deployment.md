@@ -335,6 +335,9 @@ histogram_quantile(0.95, sum by (le) (rate(molcajete_client_rtt_seconds_bucket[5
 histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_receive_seconds_bucket[5m])))
 histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_lag_seconds_bucket[5m])))
 
+# the same per kind of client: a slow tablet and a fast desktop separately
+histogram_quantile(0.95, sum by (le, browser, device) (rate(molcajete_client_frame_lag_seconds_bucket[5m])))
+
 # what taking pixels in costs: bytes received from the remote server,
 # and decoding time as a fraction of one core
 sum by (protocol) (rate(molcajeted_remote_received_bytes_total[5m]))
@@ -369,4 +372,4 @@ histogram_quantile(0.99, sum by (le) (rate(molcajeted_socket_write_seconds_bucke
 - **Metrics**: a Prometheus-compatible store (Prometheus with the remote-write receiver enabled, or Mimir) and a Grafana datasource.
 - **Profiles**: Pyroscope and a Grafana datasource.
 - Add `deploy/observability/molcajete.alloy` to the existing Alloy configuration. It finds targets by the pod label `app.kubernetes.io/name=molcajete` and ports named `telemetry`.
-- Dashboard: `deploy/observability/grafana-dashboard.json` (`Molcajete Performance`; datasource uids `prometheus`, `loki`, `pyroscope`). It narrows bottlenecks down in order: overview → server frame pipeline → client and network → gateway → CPU flamegraphs → session logs.
+- Dashboard: `deploy/observability/grafana-dashboard.json` (`Molcajete Performance`; datasource uids `prometheus`, `loki`, `pyroscope`). It narrows bottlenecks down in order: overview → server frame pipeline → client and network → gateway → CPU flamegraphs → session logs. The `Browser` and `Device` variables select the kinds of client the browser panels show (molcajeted's own metrics, such as the ack, are for every client together); "Browser lag p95 by client" and "Clients over the time range" show each kind separately, and the "Sessions" table shows each tunnel's browser lag and arrival from its client reports next to the ack from molcajeted's `display summary` (logged when the session ends). The server pipeline also shows the bytes received from the remote server and their decoding time (`molcajeted_remote_received_bytes_total`, `molcajeted_remote_decode_seconds`), the copies scroll and move detection found (`molcajeted_copies_total`) and the images per frame (`molcajeted_frame_images`); the client row shows the apply times clients report (`molcajeted_client_apply_seconds`).
