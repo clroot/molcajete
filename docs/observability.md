@@ -59,7 +59,10 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajeted_connections_total` | counter | protocol, result | Connections by how they ended: `ok`, `error`, `handshake_failed`, `unsupported` (protocol `unknown` for the last two when the handshake did not get that far) |
 | `molcajeted_session_duration_seconds` | histogram | protocol | Session length |
 | `molcajeted_remote_received_bytes_total` | counter | protocol | Bytes read from the remote server's socket (`rdp`: TLS records, handshake included; `vnc`) |
-| `molcajeted_remote_decode_seconds` | histogram | protocol | `rdp` only: decoding one PDU from the server (IronRDP, bitmap decompression included) and copying its graphics updates into the display |
+| `molcajeted_remote_decode_seconds` | histogram | protocol | `rdp` only: decoding one PDU from the server (IronRDP, bitmap decompression and the graphics pipeline's codecs included) and copying its graphics updates into the display |
+| `molcajeted_rdp_gfx_frames_total` | counter | | Frames the RDP server ended on the graphics pipeline (and molcajeted acknowledged). Zero while `molcajeted_frames_total{protocol="rdp"}` grows: the sessions use bitmap updates |
+| `molcajeted_rdp_gfx_frame_decode_seconds` | histogram | | Decoding one graphics pipeline frame: all its messages, H.264 and colour conversion included. The server gets its acknowledgement after this time, so it bounds the frame rate the server can reach |
+| `molcajeted_rdp_gfx_pixels_total` | counter | codec | Pixels decoded on the graphics pipeline by codec: `avc420`, `avc444`, `progressive`, `remotefx`, `clearcodec`, `planar`, `uncompressed`, `alpha`. Shows which codecs a server really uses |
 | `molcajeted_frame_flush_seconds` | histogram | protocol | CPU time to diff and encode one frame |
 | `molcajeted_flush_phase_seconds` | histogram | protocol, phase | Time per flush phase: `video`, `scroll`, `moves`, `pixels` (includes image encoding), `refine` |
 | `molcajeted_copies_total` | counter | protocol, phase | Copies found by `scroll` and by `moves` detection. Compare with that phase's share of `molcajeted_flush_phase_seconds` to see what detection costs per copy |
@@ -146,6 +149,9 @@ Both processes log to stdout. With `--log-format json`, every line is one JSON o
 | `video mode started` | molcajeted | `codec`, `x`, `y`, `width`, `height`, `kbps` |
 | `video encoder failed` | molcajeted | `error`, `failures` |
 | `video encoders` | molcajeted | At startup: the encoders found per codec |
+| `RDP session active` | molcajeted | `width`, `height`, `fastpath_input`, `graphics_pipeline_offered` (false with `disable-gfx`, `force-lossless` or a colour depth below 32) |
+| `RDP graphics pipeline in use` | molcajeted | Once, when the server took up the graphics pipeline: `version`, `avc420`, `avc444`, `h264_decoder`. A session without this line gets bitmap updates |
+| `RDP graphics pipeline summary` | molcajeted | Whole-session `frames`, `decode_ms_avg/max`, `dropped_updates` (updates a codec could not decode), `<codec>_pixels` |
 
 Every gateway line of a tunnel carries the span fields `tunnel_id`, `connection`, `session`, `peer` and `user`. Every molcajeted line of a connection carries `id`, `protocol` and `peer`.
 

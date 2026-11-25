@@ -43,6 +43,8 @@ ironrdp-connector = "0.12"
 ironrdp-core = "0.3"
 ironrdp-displaycontrol = "0.10"
 ironrdp-dvc = "0.10"
+# Graphics pipeline ([MS-RDPEGFX]); the version ironrdp-session links.
+ironrdp-egfx = "0.5"
 ironrdp-graphics = "0.11"
 ironrdp-pdu = "0.11"
 ironrdp-session = "0.13"
@@ -61,3 +63,8 @@ ironrdp-rdpsnd = "0.11"
 # compiled from source and needs a C++ compiler (`c++`, or `CXX=...`).
 openh264 = { version = "0.9", optional = true }
 ironrdp-rdpdr = "0.9"
+
+[features]
+# The same library decodes the H.264 of the RDP graphics pipeline where the
+# platform has no decoder of its own.
+openh264 = ["dep:openh264", "ironrdp-egfx/openh264-bundled"]

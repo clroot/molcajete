@@ -12,11 +12,15 @@
 //! linked, so GPL encoders are fine. All backends take RGBA, convert it to
 //! BT.709 limited-range 4:2:0 (signalled in the bitstream) and return one
 //! access unit / temporal unit per frame, without lookahead or reordering.
+//!
+//! The other direction, decoding the H.264 an RDP server sends over its
+//! graphics pipeline, is in [`decode`].
 
 mod avi;
 mod bitstream;
 #[cfg(feature = "openh264")]
 mod builtin;
+mod decode;
 mod ffmpeg;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
@@ -35,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
+pub use decode::{PipelineDecoder, h264_decoder};
 pub use molcajete_protocol::video::VideoCodec;
 
 #[derive(Clone, Debug)]

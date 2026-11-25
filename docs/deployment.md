@@ -33,7 +33,7 @@ docker build --target daemon  -t molcajeted:<tag> .
 - The gateway image builds the wasm client and the React UI with `scripts/build-web.sh` and serves them from `/usr/share/molcajete/web`.
 - The daemon image installs Debian's ffmpeg, which molcajeted runs as a child process for the libsvtav1, libx265 and libx264 encoders.
 - Both images run as uid 10001 with `tini` as PID 1, set `MOLCAJETE_LOG_FORMAT=json`, and stop cleanly on SIGTERM.
-- Building molcajeted needs a C compiler (for `ring` and the bundled libzstd). `--features openh264` adds a built-in H.264 encoder and needs a C++ compiler.
+- Building molcajeted needs a C compiler (for `ring` and the bundled libzstd). `--features openh264` adds a built-in H.264 encoder and needs a C++ compiler. Outside macOS the same feature is what decodes the H.264 of the RDP graphics pipeline; without it RDP servers are offered the pipeline without H.264. The images are built without it.
 
 To run the images on a cluster, push them to a registry its nodes pull from:
 

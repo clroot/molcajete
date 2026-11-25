@@ -58,11 +58,14 @@ pub const ARGS: &[&str] = &[
     "enable-menu-animations",
     "force-lossless",
     "disable-audio",
+    "disable-gfx",
 ];
 
 const DEFAULT_PORT: u16 = 3389;
 const DEFAULT_CLIENT_NAME: &str = "Guacamole RDP";
 const DEFAULT_COLOR_DEPTH: u32 = 32;
+/// The only colour depth the graphics pipeline works at.
+const GFX_COLOR_DEPTH: u32 = 32;
 /// Display Control limits ([MS-RDPEDISP] 2.2.2.2.1); also used for the
 /// initial size so that later resize requests are consistent with it.
 const MIN_DIMENSION: u32 = 200;
@@ -214,6 +217,11 @@ pub struct Settings {
     /// How sound is sent to the client; `None` when audio is disabled or
     /// the client cannot play raw PCM.
     pub audio: Option<AudioEncoding>,
+    /// Offer the graphics pipeline ([MS-RDPEGFX]). On unless `disable-gfx`
+    /// is set, a colour depth below 32 was asked for (the pipeline has no
+    /// other) or the session is `force-lossless` (the pipeline's codecs,
+    /// H.264 and progressive RemoteFX, are lossy).
+    pub gfx: bool,
 }
 
 impl Settings {
@@ -254,6 +262,9 @@ impl Settings {
             _ => LineEndings::Preserve,
         };
 
+        let color_depth = color_depth(params.number("color-depth"));
+        let force_lossless = params.flag("force-lossless");
+
         Ok(Self {
             hostname: params.value("hostname").unwrap_or("localhost").to_owned(),
             port: params.number("port").unwrap_or(DEFAULT_PORT),
@@ -265,7 +276,7 @@ impl Settings {
             width,
             height,
             dpi,
-            color_depth: color_depth(params.number("color-depth")),
+            color_depth,
             client_name: params
                 .value("client-name")
                 .unwrap_or(DEFAULT_CLIENT_NAME)
@@ -278,12 +289,13 @@ impl Settings {
             line_endings,
             resize_method,
             performance_flags: performance_flags(params),
-            force_lossless: params.flag("force-lossless"),
+            force_lossless,
             audio: if params.flag("disable-audio") {
                 None
             } else {
                 AudioEncoding::negotiate(&info.audio)
             },
+            gfx: !params.flag("disable-gfx") && !force_lossless && color_depth == GFX_COLOR_DEPTH,
         })
     }
 
@@ -494,6 +506,19 @@ mod tests {
         assert_eq!(enabled.audio, Some(AudioEncoding::L16));
         let disabled = Settings::parse(&params(&[("disable-audio", "true")]), &info).unwrap();
         assert_eq!(disabled.audio, None);
+    }
+
+    #[test]
+    fn graphics_pipeline_is_offered_unless_it_cannot_serve_the_session() {
+        let gfx = |pairs| Settings::parse(&params(pairs), &info()).unwrap().gfx;
+        assert!(gfx(&[]));
+        assert!(gfx(&[("disable-gfx", "false"), ("color-depth", "32")]));
+        assert!(!gfx(&[("disable-gfx", "true")]));
+        // Its codecs are lossy.
+        assert!(!gfx(&[("force-lossless", "true")]));
+        // It only exists at 32 bits per pixel.
+        assert!(!gfx(&[("color-depth", "16")]));
+        assert!(ARGS.contains(&"disable-gfx"));
     }
 
     #[test]
