@@ -2,7 +2,6 @@ import {useState} from 'react';
 import {Table, pixel, type TableColumn} from '@astryxdesign/core/Table';
 import {Button} from '@astryxdesign/core/Button';
 import {HStack} from '@astryxdesign/core/Stack';
-import {Badge} from '@astryxdesign/core/Badge';
 import {Text} from '@astryxdesign/core/Text';
 import {MoreMenu} from '@astryxdesign/core/MoreMenu';
 import {StatusDot} from '@astryxdesign/core/StatusDot';
@@ -16,6 +15,7 @@ import AsyncContent from '../shell/AsyncContent';
 import ConfirmDeleteDialog from '../shell/ConfirmDeleteDialog';
 import {CLOSED, CREATE, edit, type DrawerState} from '../shell/drawerState';
 import UserDrawer from './UserDrawer';
+import RoleBadge from '../access/RoleBadge';
 
 export default function UsersPage({currentUser}: {currentUser: User}) {
   const users = useApiData(api.users);
@@ -36,10 +36,11 @@ export default function UsersPage({currentUser}: {currentUser: User}) {
       ),
     },
     {
-      key: 'isAdmin',
+      key: 'effectiveRole',
       header: 'Role',
-      width: pixel(140),
-      renderCell: u => (u.isAdmin ? <Badge variant="info" label="Administrator" /> : <Text>User</Text>),
+      width: pixel(180),
+      // The role that applies, which a group may have raised.
+      renderCell: u => <RoleBadge role={u.effectiveRole} />,
     },
     {
       key: 'disabled',

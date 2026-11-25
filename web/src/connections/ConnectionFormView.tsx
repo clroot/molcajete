@@ -5,23 +5,25 @@ import {Selector} from '@astryxdesign/core/Selector';
 import {Banner} from '@astryxdesign/core/Banner';
 import {Divider} from '@astryxdesign/core/Divider';
 import {Heading} from '@astryxdesign/core/Heading';
-import {api, errorMessage, type Connection} from '../api';
+import {api, errorMessage, type Connection, type Folder} from '../api';
 import {FormActions, FormDrawerLayout} from '../shell/FormDrawer';
 import {PROTOCOLS, protocolInfo} from './protocols';
 import {changeProtocol, slugify, toConnection, type ConnectionForm} from './connectionForm';
 import ParameterInput from './ParameterInput';
 import AdvancedSettings from './AdvancedSettings';
+import {folderOptions} from './tree';
 
 const FORM_ID = 'connection-form';
 
 type Props = {
   isNew: boolean;
   initial: ConnectionForm;
+  folders: Folder[];
   onClose: () => void;
   onSaved: (connection: Connection) => void;
 };
 
-export default function ConnectionFormView({isNew, initial, onClose, onSaved}: Props) {
+export default function ConnectionFormView({isNew, initial, folders, onClose, onSaved}: Props) {
   const [form, setForm] = useState(initial);
   const [isIdEdited, setIsIdEdited] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -89,6 +91,17 @@ export default function ConnectionFormView({isNew, initial, onClose, onSaved}: P
               onChange={value => value && setForm(f => changeProtocol(f, value, isNew))}
               options={PROTOCOLS.map(p => ({value: p.value, label: p.label}))}
             />
+            {isNew && folders.length > 0 && (
+              <Selector
+                label="Folder"
+                description="Users and groups granted the folder can open the connection."
+                value={form.parentId}
+                onChange={value => update({parentId: value ?? ''})}
+                options={[{value: '', label: 'Top level'}, ...folderOptions(folders)]}
+                hasSearch
+                searchPlaceholder="Search folders"
+              />
+            )}
           </VStack>
 
           <Divider />

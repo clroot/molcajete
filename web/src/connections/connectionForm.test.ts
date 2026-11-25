@@ -80,4 +80,12 @@ describe('connection form', () => {
   test('suggests URL-safe ids', () => {
     expect(slugify('  My Desktop (VNC) ')).toBe('my-desktop-vnc');
   });
+
+  test('a new connection goes into the chosen folder', () => {
+    const form = {...emptyConnectionForm('databases'), name: 'Postgres', id: 'pg'};
+    expect(toConnection(form)).toMatchObject({ok: true, connection: {parentId: 'databases'}});
+    expect(toConnection({...form, parentId: ''})).not.toMatchObject({
+      connection: {parentId: expect.anything()},
+    });
+  });
 });
