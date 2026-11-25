@@ -72,7 +72,10 @@ spec:
               memory: 64Mi
             limits:
               cpu: "1"
-              memory: 256Mi
+              # With --profiling, symbolizing a profile loads the binary's
+              # line tables (~150Mi resident); without it the gateway needs
+              # only a few Mi.
+              memory: 512Mi
 
         - name: molcajeted
           image: localhost:30500/molcajeted:latest
@@ -119,7 +122,8 @@ spec:
         - name: config
           secret:
             secretName: molcajete-config
+        # Disk-backed: a memory-backed emptyDir would count against the
+        # containers' memory limits.
         - name: tmp
           emptyDir:
-            medium: Memory
             sizeLimit: 256Mi
