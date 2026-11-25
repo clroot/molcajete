@@ -13,6 +13,7 @@ mod config;
 mod db;
 mod guacd;
 mod oidc;
+mod recording;
 mod tunnel;
 
 use std::net::SocketAddr;
@@ -89,7 +90,10 @@ impl AppState {
 
 /// Lets the page know which optional features are on.
 async fn client_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    axum::Json(serde_json::json!({ "clientReports": state.client_reports }))
+    axum::Json(serde_json::json!({
+        "clientReports": state.client_reports,
+        "recordings": state.config.recordings.enabled,
+    }))
 }
 
 async fn websocket_tunnel(
@@ -109,7 +113,10 @@ async fn websocket_tunnel(
     };
     let mut request = tunnel::TunnelRequest::from_query(query.as_deref().unwrap_or(""));
     request.peer = Some(client_address(&headers, peer));
-    request.user = Some(user.username.clone());
+    request.user = Some(recording::RecordedUser {
+        id: user.id.clone(),
+        username: user.username.clone(),
+    });
     let connection = match request.connection.as_deref() {
         Some(id) => match state.db.connection_for_user(id, &user).await {
             Ok(c) => Some(c),
@@ -231,6 +238,12 @@ fn router(state: Arc<AppState>) -> Router {
                 .put(api::update_group)
                 .delete(api::delete_group),
         )
+        .route("/recordings", get(api::list_recordings))
+        .route(
+            "/recordings/{id}",
+            get(api::get_recording).delete(api::delete_recording),
+        )
+        .route("/recordings/{id}/file", get(api::recording_file))
         .route("/settings", get(client_settings))
         .route(
             "/telemetry/client",
@@ -327,6 +340,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let db = open_database(&config).await?;
     bootstrap::seed(&db, &config).await?;
+    if config.recordings.enabled {
+        let directory = config.recordings.directory(&config.server);
+        info!(dir = %directory.display(), "session recordings enabled");
+        recording::start_maintenance(db.clone(), config.recordings.clone(), directory).await;
+    }
 
     let state = Arc::new(AppState {
         config,
@@ -350,6 +368,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::db::attributes;
     use axum::body::Body;
     use axum::http::Request;
     use futures_util::StreamExt as _;
@@ -374,15 +393,16 @@ mod tests {
     async fn app_with(extra: &str) -> TestApp {
         let web = tempfile::tempdir().unwrap();
         std::fs::write(web.path().join("index.html"), "<!doctype html>").unwrap();
+        let (db, data) = db::tests::sqlite().await;
         let toml = format!(
-            "[server]\nstatic_dir = {:?}\n{extra}\n\
+            "[server]\nstatic_dir = {:?}\ndata_dir = {:?}\n{extra}\n\
              [[users]]\nusername = \"admin\"\npassword = \"admin-password\"\n\
              [[connections]]\nid = \"granted\"\nprotocol = \"vnc\"\n\
              [[connections]]\nid = \"secret\"\nprotocol = \"ssh\"\n",
-            web.path().display().to_string()
+            web.path().display().to_string(),
+            data.path().display().to_string()
         );
         let config: Config = ::toml::from_str(&toml).unwrap();
-        let (db, data) = db::tests::sqlite().await;
         bootstrap::seed(&db, &config).await.unwrap();
         let bob = db
             .create_user(db::NewUser {
@@ -1128,9 +1148,13 @@ mod tests {
         .await;
     }
 
-    /// What a fake guacd saw: the `connect` instruction and everything the
-    /// gateway sent after the handshake.
-    type GuacdSaw = (molcajete_protocol::Instruction, Vec<u8>);
+    /// What a fake guacd saw: the `connect` instruction, everything the
+    /// gateway sent after the handshake, and the handshake before `connect`.
+    type GuacdSaw = (
+        molcajete_protocol::Instruction,
+        Vec<u8>,
+        Vec<molcajete_protocol::Instruction>,
+    );
 
     /// A guacd that answers `select` with `args`, `connect` with `ready`
     /// followed by `payload`, and then reads until the gateway hangs up.
@@ -1146,12 +1170,13 @@ mod tests {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut parser = molcajete_protocol::Parser::new();
             let mut buf = [0u8; 4096];
+            let mut handshake = Vec::new();
             let connect = 'handshake: loop {
                 while let Some(ins) = parser.next_instruction().unwrap() {
                     match ins.opcode.as_str() {
                         "select" => sock.write_all(args.as_bytes()).await.unwrap(),
                         "connect" => break 'handshake ins,
-                        _ => {}
+                        _ => handshake.push(ins),
                     }
                 }
                 let n = sock.read(&mut buf).await.unwrap();
@@ -1173,7 +1198,7 @@ mod tests {
             }
             let mut after = parser.pending().to_vec();
             let _ = sock.read_to_end(&mut after).await;
-            (connect, after)
+            (connect, after, handshake)
         });
         (addr, task)
     }
@@ -1224,6 +1249,7 @@ mod tests {
         /// Binary messages, one entry each.
         binary: Vec<Vec<u8>>,
         guacd: GuacdSaw,
+        app: TestApp,
     }
 
     impl TunnelRun {
@@ -1267,6 +1293,19 @@ mod tests {
         args: &'static str,
         payload: Vec<u8>,
     ) -> TunnelRun {
+        run_tunnel_with(server, offered, args, payload, &[], "3.nop;").await
+    }
+
+    /// Like [`run_tunnel`], with these flag `attributes` set on the
+    /// connection, and `input` sent by the browser.
+    async fn run_tunnel_with(
+        server: &str,
+        offered: &str,
+        args: &'static str,
+        payload: Vec<u8>,
+        attributes: &[&str],
+        input: &str,
+    ) -> TunnelRun {
         use futures_util::SinkExt as _;
         use tokio_tungstenite::tungstenite::Message;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -1277,15 +1316,27 @@ mod tests {
             guacd_addr.port()
         ))
         .await;
+        if !attributes.is_empty() {
+            let mut granted = app.state.db.connection("granted").await.unwrap();
+            for name in attributes {
+                granted
+                    .attributes
+                    .insert((*name).to_owned(), "true".to_owned());
+            }
+            app.state.db.update_connection(&granted).await.unwrap();
+        }
         let bob = app.login("bob", "bob-password").await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let service = router(app.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, service).await });
 
-        let mut request = format!("ws://{addr}/websocket-tunnel?connection=granted")
-            .into_client_request()
-            .unwrap();
+        let mut request = format!(
+            "ws://{addr}/websocket-tunnel?connection=granted\
+             &image=image%2Fpng&image=image%2Fx-molcajete-zstd-v1&video=video%2Fh264"
+        )
+        .into_client_request()
+        .unwrap();
         let headers = request.headers_mut();
         headers.insert("sec-websocket-protocol", offered.parse().unwrap());
         // What browsers send; the gateway must not agree to compress.
@@ -1307,7 +1358,7 @@ mod tests {
         // Client → server stays text in every mode; pings are answered by
         // the gateway itself.
         socket
-            .send(Message::Text("0.,4.ping,1.7;3.nop;".into()))
+            .send(Message::Text(format!("0.,4.ping,1.7;{input}").into()))
             .await
             .unwrap();
 
@@ -1341,6 +1392,7 @@ mod tests {
             text,
             binary,
             guacd: guacd.await.unwrap(),
+            app,
         }
     }
 
@@ -1424,6 +1476,281 @@ mod tests {
         assert!(run.binary.is_empty());
         assert!(run.relayed_text() == text_payload(), "payload unchanged");
         assert_eq!(run.guacd.0.args, ["VERSION_1_5_0", "", "", ""]);
+    }
+
+    /// The recording of the session that ended last, once it is complete,
+    /// and the text of its file.
+    async fn finished_recording(app: &TestApp) -> (db::Recording, String) {
+        for _ in 0..400 {
+            let all = app.state.db.list_recordings().await.unwrap();
+            if let Some(recording) = all.into_iter().next()
+                && recording.ended_at.is_some()
+            {
+                let directory = app
+                    .state
+                    .config
+                    .recordings
+                    .directory(&app.state.config.server);
+                let path = recording::file_path(&directory, &recording).unwrap();
+                let text = std::fs::read_to_string(path).unwrap();
+                return (recording, text);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("no complete recording");
+    }
+
+    /// The `mime` arguments the browser announced to guacd for `opcode`.
+    fn announced(run: &TunnelRun, opcode: &str) -> Vec<String> {
+        let found = run.guacd.2.iter().find(|i| i.opcode == opcode);
+        found.map(|i| i.args.clone()).unwrap_or_default()
+    }
+
+    const INPUT: &str = "5.mouse,2.10,2.20,1.1;3.key,5.65307,1.1;";
+
+    #[tokio::test]
+    async fn recordings_hold_what_the_browser_got_as_guacamole_text() {
+        for (offered, args, payload) in [
+            (BOTH, MOLCAJETED_ARGS, record_payload()),
+            (BOTH, STOCK_ARGS, text_payload().into_bytes()),
+            ("guacamole", MOLCAJETED_ARGS, text_payload().into_bytes()),
+            ("guacamole", STOCK_ARGS, text_payload().into_bytes()),
+        ] {
+            let started = db::now_millis();
+            let run =
+                run_tunnel_with("", offered, args, payload, &[attributes::RECORD], INPUT).await;
+            let (recording, text) = finished_recording(&run.app).await;
+            assert_eq!(recording.connection_id, "granted");
+            assert_eq!(recording.username, "bob");
+            assert!(!recording.include_keys);
+            assert!(recording.started_at >= started);
+            assert_eq!(recording.size_bytes as usize, text.len());
+
+            // The daemon's stream, blobs as guacd sends them, whatever the
+            // tunnel; the mouse with its time, and no keys. Times never go
+            // back: the sync (42, long ago) follows the mouse, whose time is
+            // the gateway's until a sync tells the daemon's clock apart.
+            let instructions = molcajete_protocol::parse_all(&text).unwrap();
+            let (mouse, from_daemon): (Vec<_>, Vec<_>) =
+                instructions.into_iter().partition(|i| i.opcode == "mouse");
+            let (syncs, from_daemon): (Vec<_>, Vec<_>) =
+                from_daemon.into_iter().partition(|i| i.opcode == "sync");
+            let from_daemon: String = from_daemon.iter().map(|i| i.encode()).collect();
+            assert!(
+                from_daemon + "4.sync,2.42;" == text_payload(),
+                "{offered} {args}"
+            );
+            assert_eq!(mouse.len(), 1);
+            assert_eq!(mouse[0].args[..3], ["10", "20", "1"]);
+            let mouse_at: i64 = mouse[0].args[3].parse().unwrap();
+            let sync_at: i64 = syncs[0].args[0].parse().unwrap();
+            let mouse_first = text.find("5.mouse") < text.find("4.sync");
+            if mouse_first {
+                assert!(mouse_at >= started && sync_at == mouse_at);
+            } else {
+                assert_eq!(sync_at, 42);
+                assert!(mouse_at >= 42);
+            }
+
+            // Recording changes nothing for guacd but the formats offered.
+            assert_eq!(run.guacd.1, INPUT.as_bytes());
+            assert_eq!(announced(&run, "image"), ["image/png"]);
+            assert!(announced(&run, "video").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn recordings_take_keys_and_molcajete_formats_only_when_asked() {
+        let run = run_tunnel_with(
+            "",
+            BOTH,
+            MOLCAJETED_ARGS,
+            record_payload(),
+            &[
+                attributes::RECORD,
+                attributes::RECORD_KEYS,
+                attributes::RECORD_EXCLUDE_MOUSE,
+                attributes::RECORD_MOLCAJETE_FORMATS,
+            ],
+            INPUT,
+        )
+        .await;
+        let (recording, text) = finished_recording(&run.app).await;
+        assert!(recording.include_keys);
+        let instructions = molcajete_protocol::parse_all(&text).unwrap();
+        assert!(instructions.iter().all(|i| i.opcode != "mouse"));
+        let keys: Vec<_> = instructions.iter().filter(|i| i.opcode == "key").collect();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].args[..2], ["65307", "1"]);
+        assert_eq!(
+            announced(&run, "image"),
+            ["image/png", "image/x-molcajete-zstd-v1"]
+        );
+        assert_eq!(announced(&run, "video"), ["video/h264"]);
+    }
+
+    #[tokio::test]
+    async fn sessions_are_not_recorded_unless_both_sides_agree() {
+        // Recording off in the configuration.
+        let run = run_tunnel_with(
+            "\n[recordings]\nenabled = false",
+            BOTH,
+            STOCK_ARGS,
+            text_payload().into_bytes(),
+            &[attributes::RECORD],
+            INPUT,
+        )
+        .await;
+        assert!(run.app.state.db.list_recordings().await.unwrap().is_empty());
+        assert_eq!(announced(&run, "image").len(), 2);
+        // Not asked for by the connection.
+        let run = run_tunnel("", BOTH, STOCK_ARGS, text_payload().into_bytes()).await;
+        assert!(run.app.state.db.list_recordings().await.unwrap().is_empty());
+        assert_eq!(announced(&run, "video"), ["video/h264"]);
+    }
+
+    #[tokio::test]
+    async fn a_session_that_cannot_be_recorded_is_refused() {
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let (guacd_addr, _guacd) = fake_guacd(STOCK_ARGS, text_payload().into_bytes()).await;
+        // A directory that cannot be created: its parent is a file.
+        let app = app_with(&format!(
+            "\n[guacd]\nport = {}\n[recordings]\ndirectory = \"/dev/null/recordings\"\n",
+            guacd_addr.port()
+        ))
+        .await;
+        let mut granted = app.state.db.connection("granted").await.unwrap();
+        granted
+            .attributes
+            .insert(attributes::RECORD.into(), "true".into());
+        app.state.db.update_connection(&granted).await.unwrap();
+        let bob = app.login("bob", "bob-password").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = router(app.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, service).await });
+
+        let mut request = format!("ws://{addr}/websocket-tunnel?connection=granted")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "guacamole".parse().unwrap());
+        request.headers_mut().insert("cookie", bob.parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let message = socket.next().await.unwrap().unwrap();
+        let Message::Close(Some(frame)) = message else {
+            panic!("expected close, got {message:?}");
+        };
+        assert_eq!(frame.reason.as_str(), "512");
+        assert!(app.state.db.list_recordings().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_administrators_reach_recordings() {
+        let app = app().await;
+        let directory = app
+            .state
+            .config
+            .recordings
+            .directory(&app.state.config.server);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut done = db::Recording {
+            id: "done".into(),
+            connection_id: "granted".into(),
+            connection_name: "granted".into(),
+            protocol: "vnc".into(),
+            user_id: "u".into(),
+            username: "bob".into(),
+            file_name: "done.guac".into(),
+            include_keys: false,
+            started_at: 1_000,
+            ended_at: Some(2_000),
+            size_bytes: 22,
+        };
+        std::fs::write(directory.join("done.guac"), "4.sync,4.1000,1.0;0123").unwrap();
+        app.state.db.create_recording(&done).await.unwrap();
+        done.id = "live".into();
+        done.file_name = "live.guac".into();
+        done.ended_at = None;
+        done.started_at = 3_000;
+        std::fs::write(directory.join("live.guac"), "4.sync,4.3000;").unwrap();
+        app.state.db.create_recording(&done).await.unwrap();
+
+        let bob = app.login("bob", "bob-password").await;
+        for path in [
+            "/api/recordings",
+            "/api/recordings/done",
+            "/api/recordings/done/file",
+        ] {
+            assert_eq!(app.get(path, None).await.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                app.get(path, Some(&bob)).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let delete = |cookie: &str, id: &str| {
+            Request::delete(format!("/api/recordings/{id}"))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.send(delete(&bob, "done")).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let admin = app.login("admin", "admin-password").await;
+        let list = body_json(app.get("/api/recordings", Some(&admin)).await).await;
+        assert_eq!(list[0]["id"], "live");
+        // In progress: the size of the file so far.
+        assert_eq!(list[0]["sizeBytes"], 14);
+        assert_eq!(list[0]["endedAt"], serde_json::Value::Null);
+        assert_eq!(list[1]["connectionId"], "granted");
+
+        let file = app.get("/api/recordings/done/file", Some(&admin)).await;
+        assert_eq!(file.status(), StatusCode::OK);
+        assert!(file.headers().get(header::CONTENT_DISPOSITION).is_none());
+        let bytes = axum::body::to_bytes(file.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"4.sync,4.1000,1.0;0123");
+        let download = app
+            .get("/api/recordings/done/file?download=true", Some(&admin))
+            .await;
+        assert_eq!(
+            download.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"done.guac\""
+        );
+        // Ranges, for players that read a part.
+        let range = Request::get("/api/recordings/done/file")
+            .header(header::COOKIE, &admin)
+            .header(header::RANGE, "bytes=18-")
+            .body(Body::empty())
+            .unwrap();
+        let range = app.send(range).await;
+        assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+        let bytes = axum::body::to_bytes(range.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"0123");
+
+        assert_eq!(
+            app.send(delete(&admin, "live")).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            app.send(delete(&admin, "done")).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(!directory.join("done.guac").exists());
+        assert_eq!(
+            app.get("/api/recordings/done", Some(&admin)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(directory.join("live.guac").exists());
     }
 
     #[test]

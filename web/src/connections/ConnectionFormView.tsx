@@ -12,6 +12,7 @@ import {changeProtocol, slugify, toConnection, type ConnectionForm} from './conn
 import ParameterInput from './ParameterInput';
 import AdvancedSettings from './AdvancedSettings';
 import {folderOptions} from './tree';
+import RecordingSettings from './RecordingSettings';
 
 const FORM_ID = 'connection-form';
 
@@ -117,6 +118,10 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
               />
             ))}
           </VStack>
+
+          <Divider />
+
+          <RecordingSettings recording={form.recording} onChange={recording => update({recording})} />
 
           <Divider />
 

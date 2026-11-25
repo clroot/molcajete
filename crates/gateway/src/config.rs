@@ -21,6 +21,8 @@ pub struct Config {
     /// Sign-in through an OpenID Connect identity provider.
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    #[serde(default)]
+    pub recordings: RecordingsConfig,
     /// Administrators created in the database on startup when no user with
     /// that name exists yet. Existing users and passwords are left alone.
     #[serde(default)]
@@ -181,6 +183,83 @@ impl OidcConfig {
     }
 }
 
+/// Session recording (connections with *Record sessions* on).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingsConfig {
+    /// `false` records nothing, whatever the connections say.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Where recordings are written. Without one,
+    /// `<server.data_dir>/recordings`.
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
+    /// Recordings older than this many days are deleted; 0 keeps them.
+    #[serde(default)]
+    pub max_age_days: u64,
+    /// When all recordings together take more than this, the oldest are
+    /// deleted: bytes, or a string such as `"50 GiB"`; 0 sets no limit.
+    #[serde(default, deserialize_with = "byte_size")]
+    pub max_total_size: u64,
+}
+
+impl Default for RecordingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directory: None,
+            max_age_days: 0,
+            max_total_size: 0,
+        }
+    }
+}
+
+impl RecordingsConfig {
+    pub fn directory(&self, server: &ServerConfig) -> PathBuf {
+        self.directory
+            .clone()
+            .unwrap_or_else(|| server.data_dir.join("recordings"))
+    }
+}
+
+/// Parses `"1.5 GiB"`, `"500MB"`, `"1024"` or a plain integer into bytes.
+pub fn parse_byte_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let factor: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "kib" => 1 << 10,
+        "m" | "mb" => 1_000_000,
+        "mib" => 1 << 20,
+        "g" | "gb" => 1_000_000_000,
+        "gib" => 1 << 30,
+        "t" | "tb" => 1_000_000_000_000,
+        "tib" => 1 << 40,
+        _ => return None,
+    };
+    (number >= 0.0).then_some((number * factor as f64) as u64)
+}
+
+fn byte_size<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Size {
+        Bytes(u64),
+        Text(String),
+    }
+    match Size::deserialize(deserializer)? {
+        Size::Bytes(bytes) => Ok(bytes),
+        Size::Text(text) => parse_byte_size(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!("{text:?} is not a size such as \"50 GiB\""))
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -282,6 +361,9 @@ pub struct ConnectionConfig {
     /// Protocol parameters sent in the `connect` instruction.
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+    /// molcajete's own settings, such as `record-sessions = "true"`.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
 }
 
 impl ConnectionConfig {
@@ -352,6 +434,35 @@ mod tests {
         assert_eq!(config.database.url, None);
         assert_eq!(config.auth.session_ttl_hours, 12);
         assert!(config.oidc.is_none());
+        assert!(config.recordings.enabled);
+        assert_eq!(
+            config.recordings.directory(&config.server),
+            PathBuf::from("./recordings")
+        );
+        assert_eq!(config.recordings.max_total_size, 0);
+    }
+
+    #[test]
+    fn parses_recording_limits() {
+        let config: Config = toml::from_str(
+            "[recordings]\ndirectory = \"/srv/rec\"\nmax_age_days = 30\nmax_total_size = \"1.5 GiB\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.recordings.max_age_days, 30);
+        assert_eq!(config.recordings.max_total_size, 3 << 29);
+        assert_eq!(
+            config.recordings.directory(&config.server),
+            PathBuf::from("/srv/rec")
+        );
+        let config: Config = toml::from_str("[recordings]\nmax_total_size = 4096\n").unwrap();
+        assert_eq!(config.recordings.max_total_size, 4096);
+        assert!(toml::from_str::<Config>("[recordings]\nmax_total_size = \"lots\"\n").is_err());
+
+        assert_eq!(parse_byte_size("500MB"), Some(500_000_000));
+        assert_eq!(parse_byte_size(" 2 tib "), Some(2 << 40));
+        assert_eq!(parse_byte_size("10 KiB"), Some(10_240));
+        assert_eq!(parse_byte_size("-1"), None);
+        assert_eq!(parse_byte_size("1 parsec"), None);
     }
 
     #[test]

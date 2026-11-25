@@ -1,5 +1,6 @@
-//! Storage for users, groups, connections, folders, grants and login
-//! sessions, in the spirit of Guacamole's JDBC authentication extensions.
+//! Storage for users, groups, connections, folders, grants, login sessions
+//! and the index of session recordings, in the spirit of Guacamole's JDBC
+//! authentication extensions.
 //!
 //! One code path serves PostgreSQL, MySQL/MariaDB and SQLite through sqlx's
 //! `Any` driver. Queries are written with `?` placeholders and rewritten for
@@ -11,6 +12,7 @@ mod folders;
 mod grants;
 mod groups;
 mod oidc;
+mod recordings;
 mod sessions;
 mod users;
 
@@ -23,11 +25,12 @@ use sqlx::AnyPool;
 use sqlx::any::AnyPoolOptions;
 use sqlx::migrate::Migrator;
 
-pub use connections::ConnectionRecord;
+pub use connections::{ConnectionRecord, attributes};
 pub use folders::Folder;
 pub use grants::{Access, Principal, Target};
 pub use groups::{Group, GroupUpdate};
 pub use oidc::PendingLogin;
+pub use recordings::Recording;
 pub use users::{NewUser, Role, User, UserUpdate};
 
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("migrations/sqlite");
@@ -204,7 +207,9 @@ pub(crate) mod tests {
         for table in [
             "molcajete_oidc_login",
             "molcajete_user_identity",
+            "molcajete_recording",
             "molcajete_session",
+            "molcajete_connection_attribute",
             "molcajete_connection_permission",
             "molcajete_connection_group_permission",
             "molcajete_group_connection_permission",
@@ -244,6 +249,10 @@ pub(crate) mod tests {
 
     /// Every table, children first.
     const TABLES: &[&str] = &[
+        "molcajete_recording",
+        "molcajete_connection_attribute",
+        "molcajete_oidc_login",
+        "molcajete_user_identity",
         "molcajete_session",
         "molcajete_connection_permission",
         "molcajete_connection_group_permission",

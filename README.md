@@ -118,6 +118,26 @@ People can also sign in through an OpenID Connect identity provider
 on their first sign-in, their roles and user groups can follow the provider's
 groups, and the password form can be turned off. See [single sign-on](docs/deployment.md#single-sign-on-openid-connect).
 
+### Session recordings
+
+Turn on *Record sessions* in a connection's settings and the gateway writes
+every session of it to a file in Guacamole's recording format, for stock
+guacd and molcajeted alike. Administrators find them under *Recordings*,
+where they can play them back in the browser (pause, 1×–8×, and seeking
+anywhere), download or delete them. Everyone else gets 403.
+
+- The mouse is recorded unless *Record the mouse* is off. Key presses are
+  recorded only with *Record key presses*, which records passwords typed
+  during the session too; the form warns about it and the list marks such
+  recordings.
+- Recorded sessions do not get molcajeted's zstd images and video streams,
+  so that the stock player and `guacenc` can play every recording; this
+  costs the bandwidth those formats save. *Keep molcajete's image and video
+  formats* lifts that for a connection whose recordings only molcajete
+  plays back.
+- `[recordings]` in `gateway.toml` sets the directory and the retention
+  (age and total size); see [deployment](docs/deployment.md#session-recordings).
+
 The web UI (`web/`) is React with the [Astryx](https://astryx.atmeta.com)
 design system. For UI work, run `SKIP_UI=1 scripts/build-web.sh` once and
 `bun run dev` in `web/`; it proxies the API and the tunnel to a gateway on
@@ -205,6 +225,11 @@ headless Chromium and compare layer/canvas pixels with what the HTML canvas
 reference implementation produces (composite modes including the "unbounded"
 ones, raster operations, overlapping copies, PNG alpha, clipping, paths,
 patterns, layer trees and frame atomicity).
+
+`tests/browser/playback.test.mjs` (part of `npm test`) plays a recording with
+known frames and checks seeking and playing; `tests/browser/seek-bench.mjs
+<file.guac> [repeat]` repeats a real recording into an hour and times seeking
+through it.
 
 `tests/browser/replay-bench.mjs` replays a recorded session into the stock
 guacamole-common-js client and into molcajete-client (main thread and worker) with

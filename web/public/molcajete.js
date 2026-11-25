@@ -9,6 +9,7 @@
 //   session.set_event_handler((type, detail) => { ... });
 //   session.connect(session.tunnel_url("wss://host/websocket-tunnel", "my-connection"));
 import init, { MolcajeteClient } from "./pkg/molcajete_client.js";
+import { RecordingPlayer } from "./molcajete-player.js";
 
 const supportsWorker = () =>
   typeof OffscreenCanvas !== "undefined" &&
@@ -135,11 +136,14 @@ export class MolcajeteSession {
    *   `worker: false` forces main-thread mode; `binary: false` keeps the
    *   tunnel on the Guacamole text protocol instead of offering the gateway
    *   raw image, video and audio data; `zstd: false` does not announce the
-   *   zstd image type, so that lossless updates arrive as PNG
+   *   zstd image type, so that lossless updates arrive as PNG;
+   *   `playback: true` makes a player of session recordings (see `playback`),
+   *   which takes no input
    */
   static async create(container, options = {}) {
     const useWorker = options.worker ?? supportsWorker();
     const session = new MolcajeteSession(container, useWorker);
+    session.#playback = options.playback === true;
     session.#video = await supportedVideo();
     if (useWorker) await session.#startWorker();
     else await session.#startMain();
@@ -176,6 +180,8 @@ export class MolcajeteSession {
   #link = null;
   /** Pointer whose events are kept from the remote side after it opened a link. */
   #heldPointer = null;
+  #playback = false;
+  #player = null; // main-thread mode
 
   /** "worker" or "main". */
   mode;
@@ -254,6 +260,8 @@ export class MolcajeteSession {
   }
 
   #onEvent(type, detail) {
+    // A recording shows the recorded pointer itself.
+    if (this.#playback && type === "cursor") return;
     if (type === "layout") {
       this.#canvas.style.width = `${detail.width}px`;
       this.#canvas.style.height = `${detail.height}px`;
@@ -371,6 +379,8 @@ export class MolcajeteSession {
   }
 
   #installInput() {
+    this.#observeSize();
+    if (this.#playback) return;
     const canvas = this.#canvas;
     const sink = this.#sink;
     const position = (e) => {
@@ -419,7 +429,9 @@ export class MolcajeteSession {
       if (e.inputType !== "insertCompositionText") sink.value = "";
     });
     this.#listen(sink, "blur", () => this.#post("release_keys"));
+  }
 
+  #observeSize() {
     this.#observer = new ResizeObserver(() => {
       const r = this.#container.getBoundingClientRect();
       this.#post("set_viewport", r.width, r.height, devicePixelRatio || 1);
@@ -533,8 +545,23 @@ export class MolcajeteSession {
     this.call("release_keys");
   }
 
+  /**
+   * Controls the player of session recordings (created with `playback: true`):
+   * `load(url)`, `play()`, `pause()`, `seek(ms)`, `speed(x)`, `close()`. Its
+   * state arrives as `playback` events (see molcajete-player.js).
+   */
+  playback(command, ...args) {
+    if (!this.#client) {
+      this.#post(`player_${command}`, ...args);
+      return;
+    }
+    this.#player ??= new RecordingPlayer(this.#client, (type, detail) => this.#handler?.(type, detail));
+    this.#player[command](...args);
+  }
+
   /** Disconnects and releases all resources. */
   free() {
+    this.#player?.close();
     this.disconnect();
     for (const remove of this.#listeners.splice(0)) remove();
     this.#observer?.disconnect();

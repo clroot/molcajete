@@ -36,6 +36,9 @@ pub enum QueuedImage {
     Decoded(DecodedImage),
     /// A zstd image as it was received; decoded when it is drawn.
     Zstd(Vec<u8>),
+    /// A PNG as it was received, decoded in wasm when it is drawn (while
+    /// seeking through a recording, see `crate::png`).
+    Png(Vec<u8>),
 }
 
 impl From<DecodedImage> for QueuedImage {
@@ -631,6 +634,9 @@ impl Display {
                         ImageState::Ready(QueuedImage::Zstd(data)) => {
                             self.draw_zstd_image(layer, mode, x, y, &data);
                         }
+                        ImageState::Ready(QueuedImage::Png(data)) => {
+                            self.draw_png_image(layer, mode, x, y, &data);
+                        }
                         ImageState::Pending | ImageState::Failed => {}
                     },
                 }
@@ -1063,6 +1069,32 @@ impl Display {
                     rgba: &pixels,
                     width,
                     height,
+                    opaque: true,
+                };
+                self.draw_image(layer, mode, x, y, image);
+            }
+            Err(err) => {
+                web_sys::console::warn_1(&format!("image decode failed: {err}").into());
+            }
+        }
+        if pixels.capacity() <= KEPT_PIXEL_BYTES {
+            self.pixels = pixels;
+        }
+    }
+
+    fn draw_png_image(&mut self, layer: i32, mode: CompositeMode, x: i32, y: i32, data: &[u8]) {
+        let started = crate::scope::performance_now();
+        let mut pixels = std::mem::take(&mut self.pixels);
+        match crate::png::decode_premultiplied(data, &mut pixels) {
+            Ok((width, height, opaque)) => {
+                self.stats
+                    .decode
+                    .add(crate::scope::performance_now() - started);
+                let image = ImageSource::Pixels {
+                    rgba: &pixels,
+                    width,
+                    height,
+                    opaque,
                 };
                 self.draw_image(layer, mode, x, y, image);
             }
@@ -1216,6 +1248,11 @@ impl Display {
     /// Number of queued operations not yet executed.
     pub fn queued(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Number of complete frames not yet applied (waiting for images).
+    pub fn pending_frames(&self) -> usize {
+        self.queued_syncs
     }
 
     /// Premultiplied RGBA of one layer pixel (testing aid).

@@ -252,6 +252,26 @@ Finding a user's connections uses a recursive query (`WITH RECURSIVE`): PostgreS
 
 The JSON API keeps `isAdmin` on users (now derived from the role) and accepts it in user requests; scripts that use it keep working. `/api/users` and `/api/groups` (lists only) are open to connection managers, who need them to grant connections.
 
+### Session recordings
+
+A connection with *Record sessions* on has every session written to a file by the gateway, whichever daemon serves it ([README](../README.md#session-recordings), [architecture](architecture.md#211-session-recordings)). Configuration:
+
+```toml
+[recordings]
+enabled = true                 # false records nothing, whatever the connections say
+directory = "/var/lib/molcajete/recordings"   # default: <server.data_dir>/recordings
+max_age_days = 90              # delete recordings that ended longer ago; 0 keeps them
+max_total_size = "200 GiB"     # delete the oldest beyond this; bytes or "500 MB", "1.5 TiB"; 0 = no limit
+```
+
+- **Storage.** Files are named `YYYYMMDD-HHMMSS_<connection>_<id>.guac` (UTC). In Kubernetes, put `directory` on a PersistentVolume, the same one as the SQLite file or another; without one, recordings are lost when the pod restarts while the database still lists them. Several gateway replicas that share a database must share the directory too (ReadWriteMany), and at startup a gateway completes the index entries of recordings that were still open, which assumes no other replica is recording at that moment.
+- **Failure.** A session whose recording file cannot be created is refused (status 512, server error) rather than run unrecorded. A write error during a session is logged and the rest of that session is not recorded.
+- **Retention.** Checked at startup and every ten minutes. Sessions still being recorded are never deleted. With neither limit set, nothing is ever deleted.
+- **Access.** Listing, playing, downloading and deleting recordings are for administrators only (`/api/recordings`, `/api/recordings/{id}`, `/api/recordings/{id}/file` with range requests and `?download=true`). Downloads are logged with the administrator's name.
+- **Database.** Migration `20261126000100_recordings` adds `molcajete_connection_attribute` (molcajete's own connection settings, which are never sent to guacd) and `molcajete_recording` (the index: connection id and name, user id and name, start and end, size, file name, whether key presses are included). The connection and user are copied into the index, so a recording outlives both.
+- **Stock tools.** The files are in Guacamole's recording format. `guacenc -s 1280x800 -f <file>` turns one into an M4V video and the stock player (`guacamole-common-js` `SessionRecording`) plays it, unless the connection keeps molcajete's image and video formats (see the README). `guacenc` is not in the `guacamole/guacd` image; build guacamole-server with `--enable-guacenc`.
+- **Connections that already use guacd's `recording-path`** keep working as before: those parameters go to stock guacd unchanged and guacd writes its own files on its host. molcajeted does not implement them.
+
 ## Observability options
 
 Everything is off by default and costs nothing unless enabled (metrics calls are no-ops without a recorder).

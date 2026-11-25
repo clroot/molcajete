@@ -9,6 +9,7 @@ import {
   KeyIcon,
   ArrowRightStartOnRectangleIcon,
   UserCircleIcon,
+  FilmIcon,
 } from '@heroicons/react/24/outline';
 import type {User} from '../api';
 import {href, type Route} from '../route';
@@ -62,6 +63,12 @@ export default function AppFrame({user, route, onSignOut, children}: Props) {
                   icon={UserGroupIcon}
                   href={href.groups}
                   isSelected={route.name === 'groups'}
+                />
+                <SideNavItem
+                  label="Recordings"
+                  icon={FilmIcon}
+                  href={href.recordings}
+                  isSelected={route.name === 'recordings'}
                 />
               </>
             )}

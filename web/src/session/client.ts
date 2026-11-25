@@ -63,14 +63,33 @@ export interface MolcajeteSession {
   /** The remote host's IME composes text; keys are sent as pressed. */
   set_remote_composition(enabled: boolean): void;
   release_keys(): void;
+  /** Controls the player of a client created with `playback: true` (public/molcajete-player.js). */
+  playback(command: 'load', url: string): void;
+  playback(command: 'seek', time: number): void;
+  playback(command: 'speed', speed: number): void;
+  playback(command: 'play' | 'pause' | 'close'): void;
   free(): void;
 }
+
+/** What the player of session recordings reports (`playback` events). */
+export type PlaybackStatus =
+  | {state: 'loading'; loaded: number; total: number}
+  | {state: 'error'; message: string}
+  | {
+      state: 'ready' | 'playing' | 'paused' | 'seeking' | 'ended';
+      /** Milliseconds from the start of the recording. */
+      time: number;
+      duration: number;
+      /** Unix milliseconds of the start. */
+      start: number;
+      speed: number;
+    };
 
 type ClientModule = {
   MolcajeteSession: {
     create(
       container: HTMLElement,
-      options?: {worker?: boolean; binary?: boolean; zstd?: boolean},
+      options?: {worker?: boolean; binary?: boolean; zstd?: boolean; playback?: boolean},
     ): Promise<MolcajeteSession>;
   };
 };

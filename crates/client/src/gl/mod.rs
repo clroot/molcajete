@@ -319,11 +319,13 @@ struct Programs {
 pub enum ImageSource<'a> {
     /// An image decoded by the browser (`VideoFrame` or `ImageBitmap`).
     Decoded(&'a DecodedImage),
-    /// Opaque RGBA pixels in wasm memory, top row first (a zstd image).
+    /// Premultiplied RGBA pixels in wasm memory, top row first (a zstd
+    /// image, or a PNG decoded in wasm while seeking).
     Pixels {
         rgba: &'a [u8],
         width: u32,
         height: u32,
+        opaque: bool,
     },
 }
 
@@ -338,7 +340,7 @@ impl ImageSource<'_> {
     fn opaque(&self) -> bool {
         match self {
             Self::Decoded(image) => image.opaque,
-            Self::Pixels { .. } => true,
+            Self::Pixels { opaque, .. } => *opaque,
         }
     }
 }
@@ -791,11 +793,12 @@ impl Renderer {
                 rgba,
                 width,
                 height,
+                ..
             } => {
                 let gl = &self.gl;
                 gl.bind_texture(GL::TEXTURE_2D, Some(tex));
-                // The pixels are opaque, so they are premultiplied already;
-                // asking for it would only make the browser convert them.
+                // The pixels are premultiplied already; asking for it would
+                // only make the browser convert them.
                 gl.pixel_storei(GL::UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
                 let result = gl
                     .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(

@@ -1,4 +1,5 @@
-//! `molcajete_connection` and `molcajete_connection_parameter`.
+//! `molcajete_connection`, `molcajete_connection_parameter` and
+//! `molcajete_connection_attribute`.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +31,39 @@ pub struct ConnectionRecord {
     /// [`Database::move_connection`]).
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// molcajete's own settings of the connection ([`attributes`]), which
+    /// are never sent to guacd.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// Names of connection attributes. The flags among them are `"true"` when
+/// set and absent otherwise.
+pub mod attributes {
+    /// Record every session of the connection.
+    pub const RECORD: &str = "record-sessions";
+    /// Also record key presses, which include every password typed.
+    pub const RECORD_KEYS: &str = "record-keys";
+    /// Leave the mouse out of recordings.
+    pub const RECORD_EXCLUDE_MOUSE: &str = "record-exclude-mouse";
+    /// Let molcajeted use its own image and video formats in recorded
+    /// sessions, which only molcajete's player can play.
+    pub const RECORD_MOLCAJETE_FORMATS: &str = "record-molcajete-formats";
+
+    /// Every attribute the gateway knows.
+    pub const ALL: &[&str] = &[
+        RECORD,
+        RECORD_KEYS,
+        RECORD_EXCLUDE_MOUSE,
+        RECORD_MOLCAJETE_FORMATS,
+    ];
+}
+
+impl ConnectionRecord {
+    /// Whether the flag attribute `name` is set.
+    pub fn flag(&self, name: &str) -> bool {
+        self.attributes.get(name).is_some_and(|v| v == "true")
+    }
 }
 
 /// What the connection list shows; no secrets.
@@ -127,6 +161,14 @@ impl Database {
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
+        let attributes = query!(
+            self,
+            "SELECT attribute_name, attribute_value FROM molcajete_connection_attribute \
+             WHERE connection_id = ?"
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(ConnectionRecord {
             id: row.try_get("connection_id")?,
             name: row.try_get("name")?,
@@ -138,6 +180,10 @@ impl Database {
                 .map(|r| Ok((r.try_get("parameter_name")?, r.try_get("parameter_value")?)))
                 .collect::<Result<_, sqlx::Error>>()?,
             parent_id: row.try_get("parent_id")?,
+            attributes: attributes
+                .iter()
+                .map(|r| Ok((r.try_get("attribute_name")?, r.try_get("attribute_value")?)))
+                .collect::<Result<_, sqlx::Error>>()?,
         })
     }
 
@@ -200,6 +246,8 @@ impl Database {
         .map_err(DbError::from_sqlx)?;
         self.insert_parameters(&mut tx, &c.id, &c.parameters)
             .await?;
+        self.insert_attributes(&mut tx, &c.id, &c.attributes)
+            .await?;
         tx.commit().await?;
         self.connection(&c.id).await
     }
@@ -234,6 +282,15 @@ impl Database {
         .await?;
         self.insert_parameters(&mut tx, &c.id, &c.parameters)
             .await?;
+        query!(
+            self,
+            "DELETE FROM molcajete_connection_attribute WHERE connection_id = ?"
+        )
+        .bind(&c.id)
+        .execute(&mut *tx)
+        .await?;
+        self.insert_attributes(&mut tx, &c.id, &c.attributes)
+            .await?;
         tx.commit().await?;
         self.connection(&c.id).await
     }
@@ -249,6 +306,27 @@ impl Database {
                 self,
                 "INSERT INTO molcajete_connection_parameter \
                  (connection_id, parameter_name, parameter_value) VALUES (?, ?, ?)"
+            )
+            .bind(id)
+            .bind(name.as_str())
+            .bind(value.as_str())
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn insert_attributes(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        id: &str,
+        attributes: &BTreeMap<String, String>,
+    ) -> DbResult<()> {
+        for (name, value) in attributes {
+            query!(
+                self,
+                "INSERT INTO molcajete_connection_attribute \
+                 (connection_id, attribute_name, attribute_value) VALUES (?, ?, ?)"
             )
             .bind(id)
             .bind(name.as_str())
@@ -293,6 +371,7 @@ mod tests {
                 ("password".into(), "secret".into()),
             ]),
             parent_id: None,
+            attributes: BTreeMap::from([(attributes::RECORD.into(), "true".into())]),
         }
     }
 
@@ -320,6 +399,7 @@ mod tests {
             changed.guacd_host = Some("127.0.0.1".into());
             changed.guacd_port = Some(4823);
             changed.parameters.remove("password");
+            changed.attributes = BTreeMap::from([(attributes::RECORD_KEYS.into(), "true".into())]);
             changed.parameters.insert("dpi".into(), "144".into());
             changed
                 .parameters
