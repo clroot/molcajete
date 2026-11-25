@@ -31,7 +31,7 @@ use molcajete_protocol::Status;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::display::{Display, ImageFormats};
+use crate::display::{Display, ImageFormats, Pacing};
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
 use crate::send_error;
@@ -69,8 +69,9 @@ pub async fn run(
     let renderer = Renderer::new(fonts, scheme);
 
     // Terminal text must stay crisp: never use lossy encodings.
-    let mut display =
-        Display::new(ImageFormats::from_mimetypes(&info.image), true).with_protocol("ssh");
+    let mut display = Display::new(ImageFormats::from_mimetypes(&info.image), true)
+        .with_protocol("ssh")
+        .with_pacing(Pacing::TERMINAL);
     session::send_name(writer.buffer(), &settings.hostname);
     display.resize(info.width, info.height, writer.buffer());
     paint_background(&mut display, &mut writer, background);

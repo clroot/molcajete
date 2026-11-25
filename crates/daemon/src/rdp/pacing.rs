@@ -3,8 +3,10 @@
 //!
 //! A frame is sent once the PDUs that are already available have been
 //! processed (the socket would block), no earlier than the display's shared
-//! pacing allows (`Display::next_frame_at`: ~30 fps, less for heavy frames or
-//! a lagging client) and never more often than [`MIN_FRAME_INTERVAL`].
+//! pacing allows (`Display::next_frame_at` with `Pacing::DESKTOP`: up to
+//! ~60 fps, less for a lagging client, an unacknowledged heavy frame or a
+//! used-up byte budget) and never more often than [`MIN_FRAME_INTERVAL`],
+//! which is the same floor counted from when the frame was written out.
 //! A server that never pauses (video) still gets a frame every
 //! [`MAX_FRAME_DELAY`].
 

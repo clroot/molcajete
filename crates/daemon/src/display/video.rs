@@ -51,8 +51,9 @@ const REGROW_FRAMES: u32 = 8;
 /// Encoder errors after which video mode is given up for the session.
 const MAX_FAILURES: u32 = 3;
 /// Nominal frame rate given to rate control (frames are sent at most this
-/// often by the frame pacing; slower content simply uses fewer bits).
-const FPS: u32 = 30;
+/// often by the frame pacing while a video is active; slower content simply
+/// uses fewer bits).
+pub(super) const FPS: u32 = 30;
 /// Target bits per pixel and frame for H.264; the other codecs reach the
 /// same quality with fewer bits.
 const H264_BITS_PER_PIXEL: f32 = 0.1;

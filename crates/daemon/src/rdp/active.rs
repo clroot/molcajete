@@ -34,7 +34,7 @@ use super::mouse::Mouse;
 use super::pacing::FramePacer;
 use super::settings::{ResizeMethod, Settings};
 use super::slow_path;
-use crate::display::{Display, ImageFormats};
+use crate::display::{Display, ImageFormats, Pacing};
 use crate::handshake::ClientInfo;
 use crate::io::GuacWriter;
 use crate::send_error;
@@ -121,7 +121,8 @@ impl<'a> Session<'a> {
                     ImageFormats::from_mimetypes(&info.image),
                     settings.force_lossless,
                 )
-                .with_protocol("rdp");
+                .with_protocol("rdp")
+                .with_pacing(Pacing::DESKTOP);
                 session::enable_video(&mut display, info);
                 display
             },
