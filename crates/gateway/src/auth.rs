@@ -23,6 +23,9 @@ use crate::db::{DbError, Role, User};
 
 pub const SESSION_COOKIE: &str = "molcajete_session";
 pub const MIN_PASSWORD_LENGTH: usize = 8;
+/// Stored instead of a hash for users without a password (created through
+/// single sign-on); no password matches it.
+pub const NO_PASSWORD: &str = "!";
 
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     Argon2::default()
@@ -81,17 +84,22 @@ pub fn check_password_policy(password: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// The session token from the `Cookie` header.
-pub fn session_token(headers: &HeaderMap) -> Option<&str> {
+/// A non-empty cookie from the `Cookie` header.
+pub fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == SESSION_COOKIE)
+        .find(|(n, _)| *n == name)
         .map(|(_, value)| value)
         .filter(|v| !v.is_empty())
+}
+
+/// The session token from the `Cookie` header.
+pub fn session_token(headers: &HeaderMap) -> Option<&str> {
+    cookie(headers, SESSION_COOKIE)
 }
 
 /// Whether the browser reached us over HTTPS, possibly through a proxy.
@@ -210,6 +218,8 @@ mod tests {
         assert!(verify_password("correct horse", &hash));
         assert!(!verify_password("wrong", &hash));
         assert!(!verify_password("correct horse", "not a hash"));
+        assert!(!verify_password("", NO_PASSWORD));
+        assert!(!verify_password(NO_PASSWORD, NO_PASSWORD));
     }
 
     #[test]

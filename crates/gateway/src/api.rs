@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -104,17 +104,27 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> ApiResult<Response> {
+    if !state.password_login() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Password sign-in is turned off; use single sign-on.",
+        ));
+    }
     let found = match state.db.user_credentials(body.username.trim()).await {
         Ok(found) => Some(found),
         Err(DbError::NotFound) => None,
         Err(err) => return Err(err.into()),
     };
+    // Users without a password take as long to refuse as unknown ones.
     let hash = found
         .as_ref()
-        .map_or_else(|| auth::dummy_hash().to_owned(), |(_, hash)| hash.clone());
+        .map(|(_, hash)| hash.as_str())
+        .filter(|hash| *hash != auth::NO_PASSWORD)
+        .unwrap_or_else(|| auth::dummy_hash())
+        .to_owned();
     let valid = auth::verify_password_blocking(body.password, hash).await;
     let user = match found {
-        Some((user, _)) if valid && !user.disabled => user,
+        Some((user, hash)) if valid && hash != auth::NO_PASSWORD && !user.disabled => user,
         _ => {
             warn!(username = %body.username, "login failed");
             return Err(ApiError::new(
@@ -124,24 +134,60 @@ pub async fn login(
         }
     };
 
+    let cookie = start_session(&state, &user, auth::is_https(&headers), None).await?;
+    info!(username = %user.username, "login");
+    Ok(([(header::SET_COOKIE, cookie)], Json(user)).into_response())
+}
+
+/// Opens a login session for the user and returns its cookie. `id_token` is
+/// the provider's ID token for sessions opened through single sign-on.
+pub async fn start_session(
+    state: &AppState,
+    user: &User,
+    secure: bool,
+    id_token: Option<&str>,
+) -> ApiResult<HeaderValue> {
     let token = auth::new_token();
     let ttl_secs = state.config.auth.session_ttl_hours.max(1) * 3600;
     state
         .db
-        .create_session(&auth::token_hash(&token), &user.id, ttl_secs as i64 * 1000)
+        .create_session(
+            &auth::token_hash(&token),
+            &user.id,
+            ttl_secs as i64 * 1000,
+            id_token,
+        )
         .await?;
     state.db.record_login(&user.id).await?;
-    info!(username = %user.username, "login");
-    let cookie = auth::session_cookie(&token, ttl_secs, auth::is_https(&headers));
-    Ok(([(header::SET_COOKIE, cookie)], Json(user)).into_response())
+    Ok(auth::session_cookie(&token, ttl_secs, secure))
 }
 
+/// Ends the session. For a session opened through single sign-on at a
+/// provider that supports RP-initiated logout, the response is
+/// `{"logoutUrl": …}`: where to send the browser to sign out there too.
 pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+    let mut logout_url = None;
     if let Some(token) = auth::session_token(&headers) {
-        state.db.delete_session(&auth::token_hash(token)).await?;
+        let token_hash = auth::token_hash(token);
+        let id_token = match state.db.session_id_token(&token_hash).await {
+            Ok(id_token) => id_token,
+            Err(DbError::NotFound) => None,
+            Err(err) => return Err(err.into()),
+        };
+        state.db.delete_session(&token_hash).await?;
+        if let (Some(oidc), Some(id_token)) = (&state.oidc, id_token) {
+            logout_url = oidc.logout_url(&id_token).await;
+        }
     }
     let cookie = auth::clear_session_cookie(auth::is_https(&headers));
-    Ok(([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response())
+    Ok(match logout_url {
+        Some(url) => (
+            [(header::SET_COOKIE, cookie)],
+            Json(serde_json::json!({ "logoutUrl": url })),
+        )
+            .into_response(),
+        None => ([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response(),
+    })
 }
 
 pub async fn me(CurrentUser(user): CurrentUser) -> Json<User> {
@@ -513,7 +559,9 @@ pub async fn get_user(
 #[serde(rename_all = "camelCase")]
 pub struct UserRequest {
     username: Option<String>,
-    /// Required when creating; leaving it out keeps the current password.
+    /// Required when creating, unless single sign-on is configured (users
+    /// without one sign in only through the provider); leaving it out keeps
+    /// the current password.
     password: Option<String>,
     role: Option<Role>,
     /// Before roles: `true` is `role: "admin"`, `false` is `role: "user"`.
@@ -536,7 +584,7 @@ impl UserRequest {
     }
 }
 
-fn validate_username(name: &str) -> ApiResult<String> {
+pub fn validate_username(name: &str) -> ApiResult<String> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
         return Err(ApiError::bad_request(
@@ -577,8 +625,12 @@ pub async fn create_user(
 ) -> ApiResult<(StatusCode, Json<UserDetail>)> {
     let username = validate_username(body.username.as_deref().unwrap_or(""))?;
     let password = body.password.clone().unwrap_or_default();
-    auth::check_password_policy(&password)?;
-    let hash = auth::hash_password_blocking(password).await?;
+    let hash = if password.is_empty() && state.oidc.is_some() {
+        auth::NO_PASSWORD.to_owned()
+    } else {
+        auth::check_password_policy(&password)?;
+        auth::hash_password_blocking(password).await?
+    };
     let user = state
         .db
         .create_user(NewUser {
