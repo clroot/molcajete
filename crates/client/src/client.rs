@@ -1088,6 +1088,8 @@ impl Inner {
                 self.emit("display-control", JsValue::from_bool(available))
             }
             S::Msg { id } => self.emit("msg", JsValue::from(id)),
+            S::Link { url } => self.emit("link", url.map_or(JsValue::NULL, JsValue::from_str)),
+            S::Selection { active } => self.emit("selection", JsValue::from_bool(active)),
             S::Error { message, status } => {
                 let message = message.to_owned();
                 self.fail(status, &message);
@@ -1339,6 +1341,30 @@ impl Inner {
             },
             text,
         );
+    }
+
+    /// Pastes text into a terminal: sends it as the clipboard, then the
+    /// terminal's paste shortcut, Ctrl+Shift+V (molcajeted and guacd paste
+    /// on it). Ctrl and Shift are pressed only when not already held, and
+    /// only those are released, so keys the user holds stay held.
+    pub fn paste_text(&mut self, text: &str) {
+        use input::keysym::{CONTROL_L, CONTROL_R, SHIFT_L, SHIFT_R};
+        const KEY_V: u32 = 'V' as u32;
+        self.send_clipboard(text);
+        let mut keys = Vec::new();
+        for (left, right) in [(CONTROL_L, CONTROL_R), (SHIFT_L, SHIFT_R)] {
+            if !self.keyboard.is_down(&[left, right]) {
+                keys.push(left);
+            }
+        }
+        for &keysym in &keys {
+            self.send_key(keysym, true);
+        }
+        self.send_key(KEY_V, true);
+        self.send_key(KEY_V, false);
+        for &keysym in keys.iter().rev() {
+            self.send_key(keysym, false);
+        }
     }
 
     /// Answers a `required` request (e.g. credentials).

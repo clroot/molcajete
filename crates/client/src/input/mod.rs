@@ -175,6 +175,11 @@ impl Keyboard {
     pub fn any_pressed(&self) -> bool {
         !self.pressed.is_empty()
     }
+
+    /// Whether a key with one of these keysyms is held.
+    pub fn is_down(&self, keysyms: &[u32]) -> bool {
+        self.pressed.values().any(|k| keysyms.contains(k))
+    }
 }
 
 /// Events needed to type text (from IME composition) on the remote side.
@@ -257,6 +262,16 @@ mod tests {
         // Shift is up now, but the release must still be "A".
         assert_eq!(kb.key_up("a", "KeyA", 0, false), vec![('A' as u32, false)]);
         assert!(!kb.any_pressed());
+    }
+
+    #[test]
+    fn tells_held_keys() {
+        let mut kb = Keyboard::default();
+        kb.key_down("Control", "ControlRight", 2, false, false);
+        assert!(kb.is_down(&[keysym::CONTROL_L, keysym::CONTROL_R]));
+        assert!(!kb.is_down(&[keysym::SHIFT_L, keysym::SHIFT_R]));
+        kb.key_up("Control", "ControlRight", 2, false);
+        assert!(!kb.is_down(&[keysym::CONTROL_L, keysym::CONTROL_R]));
     }
 
     #[test]
