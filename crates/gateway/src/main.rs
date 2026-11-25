@@ -723,7 +723,13 @@ mod tests {
                 assert_ne!(n, 0, "gateway hung up during the handshake");
                 parser.feed(&buf[..n]);
             };
-            sock.write_all(b"5.ready,5.$abcd;").await.unwrap();
+            // The first bytes arrive in the same segment as `ready`, cut in
+            // the middle of a record header or an instruction: the relay
+            // has to take them over from the handshake parser.
+            let (with_ready, payload) = payload.split_at(payload.len().min(7));
+            sock.write_all(&[b"5.ready,5.$abcd;".as_slice(), with_ready].concat())
+                .await
+                .unwrap();
             // In pieces, so that records and instructions arrive split.
             for piece in payload.chunks(1000) {
                 sock.write_all(piece).await.unwrap();

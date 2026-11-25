@@ -713,11 +713,14 @@ impl Inner {
             bytes
                 .subarray(offset as u32, (offset + available) as u32)
                 .copy_to(&mut header[..available]);
+            // The length is checked against what is left before it is added
+            // to anything: on wasm32 a length near 4 GiB would wrap around.
             let record = parse_header(&header[..available])
-                .map(|(tag, length)| (tag, offset + HEADER_LEN, offset + HEADER_LEN + length))
-                .filter(|&(tag, body, end)| {
-                    end <= total && (tag != TAG_BLOB || end - body >= BLOB_HEADER_LEN - HEADER_LEN)
-                });
+                .filter(|&(tag, length)| {
+                    length <= total - offset - HEADER_LEN
+                        && (tag != TAG_BLOB || length >= BLOB_HEADER_LEN - HEADER_LEN)
+                })
+                .map(|(tag, length)| (tag, offset + HEADER_LEN, offset + HEADER_LEN + length));
             let Some((tag, body, end)) = record else {
                 self.fail(Status::SERVER_ERROR, "protocol error: malformed record");
                 return;

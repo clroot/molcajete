@@ -295,8 +295,9 @@ impl<'a> Iterator for Records<'a> {
         }
         let item = parse_header(self.rest)
             .and_then(|(tag, length)| {
-                let body = self.rest.get(HEADER_LEN..HEADER_LEN + length)?;
-                self.rest = &self.rest[HEADER_LEN + length..];
+                let end = HEADER_LEN.checked_add(length)?;
+                let body = self.rest.get(HEADER_LEN..end)?;
+                self.rest = &self.rest[end..];
                 Some(decode(tag, body))
             })
             .unwrap_or(Err(RecordError::Truncated));
