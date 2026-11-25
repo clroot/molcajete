@@ -105,14 +105,32 @@ pub struct OidcConfig {
     /// Shown on the button: "Sign in with <display_name>".
     #[serde(default = "default_oidc_display_name")]
     pub display_name: String,
-    /// Members of any of these groups are administrators.
+    /// Members of any of these provider groups get the `admin` role.
     #[serde(default)]
     pub admin_groups: Vec<String>,
-    /// With `admin_groups`, also take administrator access away from users
-    /// who are no longer in those groups when they sign in. `false` only
-    /// ever grants it.
+    /// Members of any of these provider groups (and none of
+    /// `admin_groups`) get the `connection_manager` role.
+    #[serde(default)]
+    pub connection_manager_groups: Vec<String>,
+    /// With `admin_groups` or `connection_manager_groups`, set the user's
+    /// own role from them on every sign-in, also lowering it to `user` for
+    /// someone who left those groups. `false` only ever raises it.
     #[serde(default = "default_true")]
-    pub sync_admin: bool,
+    pub sync_role: bool,
+    /// Make the user a member of exactly the molcajete user groups named in
+    /// `groups_claim` on every sign-in (memberships in other groups are
+    /// removed).
+    #[serde(default)]
+    pub sync_groups: bool,
+    /// With `sync_groups`, create a molcajete group (role `user`, no
+    /// grants) for a provider group that has none; otherwise such names
+    /// are skipped.
+    #[serde(default)]
+    pub create_groups: bool,
+    /// With `sync_groups`, only provider groups whose names start with this
+    /// are synced (names are kept as they are).
+    #[serde(default)]
+    pub group_prefix: Option<String>,
     /// Create users that sign in for the first time. `false` only lets in
     /// users an administrator created beforehand (matched by username).
     #[serde(default = "default_true")]
@@ -353,7 +371,8 @@ mod tests {
         assert_eq!(oidc.username_claim, "preferred_username");
         assert_eq!(oidc.groups_claim, "groups");
         assert_eq!(oidc.scopes, ["profile", "email"]);
-        assert!(oidc.password_login && oidc.auto_create_users && oidc.sync_admin);
+        assert!(oidc.password_login && oidc.auto_create_users && oidc.sync_role);
+        assert!(!oidc.sync_groups && !oidc.create_groups && oidc.group_prefix.is_none());
 
         let both: Config = toml::from_str(
             r#"

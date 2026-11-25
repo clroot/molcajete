@@ -285,10 +285,137 @@ async fn admin_groups_grant_and_take_away_admin() {
 
 #[tokio::test]
 async fn admin_groups_only_grant_without_sync() {
-    let sso = sso("sync_admin = false").await;
+    let sso = sso("sync_role = false").await;
     let login = |groups: &[&str]| Login::new("sub-root", "root", groups);
     sso.sign_in(login(&["molcajete-admins"])).await.session();
     let session = sso.sign_in(login(&[])).await.session();
+    assert_eq!(sso.me(&session).await["isAdmin"], true);
+}
+
+#[tokio::test]
+async fn connection_manager_groups_set_that_role() {
+    let sso = sso("connection_manager_groups = [\"ops\"]").await;
+    let login = |groups: &[&str]| Login::new("sub-cm", "carmen", groups);
+    let session = sso.sign_in(login(&["ops"])).await.session();
+    assert_eq!(sso.me(&session).await["role"], "connection_manager");
+    // Admin wins over connection manager.
+    let session = sso
+        .sign_in(login(&["ops", "molcajete-admins"]))
+        .await
+        .session();
+    assert_eq!(sso.me(&session).await["role"], "admin");
+    let session = sso.sign_in(login(&[])).await.session();
+    assert_eq!(sso.me(&session).await["role"], "user");
+}
+
+/// The local `admin` gone, so that the next one signing in through the
+/// provider is the last administrator.
+async fn remove_local_admin(sso: &Sso) {
+    let (admin, _) = sso.state.db.user_credentials("admin").await.unwrap();
+    sso.state.db.delete_user(&admin.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_last_admin_keeps_the_role() {
+    let sso = sso("").await;
+    let login = |groups: &[&str]| Login::new("sub-root", "root", groups);
+    sso.sign_in(login(&["molcajete-admins"])).await.session();
+    remove_local_admin(&sso).await;
+    let session = sso.sign_in(login(&[])).await.session();
+    let me = sso.me(&session).await;
+    assert_eq!(
+        (me["role"].as_str(), me["isAdmin"].as_bool()),
+        (Some("admin"), Some(true))
+    );
+}
+
+async fn group_names(sso: &Sso, session: &str) -> Vec<String> {
+    let me = sso.me(session).await;
+    let ids = sso
+        .state
+        .db
+        .user_group_ids(me["id"].as_str().unwrap())
+        .await
+        .unwrap();
+    let mut names: Vec<String> = sso
+        .state
+        .db
+        .list_groups()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|g| ids.contains(&g.id))
+        .map(|g| g.name)
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn groups_follow_the_provider() {
+    let sso = sso("sync_groups = true").await;
+    let db = &sso.state.db;
+    db.create_group("ops", Role::User).await.unwrap();
+    db.create_group("night-shift", Role::ConnectionManager)
+        .await
+        .unwrap();
+    let login = |groups: &[&str]| Login::new("sub-g", "gina", groups);
+
+    let session = sso
+        .sign_in(login(&["ops", "night-shift", "unknown"]))
+        .await
+        .session();
+    assert_eq!(group_names(&sso, &session).await, ["night-shift", "ops"]);
+    // A group's role counts towards the effective role.
+    let me = sso.me(&session).await;
+    assert_eq!(
+        (me["role"].as_str(), me["effectiveRole"].as_str()),
+        (Some("user"), Some("connection_manager"))
+    );
+    // Without create_groups, unknown names are skipped.
+    assert!(
+        db.list_groups()
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.name != "unknown")
+    );
+
+    let session = sso.sign_in(login(&["ops"])).await.session();
+    assert_eq!(group_names(&sso, &session).await, ["ops"]);
+    assert_eq!(sso.me(&session).await["effectiveRole"], "user");
+    let session = sso.sign_in(login(&[])).await.session();
+    assert!(group_names(&sso, &session).await.is_empty());
+}
+
+#[tokio::test]
+async fn missing_groups_can_be_created() {
+    let sso = sso("sync_groups = true\ncreate_groups = true\ngroup_prefix = \"mol-\"").await;
+    let session = sso
+        .sign_in(Login::new("sub-g", "gina", &["mol-ops", "other"]))
+        .await
+        .session();
+    assert_eq!(group_names(&sso, &session).await, ["mol-ops"]);
+    let groups = sso.state.db.list_groups().await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].role, Role::User);
+}
+
+#[tokio::test]
+async fn groups_cannot_remove_the_last_admin() {
+    let sso = sso("sync_groups = true").await;
+    sso.state
+        .db
+        .create_group("root-group", Role::Admin)
+        .await
+        .unwrap();
+    let login = |groups: &[&str]| Login::new("sub-root", "root", groups);
+    let session = sso.sign_in(login(&["root-group"])).await.session();
+    assert_eq!(sso.me(&session).await["isAdmin"], true);
+    remove_local_admin(&sso).await;
+
+    let session = sso.sign_in(login(&[])).await.session();
+    assert_eq!(group_names(&sso, &session).await, ["root-group"]);
     assert_eq!(sso.me(&session).await["isAdmin"], true);
 }
 

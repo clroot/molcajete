@@ -498,49 +498,89 @@ async fn follow_username(db: &Database, user: User, username: &str) -> Result<Us
     }
 }
 
-/// Applies the provider's groups on every sign-in: administrator access
-/// from `admin_groups`. Mapping the groups to molcajete user groups also
-/// belongs here.
+/// Applies the provider's groups on every sign-in: memberships in molcajete
+/// user groups (`sync_groups`) and the user's own role (`admin_groups`,
+/// `connection_manager_groups`).
+///
+/// A change that would leave no enabled administrator is skipped with a
+/// warning and the user still signs in: the provider cannot lock everyone
+/// out of administration.
 async fn sync_from_provider(
     db: &Database,
     config: &OidcConfig,
     user: User,
     groups: &[String],
 ) -> Result<User, LoginError> {
-    if config.admin_groups.is_empty() {
-        return Ok(user);
-    }
-    let in_admin_group = groups.iter().any(|g| config.admin_groups.contains(g));
-    let role = if in_admin_group {
-        Role::Admin
-    } else if config.sync_admin && user.role == Role::Admin {
-        Role::User
-    } else {
-        user.role
-    };
-    if role == user.role {
-        return Ok(user);
-    }
-    let update = UserUpdate {
-        role: Some(role),
-        ..Default::default()
-    };
-    match db.update_user(&user.id, update).await {
-        Ok(updated) => {
-            info!(username = %user.username, role = role.as_str(), "role follows the provider's groups");
-            Ok(updated)
-        }
-        // Signing in must not lock everyone else out of administration.
-        Err(DbError::LastAdmin) => {
-            warn!(
+    if config.sync_groups {
+        let names: Vec<String> = groups
+            .iter()
+            .filter(|g| {
+                config
+                    .group_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| g.starts_with(prefix))
+            })
+            .cloned()
+            .collect();
+        match db
+            .sync_user_groups_by_name(&user.id, &names, config.create_groups)
+            .await
+        {
+            Ok(joined) => {
+                let joined: Vec<&str> = joined.iter().map(|g| g.name.as_str()).collect();
+                info!(username = %user.username, groups = ?joined, "groups follow the provider");
+            }
+            Err(DbError::LastAdmin) => warn!(
                 username = %user.username,
-                "left the provider's administrator groups but is the last administrator; \
-                 keeping the administrator role"
-            );
-            Ok(user)
+                "the provider's groups would remove the last administrator; \
+                 keeping the user's groups"
+            ),
+            Err(err) => return Err(err.into()),
         }
-        Err(err) => Err(err.into()),
     }
+
+    if let Some(mapped) = mapped_role(config, groups) {
+        let role = if config.sync_role {
+            mapped
+        } else {
+            user.role.max(mapped)
+        };
+        if role != user.role {
+            let update = UserUpdate {
+                role: Some(role),
+                ..Default::default()
+            };
+            match db.update_user(&user.id, update).await {
+                Ok(_) => {
+                    info!(username = %user.username, role = role.as_str(), "role follows the provider's groups");
+                }
+                Err(DbError::LastAdmin) => warn!(
+                    username = %user.username,
+                    "left the provider's administrator groups but is the last administrator; \
+                     keeping the administrator role"
+                ),
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    // Group memberships change the effective role too.
+    Ok(db.user(&user.id).await?)
+}
+
+/// The role `admin_groups` and `connection_manager_groups` give someone in
+/// `groups`; `None` when neither is configured.
+fn mapped_role(config: &OidcConfig, groups: &[String]) -> Option<Role> {
+    if config.admin_groups.is_empty() && config.connection_manager_groups.is_empty() {
+        return None;
+    }
+    let member_of = |list: &[String]| groups.iter().any(|g| list.contains(g));
+    Some(if member_of(&config.admin_groups) {
+        Role::Admin
+    } else if member_of(&config.connection_manager_groups) {
+        Role::ConnectionManager
+    } else {
+        Role::User
+    })
 }
 
 // ---------------------------------------------------------------------------
