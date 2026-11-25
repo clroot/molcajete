@@ -80,6 +80,12 @@ class PcmPlayer {
   }
 }
 
+/** macOS switches input sources with Caps Lock, so it toggles the remote one there. */
+function isMac() {
+  const platform = navigator.userAgentData?.platform ?? navigator.platform ?? "";
+  return /mac/i.test(platform);
+}
+
 function timezone() {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -115,6 +121,7 @@ export class MolcajeteSession {
   #video = [];
   #audioContext = null;
   #players = new Map();
+  #remoteComposition = false;
 
   /** "worker" or "main". */
   mode;
@@ -250,25 +257,27 @@ export class MolcajeteSession {
     this.#listen(canvas, "contextmenu", (e) => e.preventDefault());
 
     // Keys being composed by an IME (or dead keys) are left to the browser;
-    // the composed text is typed when the composition ends.
+    // the composed text is typed when the composition ends. With remote
+    // composition every key is forwarded and the remote IME composes.
     this.#listen(sink, "keydown", (e) => {
       this.#resumeAudio();
-      if (e.isComposing || e.key === "Process" || e.key === "Dead") return;
+      const composing = e.isComposing || e.key === "Process";
+      if (e.key === "Dead" || (composing && !this.#remoteComposition)) return;
       e.preventDefault();
-      this.#post("key_down", e.key, e.code, e.location, false);
+      this.#post("key_down", e.key, e.code, e.location, composing, e.getModifierState("CapsLock"));
     });
     this.#listen(sink, "keyup", (e) => {
-      if (e.isComposing || e.key === "Process") return;
+      if ((e.isComposing || e.key === "Process") && !this.#remoteComposition) return;
       e.preventDefault();
-      this.#post("key_up", e.key, e.code, e.location);
+      this.#post("key_up", e.key, e.code, e.location, e.getModifierState("CapsLock"));
     });
     this.#listen(sink, "compositionend", (e) => {
-      if (e.data) this.#post("type_text", e.data);
+      if (e.data && !this.#remoteComposition) this.#post("type_text", e.data);
       sink.value = "";
     });
     this.#listen(sink, "input", (e) => {
       if (e.isComposing) return;
-      if (e.inputType === "insertText" && e.data) this.#post("type_text", e.data);
+      if (e.inputType === "insertText" && e.data && !this.#remoteComposition) this.#post("type_text", e.data);
       if (e.inputType !== "insertCompositionText") sink.value = "";
     });
     this.#listen(sink, "blur", () => this.#post("release_keys"));
@@ -334,6 +343,21 @@ export class MolcajeteSession {
   focus() {
     if (this.#client) this.#client.focus();
     else this.#sink?.focus();
+  }
+
+  /**
+   * Lets the remote host's IME compose text (Hangul, …): keys are sent as
+   * they are pressed, by physical position, instead of the text composed by
+   * the local IME. On macOS, Caps Lock becomes the Hangul/English key.
+   */
+  set_remote_composition(enabled) {
+    this.#remoteComposition = enabled;
+    if (this.#sink) {
+      // No input method starts on a read-only field; it still gets key events.
+      this.#sink.readOnly = enabled;
+      this.#sink.value = "";
+    }
+    this.call("set_remote_composition", enabled, isMac());
   }
 
   send_clipboard(text) {

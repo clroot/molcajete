@@ -167,7 +167,7 @@ The gateway can also collect performance reports from the browser
 
 ```sh
 cargo test --workspace                       # unit tests (protocol, gateway, guacd, client logic)
-scripts/build-web.sh                         # then: pixel tests of the WebGL2 renderer
+scripts/build-web.sh                         # then: renderer pixel tests and keyboard/IME tests
 (cd tests/browser && npm install && npm test)
 (cd tests/browser && node video.test.mjs)    # video decoding (needs ffmpeg with libx264/libsvtav1)
 ```

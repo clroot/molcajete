@@ -21,6 +21,9 @@ pub const ALT_R: u32 = 0xFFEA;
 pub const SUPER_L: u32 = 0xFFEB;
 pub const SUPER_R: u32 = 0xFFEC;
 pub const DELETE: u32 = 0xFFFF;
+pub const CAPS_LOCK: u32 = 0xFFE5;
+/// Hangul/English toggle (`XK_Hangul`).
+pub const HANGUL: u32 = 0xFF31;
 
 /// Named keys (`KeyboardEvent.key`) → keysyms indexed by location
 /// (standard, left, right). A single entry applies to every location.
@@ -179,6 +182,73 @@ fn code_fallback(code: &str) -> Option<u32> {
     })
 }
 
+/// The character a physical key types on a US keyboard, by
+/// `KeyboardEvent.code`, with or without Shift.
+pub fn us_layout_char(code: &str, shift: bool) -> Option<char> {
+    const SHIFTED: &[(char, char)] = &[
+        ('1', '!'),
+        ('2', '@'),
+        ('3', '#'),
+        ('4', '$'),
+        ('5', '%'),
+        ('6', '^'),
+        ('7', '&'),
+        ('8', '*'),
+        ('9', '('),
+        ('0', ')'),
+        ('-', '_'),
+        ('=', '+'),
+        ('[', '{'),
+        (']', '}'),
+        ('\\', '|'),
+        (';', ':'),
+        ('\'', '"'),
+        ('`', '~'),
+        (',', '<'),
+        ('.', '>'),
+        ('/', '?'),
+    ];
+    let plain = char::from_u32(code_fallback(code)?).filter(|c| c.is_ascii() && !c.is_control())?;
+    if !shift {
+        return Some(plain);
+    }
+    if plain.is_ascii_lowercase() {
+        return Some(plain.to_ascii_uppercase());
+    }
+    Some(
+        SHIFTED
+            .iter()
+            .find(|(from, _)| *from == plain)
+            .map_or(plain, |(_, to)| *to),
+    )
+}
+
+/// Keys that an active IME reports as `Process` but that are still worth
+/// forwarding by their physical position.
+pub fn editing_key_by_code(code: &str) -> Option<u32> {
+    Some(match code {
+        "Backspace" => 0xFF08,
+        "Tab" => 0xFF09,
+        "Enter" => 0xFF0D,
+        "Escape" => 0xFF1B,
+        "NumpadEnter" => 0xFF8D,
+        _ => return None,
+    })
+}
+
+/// Whether `key` is a Hangul jamo or syllable, which is what browsers report
+/// for a letter key while a Korean input source is active but not composing.
+pub fn is_hangul_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => matches!(
+            c as u32,
+            0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7AF | 0xD7B0..=0xD7FF
+        ),
+        _ => false,
+    }
+}
+
 fn is_control_character(cp: u32) -> bool {
     cp <= 0x1F || (0x7F..=0x9F).contains(&cp)
 }
@@ -237,6 +307,28 @@ pub fn is_modifier(keysym: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn us_layout_by_physical_key() {
+        assert_eq!(us_layout_char("KeyG", false), Some('g'));
+        assert_eq!(us_layout_char("KeyQ", true), Some('Q'));
+        assert_eq!(us_layout_char("Digit2", true), Some('@'));
+        assert_eq!(us_layout_char("Slash", true), Some('?'));
+        assert_eq!(us_layout_char("Space", true), Some(' '));
+        // Keys that type nothing on their own.
+        assert_eq!(us_layout_char("Lang1", false), None);
+        assert_eq!(us_layout_char("Numpad1", false), None);
+        assert_eq!(us_layout_char("Enter", false), None);
+    }
+
+    #[test]
+    fn hangul_keys() {
+        assert!(is_hangul_key("ㅎ"));
+        assert!(is_hangul_key("한"));
+        assert!(!is_hangul_key("g"));
+        assert!(!is_hangul_key("é"));
+        assert!(!is_hangul_key("Process"));
+    }
 
     #[test]
     fn printable_characters() {

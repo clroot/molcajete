@@ -1,13 +1,14 @@
 // Full-screen remote session: the wasm client renders into the display;
 // connection states show over it, and Ctrl+Alt+Shift opens the session menu.
-import {useCallback, useRef, useState} from 'react';
+import {useCallback, useEffect, useRef, useState} from 'react';
 import * as stylex from '@stylexjs/stylex';
 import {href, navigate} from '../route';
 import type {SessionEvent} from './client';
 import {useSessionEvents} from './useSessionEvents';
 import {useMolcajeteClient} from './useMolcajeteClient';
 import {useMenuShortcut} from './useMenuShortcut';
-import {useConnectionName} from './useConnectionName';
+import {useConnection} from './useConnection';
+import {useRemoteComposition} from './useRemoteComposition';
 import StatusOverlay from './StatusOverlay';
 import CredentialsDialog from './CredentialsDialog';
 import SessionMenu, {type ScaleMode} from './SessionMenu';
@@ -19,10 +20,14 @@ const styles = stylex.create({
 
 const leave = () => navigate(href.connections);
 
+/** Protocols whose remote side runs its own input method. SSH is a terminal drawn by the daemon. */
+const hasRemoteIme = (protocol: string | null) => protocol === 'rdp' || protocol === 'vnc';
+
 export default function SessionPage({connectionId}: {connectionId: string}) {
   const displayRef = useRef<HTMLDivElement>(null);
   const [session, dispatch] = useSessionEvents();
-  const connectionName = useConnectionName(connectionId);
+  const {name: connectionName, protocol} = useConnection(connectionId);
+  const [remoteComposition, setRemoteComposition] = useRemoteComposition(connectionId);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [scaleMode, setScaleMode] = useState<ScaleMode>('fit');
   const [showStats, setShowStats] = useState(false);
@@ -40,6 +45,12 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
     [dispatch],
   );
   const {client, mode, connect} = useMolcajeteClient({displayRef, connectionId, onEvent, onStartFailed});
+
+  // `mode` is set once the client exists.
+  const composesRemotely = remoteComposition && hasRemoteIme(protocol);
+  useEffect(() => {
+    if (mode) client()?.set_remote_composition(composesRemotely);
+  }, [mode, client, composesRemotely]);
 
   const reconnect = () => {
     dispatch({type: 'reconnecting'});
@@ -103,6 +114,8 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
         }}
         showStats={showStats}
         onShowStatsChange={setShowStats}
+        remoteComposition={hasRemoteIme(protocol) ? remoteComposition : null}
+        onRemoteCompositionChange={setRemoteComposition}
         onCtrlAltDel={() => client()?.send_ctrl_alt_del()}
         onDisconnect={leave}
       />

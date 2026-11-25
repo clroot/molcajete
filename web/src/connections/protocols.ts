@@ -75,6 +75,18 @@ export const PROTOCOLS: Protocol[] = [
         kind: 'switch',
         description: 'Accept self-signed certificates.',
       },
+      {
+        name: 'server-layout',
+        label: 'Keyboard layout',
+        kind: 'select',
+        description:
+          'The layout of the remote session. Korean lets the remote computer compose Hangul and enables its 한/영 and 한자 keys.',
+        options: [
+          {value: 'en-us-qwerty', label: 'English (US)'},
+          {value: 'ko-kr-qwerty', label: 'Korean'},
+          {value: 'failsafe', label: 'Any (send text as Unicode)'},
+        ],
+      },
     ],
   },
   {

@@ -55,10 +55,14 @@ const LEFT_SHIFT_SCANCODE: Scancode = key(0x2A);
 /// Scancodes of keys that do not produce text.
 fn special_scancode(keysym: u32) -> Option<Scancode> {
     Some(match keysym {
-        0xFF08 => key(0x0E),                                    // BackSpace
-        0xFF09 | 0xFE20 => key(0x0F),                           // Tab, ISO_Left_Tab
-        0xFF0D => key(0x1C),                                    // Return
-        0xFF14 => key(0x46),                                    // Scroll_Lock
+        0xFF08 => key(0x0E),          // BackSpace
+        0xFF09 | 0xFE20 => key(0x0F), // Tab, ISO_Left_Tab
+        0xFF0D => key(0x1C),          // Return
+        0xFF14 => key(0x46),          // Scroll_Lock
+        // The Korean keys, which reach the remote IME as VK_HANGUL and
+        // VK_HANJA when the session uses a Korean keyboard layout.
+        0xFF31 => key(0x72),                                    // Hangul
+        0xFF34 => key(0x71),                                    // Hangul_Hanja
         0xFF15 => key(0x54),                                    // Sys_Req
         0xFF1B => key(0x01),                                    // Escape
         0xFF50 | 0xFF95 => ext(0x47),                           // Home, KP_Home
@@ -322,7 +326,7 @@ impl Keyboard {
         }
         let ch = keysym_char(keysym)?;
         let us = match self.layout {
-            KeyboardLayout::EnUsQwerty => us_scancode(ch),
+            KeyboardLayout::EnUsQwerty | KeyboardLayout::KoKrQwerty => us_scancode(ch),
             KeyboardLayout::Failsafe => None,
         };
         let Some((sc, needs_shift)) = us else {
@@ -395,6 +399,8 @@ mod tests {
         assert_eq!(special_scancode(0xFFFF), Some(ext(0x53))); // Delete
         assert_eq!(special_scancode(SUPER_L), Some(ext(0x5B)));
         assert_eq!(special_scancode(CONTROL_R), Some(ext(0x1D)));
+        assert_eq!(special_scancode(0xFF31), Some(key(0x72))); // Hangul
+        assert_eq!(special_scancode(0xFF34), Some(key(0x71))); // Hanja
         // AltGr is not forwarded: the characters it produces are.
         assert_eq!(special_scancode(0xFE03), None);
     }
@@ -512,6 +518,19 @@ mod tests {
         assert_eq!(k.key(0x61, true), vec![up(0x2A), down(0x1E), down(0x2A)]);
         // Characters outside the layout cannot be typed at all.
         assert!(k.key(0x0100_D55C, true).is_empty());
+    }
+
+    #[test]
+    fn korean_layout_types_with_scancodes_for_the_remote_ime() {
+        let mut k = Keyboard::new(KeyboardLayout::KoKrQwerty, true);
+        // The Hangul key, then "gks": the remote IME composes 한.
+        assert_eq!(k.key(0xFF31, true), vec![down(0x72)]);
+        assert_eq!(k.key(0xFF31, false), vec![up(0x72)]);
+        assert_eq!(k.key(0x67, true), vec![down(0x22)]);
+        assert_eq!(k.key(0x6B, true), vec![down(0x25)]);
+        assert_eq!(k.key(0x73, true), vec![down(0x1F)]);
+        // Text composed on the client still arrives as Unicode.
+        assert_eq!(k.key(0x0100_D55C, true), vec![uni(0xD55C, true)]);
     }
 
     #[test]

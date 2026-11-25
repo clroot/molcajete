@@ -45,6 +45,8 @@ export interface MolcajeteSession {
   send_argv(name: string, value: string): void;
   send_ctrl_alt_del(): void;
   set_scale_mode(mode: 'fit' | 'native'): void;
+  /** The remote host's IME composes text; keys are sent as pressed. */
+  set_remote_composition(enabled: boolean): void;
   release_keys(): void;
   free(): void;
 }
