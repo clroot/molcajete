@@ -10,6 +10,7 @@ import {
   ArrowRightStartOnRectangleIcon,
   UserCircleIcon,
   FilmIcon,
+  ClipboardDocumentListIcon,
 } from '@heroicons/react/24/outline';
 import type {User} from '../api';
 import {href, type Route} from '../route';
@@ -69,6 +70,12 @@ export default function AppFrame({user, route, onSignOut, children}: Props) {
                   icon={FilmIcon}
                   href={href.recordings}
                   isSelected={route.name === 'recordings'}
+                />
+                <SideNavItem
+                  label="Audit log"
+                  icon={ClipboardDocumentListIcon}
+                  href={href.audit}
+                  isSelected={route.name === 'audit'}
                 />
               </>
             )}

@@ -27,12 +27,13 @@ use openidconnect::{
     ProviderMetadataWithLogout, RedirectUrl, Scope, TokenResponse as _, reqwest,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value};
-use tracing::{info, warn};
+use serde_json::{Map, Value, json};
+use tracing::warn;
 
 use crate::AppState;
 use crate::api::{self, ApiError};
-use crate::auth;
+use crate::audit::{self, Entry, action};
+use crate::auth::{self, ClientAddress};
 use crate::config::OidcConfig;
 use crate::db::{Database, DbError, NewUser, PendingLogin, Role, User, UserUpdate};
 
@@ -108,6 +109,14 @@ impl LoginError {
             Self::NotAllowed(_) => "not_allowed",
             Self::UsernameTaken(_) => "username_taken",
             Self::Provider(_) | Self::Failed(_) | Self::Db(_) => "failed",
+        }
+    }
+
+    /// The username the provider gave, when the error is about it.
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            Self::NotAllowed(username) | Self::UsernameTaken(username) => Some(username),
+            _ => None,
         }
     }
 }
@@ -411,24 +420,36 @@ fn string_list(value: &Value) -> Vec<String> {
 
 /// Finds, links or creates the user for an identity and applies what the
 /// provider says about them.
+///
+/// What it changes is recorded in the audit log as done by the user, from
+/// `address`.
 pub async fn sign_in(
     db: &Database,
     config: &OidcConfig,
     identity: &Identity,
+    address: &ClientAddress,
 ) -> Result<User, LoginError> {
     let user = match db
         .user_by_identity(&identity.issuer, &identity.subject)
         .await
     {
         Ok(user) => user,
-        Err(DbError::NotFound) => link_or_create(db, config, identity).await?,
+        Err(DbError::NotFound) => link_or_create(db, config, identity, address).await?,
         Err(err) => return Err(err.into()),
     };
     if user.disabled {
         return Err(LoginError::Disabled);
     }
-    let user = follow_username(db, user, &identity.username).await?;
-    sync_from_provider(db, config, user, &identity.groups).await
+    let user = follow_username(db, user, &identity.username, address).await?;
+    sync_from_provider(db, config, user, &identity.groups, address).await
+}
+
+/// An audit entry about `user` done by themselves through the provider.
+fn provider_entry(action: &'static str, user: &User, address: &ClientAddress) -> Entry {
+    Entry::new(action)
+        .by(user)
+        .from(address)
+        .target(audit::target::USER, &user.id, &user.username)
 }
 
 /// First sign-in of an identity: link the user with that username (when it
@@ -437,15 +458,15 @@ async fn link_or_create(
     db: &Database,
     config: &OidcConfig,
     identity: &Identity,
+    address: &ClientAddress,
 ) -> Result<User, LoginError> {
     let username = identity.username.as_str();
-    let user = match db.user_credentials(username).await {
+    let (user, action) = match db.user_credentials(username).await {
         Ok((user, _)) => {
             if db.has_identity(&user.id, &identity.issuer).await? {
                 return Err(LoginError::UsernameTaken(username.to_owned()));
             }
-            info!(%username, "linked an existing user to their identity at the provider");
-            user
+            (user, action::OIDC_USER_LINK)
         }
         Err(DbError::NotFound) if config.auto_create_users => {
             let user = db
@@ -460,20 +481,28 @@ async fn link_or_create(
                     DbError::Conflict => LoginError::UsernameTaken(username.to_owned()),
                     err => err.into(),
                 })?;
-            info!(%username, "created a user on their first single sign-on");
-            user
+            (user, action::OIDC_USER_CREATE)
         }
         Err(DbError::NotFound) => return Err(LoginError::NotAllowed(username.to_owned())),
         Err(err) => return Err(err.into()),
     };
     db.link_identity(&identity.issuer, &identity.subject, &user.id)
         .await?;
+    let entry = provider_entry(action, &user, address)
+        .detail("issuer", identity.issuer.as_str())
+        .detail("subject", identity.subject.as_str());
+    audit::record(db, entry).await;
     Ok(user)
 }
 
 /// Renames the user when the provider's username changed and the new one
 /// is free here.
-async fn follow_username(db: &Database, user: User, username: &str) -> Result<User, LoginError> {
+async fn follow_username(
+    db: &Database,
+    user: User,
+    username: &str,
+    address: &ClientAddress,
+) -> Result<User, LoginError> {
     if user.username == username {
         return Ok(user);
     }
@@ -483,7 +512,12 @@ async fn follow_username(db: &Database, user: User, username: &str) -> Result<Us
     };
     match db.update_user(&user.id, update).await {
         Ok(renamed) => {
-            info!(from = %user.username, to = %username, "renamed after the provider");
+            let entry =
+                provider_entry(action::OIDC_USER_RENAME, &renamed, address).changes(audit::diff(
+                    &json!({ "username": user.username }),
+                    &json!({ "username": renamed.username }),
+                ));
+            audit::record(db, entry).await;
             Ok(renamed)
         }
         Err(DbError::Conflict) => {
@@ -510,6 +544,7 @@ async fn sync_from_provider(
     config: &OidcConfig,
     user: User,
     groups: &[String],
+    address: &ClientAddress,
 ) -> Result<User, LoginError> {
     if config.sync_groups {
         let names: Vec<String> = groups
@@ -522,13 +557,20 @@ async fn sync_from_provider(
             })
             .cloned()
             .collect();
+        let before = group_names(db, &user.id).await?;
         match db
             .sync_user_groups_by_name(&user.id, &names, config.create_groups)
             .await
         {
             Ok(joined) => {
-                let joined: Vec<&str> = joined.iter().map(|g| g.name.as_str()).collect();
-                info!(username = %user.username, groups = ?joined, "groups follow the provider");
+                let after: Vec<&str> = joined.iter().map(|g| g.name.as_str()).collect();
+                let changes =
+                    audit::diff(&json!({ "groups": before }), &json!({ "groups": after }));
+                if changes.as_object().is_some_and(|c| !c.is_empty()) {
+                    let entry =
+                        provider_entry(action::OIDC_USER_GROUPS, &user, address).changes(changes);
+                    audit::record(db, entry).await;
+                }
             }
             Err(DbError::LastAdmin) => warn!(
                 username = %user.username,
@@ -552,7 +594,10 @@ async fn sync_from_provider(
             };
             match db.update_user(&user.id, update).await {
                 Ok(_) => {
-                    info!(username = %user.username, role = role.as_str(), "role follows the provider's groups");
+                    let entry = provider_entry(action::OIDC_USER_ROLE, &user, address).changes(
+                        audit::diff(&json!({ "role": user.role }), &json!({ "role": role })),
+                    );
+                    audit::record(db, entry).await;
                 }
                 Err(DbError::LastAdmin) => warn!(
                     username = %user.username,
@@ -565,6 +610,18 @@ async fn sync_from_provider(
     }
     // Group memberships change the effective role too.
     Ok(db.user(&user.id).await?)
+}
+
+/// Names of the user's groups.
+async fn group_names(db: &Database, user_id: &str) -> Result<Vec<String>, LoginError> {
+    let ids = db.user_group_ids(user_id).await?;
+    Ok(db
+        .list_groups()
+        .await?
+        .into_iter()
+        .filter(|g| ids.contains(&g.id))
+        .map(|g| g.name)
+        .collect())
 }
 
 /// The role `admin_groups` and `connection_manager_groups` give someone in
@@ -656,6 +713,7 @@ pub struct CallbackQuery {
 /// `GET /api/auth/oidc/callback`: back from the provider.
 pub async fn callback(
     State(state): State<Arc<AppState>>,
+    address: ClientAddress,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
@@ -663,18 +721,29 @@ pub async fn callback(
         return ApiError::not_found().into_response();
     };
     let clear = state_cookie("", 0, oidc.secure_cookies);
-    let result = finish_callback(&state, oidc, &headers, query).await;
+    let result = finish_callback(&state, oidc, &headers, query, &address).await;
     let (user, id_token) = match result {
         Ok(done) => done,
         Err(err) => {
             warn!(code = err.code(), error = %err, "single sign-on failed");
+            let mut entry = Entry::new(action::OIDC_LOGIN_FAILURE)
+                .from(&address)
+                .detail("reason", err.code())
+                .detail("error", err.to_string());
+            if let Some(username) = err.username() {
+                entry = entry.by_name(username);
+            }
+            audit::record(&state.db, entry).await;
             return back_with_error(err.code(), [clear]);
         }
     };
     let secure = oidc.secure_cookies || auth::is_https(&headers);
     match api::start_session(&state, &user, secure, Some(&id_token)).await {
         Ok(session) => {
-            info!(username = %user.username, "single sign-on");
+            let entry = Entry::new(action::OIDC_LOGIN_SUCCESS)
+                .by(&user)
+                .from(&address);
+            audit::record(&state.db, entry).await;
             see_other(APP_PATH, [clear, session])
         }
         Err(err) => {
@@ -689,6 +758,7 @@ async fn finish_callback(
     oidc: &Oidc,
     headers: &HeaderMap,
     query: CallbackQuery,
+    address: &ClientAddress,
 ) -> Result<(User, String), LoginError> {
     let started = auth::cookie(headers, STATE_COOKIE).ok_or(LoginError::Expired)?;
     let started = auth::token_hash(started);
@@ -712,7 +782,7 @@ async fn finish_callback(
         .code
         .ok_or_else(|| LoginError::Failed(anyhow!("the callback has no code")))?;
     let identity = oidc.finish(code, pending).await?;
-    let user = sign_in(&state.db, &oidc.config, &identity).await?;
+    let user = sign_in(&state.db, &oidc.config, &identity, address).await?;
     Ok((user, identity.id_token))
 }
 

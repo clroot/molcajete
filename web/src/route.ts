@@ -7,6 +7,7 @@ export type Route =
   | {name: 'users'}
   | {name: 'groups'}
   | {name: 'recordings'}
+  | {name: 'audit'}
   | {name: 'session'; connectionId: string}
   | {name: 'playback'; recordingId: string};
 
@@ -18,6 +19,7 @@ export function parseRoute(hash: string): Route {
   if (hash === '#/users') return {name: 'users'};
   if (hash === '#/groups') return {name: 'groups'};
   if (hash === '#/recordings') return {name: 'recordings'};
+  if (hash === '#/audit') return {name: 'audit'};
   return {name: 'connections'};
 }
 
@@ -26,6 +28,7 @@ export const href = {
   users: '#/users',
   groups: '#/groups',
   recordings: '#/recordings',
+  audit: '#/audit',
   playback: (recordingId: string) => `#/recordings/${encodeURIComponent(recordingId)}`,
   session: (connectionId: string) => `#/connect/${encodeURIComponent(connectionId)}`,
 };

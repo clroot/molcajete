@@ -1,12 +1,13 @@
-//! Storage for users, groups, connections, folders, grants, login sessions
-//! and the index of session recordings, in the spirit of Guacamole's JDBC
-//! authentication extensions.
+//! Storage for users, groups, connections, folders, grants, login sessions,
+//! the index of session recordings and the audit log, in the spirit of
+//! Guacamole's JDBC authentication extensions.
 //!
 //! One code path serves PostgreSQL, MySQL/MariaDB and SQLite through sqlx's
 //! `Any` driver. Queries are written with `?` placeholders and rewritten for
 //! PostgreSQL by [`Database::sql`]; every integer column is `BIGINT` and ids
 //! are strings, so rows decode the same way on every backend.
 
+mod audit;
 mod connections;
 mod folders;
 mod grants;
@@ -25,6 +26,7 @@ use sqlx::AnyPool;
 use sqlx::any::AnyPoolOptions;
 use sqlx::migrate::Migrator;
 
+pub use audit::{AuditEntry, AuditFilter};
 pub use connections::{ConnectionRecord, attributes};
 pub use folders::Folder;
 pub use grants::{Access, Principal, Target};
@@ -205,6 +207,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         for table in [
+            "molcajete_audit_log",
             "molcajete_oidc_login",
             "molcajete_user_identity",
             "molcajete_recording",
@@ -249,6 +252,7 @@ pub(crate) mod tests {
 
     /// Every table, children first.
     const TABLES: &[&str] = &[
+        "molcajete_audit_log",
         "molcajete_recording",
         "molcajete_connection_attribute",
         "molcajete_oidc_login",

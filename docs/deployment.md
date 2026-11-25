@@ -157,6 +157,9 @@ url = "postgres://molcajete:secret@db/molcajete"
 [recordings]
 max_age_days = 90
 
+[audit]
+retention_days = 365
+
 [[users]]
 username = "admin"
 password = "change-me"
@@ -293,6 +296,16 @@ max_total_size = "200 GiB"
 - **Format.** Files are in Guacamole's recording format, whichever daemon served the session. `guacenc` (from guacamole-server built with `--enable-guacenc`; it is not in the `guacamole/guacd` image) and the stock player play them, unless the connection keeps molcajete's image and video formats.
 - **guacd's own recording.** Connections with guacd's `recording-path` parameters keep working: those parameters go to stock guacd unchanged and guacd writes its own files on its host. molcajeted does not implement them.
 
+### `[audit]`
+
+How long the [audit log](administration.md#audit-log) of sign-ins and administrative changes is kept.
+
+| Key | Default | |
+| --- | --- | --- |
+| `retention_days` | `365` | Delete entries older than this many days, at startup and every hour. `0` keeps them forever. |
+
+The audit log is in the database, so it is backed up with it. Each entry is also a log line with the target `audit` ([observability.md](observability.md#sign-ins-and-changes)), for keeping a copy elsewhere or for longer.
+
 ### `[[users]]`
 
 Administrators created at startup when no user with that username exists yet. Existing users and their passwords are left alone, so changing a password here later has no effect; use the web UI or `set-password`.
@@ -373,6 +386,7 @@ The gateway applies pending migrations when it starts (and when `set-password` r
 | `20261126000000_groups_roles_folders` | `molcajete_user.is_admin` becomes `molcajete_user.role` (administrators get `admin`, everyone else `user`) and **the `is_admin` column is dropped**. Adds groups, members, folders (`molcajete_connection_group`, `molcajete_connection.parent_id`) and grants of folders to users and of connections and folders to groups. Existing grants are kept; existing connections sit at the top level. |
 | `20261126000100_recordings` | `molcajete_connection_attribute` (molcajete's own connection settings) and `molcajete_recording` (the recordings index). |
 | `20261126000200_oidc` | `molcajete_user_identity` (provider `iss` and `sub` per user), `molcajete_oidc_login` (sign-ins in progress) and `molcajete_session.id_token`. |
+| `20261127000000_audit_log` | `molcajete_audit_log` (the audit log). It starts empty: changes made before the upgrade are only in old process logs. |
 
 - A gateway that predates `20261126000000_groups_roles_folders` cannot start on a migrated database, because the column it reads is gone. Do not run old and new gateways against one database: stop the old one first (the Kubernetes template's `Recreate` strategy does this).
 - The JSON API keeps `isAdmin` on users, derived from the role, and accepts it in user requests, so scripts that used it keep working.
@@ -380,7 +394,7 @@ The gateway applies pending migrations when it starts (and when `set-password` r
 
 ### Configuration files
 
-The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour.
+The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour.
 
 ## Mixed versions
 

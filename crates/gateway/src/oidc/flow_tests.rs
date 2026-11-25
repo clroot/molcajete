@@ -284,6 +284,66 @@ async fn admin_groups_grant_and_take_away_admin() {
 }
 
 #[tokio::test]
+async fn sign_ins_and_what_the_provider_changes_are_audited() {
+    let sso = sso("").await;
+    let login = |groups: &[&str]| Login::new("sub-root", "root", groups);
+    sso.sign_in(login(&["molcajete-admins"])).await.session();
+    sso.sign_in(login(&[])).await.session();
+    let mut login = Login::new("s", "mallory", &[]);
+    login.audience = "another-client".into();
+    assert_eq!(sso.sign_in(login).await, Outcome::Refused("failed".into()));
+
+    let actions = |entries: &[crate::db::AuditEntry]| -> Vec<String> {
+        entries.iter().rev().map(|e| e.action.clone()).collect()
+    };
+    let only_sso = crate::db::AuditFilter {
+        action: Some("oidc".into()),
+        ..Default::default()
+    };
+    let entries = sso
+        .state
+        .db
+        .list_audit_entries(&only_sso, 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        actions(&entries),
+        [
+            "oidc.user.create",
+            "oidc.user.role",
+            "oidc.login.success",
+            "oidc.user.role",
+            "oidc.login.success",
+            "oidc.login.failure",
+        ]
+    );
+    let entry = |action: &str, nth: usize| {
+        entries
+            .iter()
+            .rev()
+            .filter(|e| e.action == action)
+            .nth(nth)
+            .unwrap()
+            .clone()
+    };
+    let promoted = entry("oidc.user.role", 0);
+    assert_eq!(promoted.actor_name.as_deref(), Some("root"));
+    assert_eq!(promoted.target_name.as_deref(), Some("root"));
+    assert_eq!(
+        promoted.changes,
+        Some(serde_json::json!({ "role": { "from": "user", "to": "admin" } }))
+    );
+    assert_eq!(
+        entry("oidc.user.role", 1).changes,
+        Some(serde_json::json!({ "role": { "from": "admin", "to": "user" } }))
+    );
+    let failure = entry("oidc.login.failure", 0);
+    assert_eq!(failure.actor_id, None);
+    assert_eq!(failure.source_address.as_deref(), Some("unknown"));
+    assert_eq!(failure.changes.unwrap()["reason"], "failed");
+}
+
+#[tokio::test]
 async fn admin_groups_only_grant_without_sync() {
     let sso = sso("sync_role = false").await;
     let login = |groups: &[&str]| Login::new("sub-root", "root", groups);

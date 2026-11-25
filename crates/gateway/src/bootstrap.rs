@@ -1,8 +1,10 @@
 //! Startup seeding: users and connections from `gateway.toml`, and a first
 //! administrator for an empty database.
 
-use tracing::{info, warn};
+use serde_json::json;
+use tracing::warn;
 
+use crate::audit::{self, Entry, action, target};
 use crate::auth;
 use crate::config::{Config, ConnectionConfig};
 use crate::db::{ConnectionRecord, Database, DbError, NewUser, Role, UserUpdate};
@@ -22,6 +24,22 @@ impl ConnectionConfig {
     }
 }
 
+/// Where entries of the audit log written at startup come from.
+const FROM_CONFIG: &str = "configuration file";
+const FROM_COMMAND_LINE: &str = "command line";
+
+/// The audit entry of an administrator created without anyone signed in.
+fn admin_created(user: &crate::db::User, source: &str) -> Entry {
+    Entry::new(action::USER_CREATE)
+        .source(source)
+        .target(target::USER, &user.id, &user.username)
+        .changes(json!({
+            "username": { "from": null, "to": user.username },
+            "role": { "from": null, "to": "admin" },
+            "password": { "from": null, "to": crate::sensitive::REDACTED },
+        }))
+}
+
 /// Imports `[[users]]` (as administrators) and `[[connections]]` that are
 /// not in the database yet, then makes sure someone can log in.
 pub async fn seed(db: &Database, config: &Config) -> anyhow::Result<()> {
@@ -32,34 +50,41 @@ pub async fn seed(db: &Database, config: &Config) -> anyhow::Result<()> {
             Err(err) => return Err(err.into()),
         }
         let hash = auth::hash_password_blocking(user.password.clone()).await?;
-        db.create_user(NewUser {
-            username: &user.username,
-            password_hash: &hash,
-            role: Role::Admin,
-            disabled: false,
-        })
-        .await?;
-        info!(username = %user.username, "created administrator from the configuration file");
+        let created = db
+            .create_user(NewUser {
+                username: &user.username,
+                password_hash: &hash,
+                role: Role::Admin,
+                disabled: false,
+            })
+            .await?;
+        audit::record(db, admin_created(&created, FROM_CONFIG)).await;
     }
 
     for connection in &config.connections {
         if db.connection_exists(&connection.id).await? {
             continue;
         }
-        db.create_connection(&connection.to_record()).await?;
-        info!(connection = %connection.id, "imported connection from the configuration file");
+        let created = db.create_connection(&connection.to_record()).await?;
+        let entry = Entry::new(action::CONNECTION_CREATE)
+            .source(FROM_CONFIG)
+            .target(target::CONNECTION, &created.id, &created.name)
+            .changes(audit::diff(&serde_json::Value::Null, &json!(created)));
+        audit::record(db, entry).await;
     }
 
     if db.count_users().await? == 0 {
         let password = auth::random_password();
         let hash = auth::hash_password_blocking(password.clone()).await?;
-        db.create_user(NewUser {
-            username: "admin",
-            password_hash: &hash,
-            role: Role::Admin,
-            disabled: false,
-        })
-        .await?;
+        let created = db
+            .create_user(NewUser {
+                username: "admin",
+                password_hash: &hash,
+                role: Role::Admin,
+                disabled: false,
+            })
+            .await?;
+        audit::record(db, admin_created(&created, "first start")).await;
         warn!(
             username = "admin",
             %password,
@@ -80,26 +105,39 @@ pub async fn set_password(db: &Database, username: &str, password: &str) -> anyh
     }
     let hash = auth::hash_password_blocking(password.to_owned()).await?;
     match db.user_credentials(username).await {
-        Ok((user, _)) => {
-            db.update_user(
-                &user.id,
-                UserUpdate {
-                    password_hash: Some(&hash),
-                    role: Some(Role::Admin),
-                    disabled: Some(false),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        Ok((before, _)) => {
+            let after = db
+                .update_user(
+                    &before.id,
+                    UserUpdate {
+                        password_hash: Some(&hash),
+                        role: Some(Role::Admin),
+                        disabled: Some(false),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let snapshot = |u: &crate::db::User| json!({ "role": u.role, "disabled": u.disabled });
+            let entry = Entry::new(action::USER_UPDATE)
+                .source(FROM_COMMAND_LINE)
+                .target(target::USER, &after.id, &after.username)
+                .changes(audit::diff(&snapshot(&before), &snapshot(&after)))
+                .changes(json!({ "password": {
+                    "from": crate::sensitive::REDACTED,
+                    "to": crate::sensitive::REDACTED,
+                } }));
+            audit::record(db, entry).await;
         }
         Err(DbError::NotFound) => {
-            db.create_user(NewUser {
-                username,
-                password_hash: &hash,
-                role: Role::Admin,
-                disabled: false,
-            })
-            .await?;
+            let created = db
+                .create_user(NewUser {
+                    username,
+                    password_hash: &hash,
+                    role: Role::Admin,
+                    disabled: false,
+                })
+                .await?;
+            audit::record(db, admin_created(&created, FROM_COMMAND_LINE)).await;
         }
         Err(err) => return Err(err.into()),
     }
@@ -158,5 +196,29 @@ mod tests {
         set_password(&db, "admin", "short").await.unwrap_err();
         set_password(&db, "rescue", "long enough").await.unwrap();
         assert!(db.user_credentials("rescue").await.unwrap().0.is_admin);
+
+        let entries = db
+            .list_audit_entries(&Default::default(), 10, 0)
+            .await
+            .unwrap();
+        let seen: Vec<_> = entries
+            .iter()
+            .rev()
+            .map(|e| {
+                (
+                    e.action.as_str(),
+                    e.source_address.as_deref().unwrap(),
+                    e.target_name.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("user.create", "first start", "admin"),
+                ("user.create", "command line", "rescue"),
+            ]
+        );
+        assert!(entries.iter().all(|e| e.actor_id.is_none()));
     }
 }

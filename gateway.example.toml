@@ -26,6 +26,10 @@ port = 4822
 # max_age_days = 90                             # 0 keeps recordings forever
 # max_total_size = "200 GiB"                    # the oldest go first; 0 = no limit
 
+# Audit log of sign-ins and administrative changes (Audit log in the web UI).
+# [audit]
+# retention_days = 365                          # 0 keeps entries forever
+
 # Created as an administrator on startup if the username does not exist
 # yet; afterwards, manage users (and passwords) in the web UI. Without any
 # user, an "admin" account with a random password is created and logged.

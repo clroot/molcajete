@@ -345,7 +345,7 @@ Measurements are in section 7.7.
 
 ## 5. Gateway (`molcajete-gateway`)
 
-The gateway is an axum server. It serves the web UI (`web/dist`), the JSON API under `/api` (authentication, connections, folders, users, groups, recordings, settings, client reports), the tunnel at `/websocket-tunnel` and `/healthz`. Its own configuration is a TOML file (`gateway.example.toml`); everything managed through the UI is in the database. Configuration keys are listed in [deployment.md](deployment.md).
+The gateway is an axum server. It serves the web UI (`web/dist`), the JSON API under `/api` (authentication, connections, folders, users, groups, recordings, audit log, settings, client reports), the tunnel at `/websocket-tunnel` and `/healthz`. Its own configuration is a TOML file (`gateway.example.toml`); everything managed through the UI is in the database. Configuration keys are listed in [deployment.md](deployment.md).
 
 ### 5.1 Tunnel (`tunnel.rs`, `guacd.rs`)
 
@@ -438,6 +438,7 @@ One code path serves SQLite, PostgreSQL and MySQL/MariaDB through sqlx's `Any` d
 | `20261126000000_groups_roles_folders` | groups and members, roles, folders, group and folder grants |
 | `20261126000100_recordings` | connection attributes, the recording index |
 | `20261126000200_oidc` | identities at providers, pending sign-ins |
+| `20261127000000_audit_log` | the audit log |
 
 Connection attributes (`molcajete_connection_attribute`) hold molcajete's own per-connection switches (`record-sessions`, `record-keys`, `record-exclude-mouse`, `record-molcajete-formats`); unlike parameters they never reach the daemon. Upgrading is described in [deployment.md](deployment.md#upgrading).
 
@@ -456,7 +457,32 @@ Connection attributes (`molcajete_connection_attribute`) hold molcajete's own pe
 
 **Writing, index and retention.** A recording starts after a successful handshake; the file and its row in `molcajete_recording` are created first, and a session whose file cannot be created is refused (`SERVER_ERROR`). Both directions of the relay encode into one `Encoder` (a mutex never held across an await); before each message to the browser and after each message from it the encoded text goes through a bounded channel to a writer thread, so a slow disk slows the tunnel down instead of losing data. When the tunnel closes, the row gets its end time and size; a row left open by a crash is completed from its file at the next start. Retention runs at start and every 10 minutes: by end time (`max_age_days`) and, newest first, deleting everything older than where the sizes add up past `max_total_size`. The recording endpoints are for administrators only.
 
-### 5.7 Client reports
+### 5.7 Audit log (`audit.rs`, `sensitive.rs`, `db/audit.rs`)
+
+Sign-ins, sign-outs and every change made through the API, the configuration file or `set-password` are recorded in `molcajete_audit_log`. A handler describes what happened and records it once the change has succeeded:
+
+```rust
+audit::record(
+    &state.db,
+    Entry::new(action::USER_UPDATE)      // one of audit::action
+        .by(&admin)                      // or .by_name(typed) / nothing for the gateway
+        .from(&address)                  // the ClientAddress extractor, or .source("command line")
+        .target(target::USER, &user.id, &user.username)
+        .changes(audit::diff(&before, &after))
+        .detail("reason", "wrong_password"),
+)
+.await;
+```
+
+- **Diffs.** `audit::diff` compares two JSON snapshots: nested objects flatten to dotted keys (`parameters.hostname`), lists of strings become `added`/`removed`, and a missing field equals `null`. Handlers snapshot what an administrator thinks of as the record (for a user: username, role, disabled, groups by name, grants), so one request that touches several tables gives one entry.
+- **Redaction.** `record` passes every entry through `sensitive::redact`, which replaces the value under any secret key at any depth with `[redacted]`. `sensitive::is_secret` is the gateway's one list of secret names (the parameters the web UI edits as passwords or keys, Guacamole's `sftp-`/`gateway-` variants, and the user's password), for anything else that must keep secrets out of logs or responses.
+- **Not in the change's transaction.** One request is several repository calls with their own transactions (a user, then its groups, then its grants), so the entry is written right after them. `record` never fails the request: it writes the log line (target `audit`) first, then the row; a failed insert is logged and counted (`molcajete_gateway_audit_write_failures_total`).
+- **Order and paging.** Entry ids are UUIDv7, increasing within the process, so entries of the same millisecond keep their order under `ORDER BY occurred_at DESC, entry_id DESC`. `GET /api/audit` pages with `LIMIT`/`OFFSET` and fetches one row more to answer `hasMore`; the action filter matches an action or everything below a prefix (`action = ? OR action LIKE 'prefix.%'`), and only names of lowercase letters, digits, `_` and `.` are accepted. CSV export streams the same query in pages of 1000.
+- **Retention.** A task deletes entries older than `[audit] retention_days` at start and every hour.
+
+Action names are part of the interface (filters, SIEM rules); new ones go into `audit::action::ALL` and [administration.md](administration.md#actions).
+
+### 5.8 Client reports
 
 The page posts the client's once-per-second `stats` to `/api/telemetry/client` (`client_report.rs`) when reports are enabled. The gateway records them in histograms labelled by connection, client mode and kind of client, and logs a summary per batch naming the tunnel and molcajeted's connection id. This is the only view into the browser side of the pipeline; see [observability.md](observability.md).
 
@@ -772,7 +798,6 @@ Tracked as issues:
 
 - Sharing a running session through links, and administrators shadowing sessions (#48); joining with `select,$id` is refused by molcajeted today
 - Active sessions and connection history for administrators, ending sessions (#49)
-- An audit log of administrative changes and logins (#50)
 - Encrypting stored connection credentials and never returning them from the API (#52)
 - File transfer: SFTP in SSH sessions and drive redirection in RDP (#53); the protocol's `file`/`pipe`/`filesystem` objects are not handled yet
 - Read-only and clipboard restrictions in the connection form (#54)
