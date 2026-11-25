@@ -802,7 +802,7 @@ impl Inner {
                 x,
                 y,
             } => {
-                let slot: ImageSlot = Rc::new(RefCell::new(ImageState::Pending));
+                let slot = ImageSlot::pending();
                 self.display.enqueue(Op::Image {
                     layer,
                     mode,
@@ -838,7 +838,7 @@ impl Inner {
                 } else {
                     "image/jpeg"
                 };
-                let slot: ImageSlot = Rc::new(RefCell::new(ImageState::Pending));
+                let slot = ImageSlot::pending();
                 self.display.enqueue(Op::Image {
                     layer,
                     mode,
@@ -1040,13 +1040,13 @@ impl Inner {
         let mimetype = mimetype.to_owned();
         let started = scope::performance_now();
         wasm_bindgen_futures::spawn_local(async move {
-            *slot.borrow_mut() = match crate::image::decode(bytes, mimetype).await {
+            slot.finish(match crate::image::decode(bytes, mimetype).await {
                 Ok(image) => ImageState::Ready(image),
                 Err(err) => {
                     web_sys::console::warn_2(&"image decode failed".into(), &err);
                     ImageState::Failed
                 }
-            };
+            });
             let elapsed = scope::performance_now() - started;
             with_inner(&weak, |inner| {
                 inner.display.image_decoded(elapsed);

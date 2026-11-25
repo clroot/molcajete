@@ -41,6 +41,21 @@ const TILE: u32 = 64;
 const ROW_GAP_MERGE: u32 = 6;
 /// Changed columns separated by fewer unchanged columns share one image.
 const COLUMN_GAP_MERGE: u32 = 48;
+/// What one more image is taken to cost, in bytes of image data: its PNG
+/// signature, chunk headers, checksums and palette, the `img`, `blob` and
+/// `end` instructions around it, base64 padding, and a decode on the client
+/// (which dominates: a client is slowed by the number of images of a frame
+/// long before their size). Changed rectangles are joined when the unchanged
+/// pixels between them are estimated to cost less than this.
+const IMAGE_OVERHEAD_BYTES: u64 = 1024;
+/// Estimated pixels per encoded byte where a row is one colour or repeats
+/// the row above it (blank lines, margins, rules).
+const FLAT_PIXELS_PER_BYTE: u64 = 128;
+/// Estimated pixels per encoded byte anywhere else (text, pictures).
+const BUSY_PIXELS_PER_BYTE: u64 = 8;
+/// Rectangles are not joined beyond this many pixels, so that a large
+/// update stays several images the client decodes side by side.
+const MAX_JOINED_PIXELS: u64 = 1 << 20;
 /// Minimum number of rows a scroll copy must cover.
 const MIN_SCROLL_ROWS: u32 = 8;
 /// Bound on pixel comparisons per frame while searching for moved blocks.
@@ -1198,8 +1213,9 @@ impl Display {
 
     /// Rectangles covering the differences inside `rect`: tiles without
     /// differences are skipped (e.g. the interior of a window that arrived
-    /// by copy), adjacent changed tiles are merged, and each result is cut
-    /// further into changed row bands and column runs.
+    /// by copy), adjacent changed tiles are merged, each result is cut
+    /// further into changed row bands and column runs, and those are joined
+    /// again wherever one image is cheaper than two.
     fn changed_rects(&self, rect: &Rect) -> Vec<Rect> {
         // (first tile column, end tile column, bounding box) per open run.
         let mut open: Vec<(u32, u32, Rect)> = Vec::new();
@@ -1246,7 +1262,77 @@ impl Display {
             open = next_open;
         }
         merged.extend(open.into_iter().map(|o| o.2));
-        merged.iter().flat_map(|r| self.split_bands(r)).collect()
+        self.join_by_cost(merged.iter().flat_map(|r| self.split_bands(r)).collect())
+    }
+
+    /// Joins rectangles into their bounding box while the unchanged pixels
+    /// this adds are estimated to cost less than the image it saves (see
+    /// [`IMAGE_OVERHEAD_BYTES`]). Lines of text that changed over the same
+    /// columns end up in one image, as the leading between them is flat;
+    /// changes side by side over unchanged text stay apart.
+    fn join_by_cost(&self, mut rects: Vec<Rect>) -> Vec<Rect> {
+        rects.sort_by_key(|r| (r.y, r.x));
+        let mut joined: Vec<Rect> = Vec::with_capacity(rects.len());
+        for mut rect in rects {
+            // Growing a rectangle may bring further ones within reach.
+            while let Some((_, i)) = joined
+                .iter()
+                .enumerate()
+                .filter_map(|(i, other)| self.join_cost(other, &rect).map(|cost| (cost, i)))
+                .min()
+            {
+                rect = union(rect, joined.swap_remove(i));
+            }
+            joined.push(rect);
+        }
+        joined
+    }
+
+    /// Estimated cost of sending the bounding box of `a` and `b` instead of
+    /// both, in flat pixels (see [`FLAT_PIXELS_PER_BYTE`]), or `None` if
+    /// that is more than an image is worth or the result would be too large.
+    fn join_cost(&self, a: &Rect, b: &Rect) -> Option<u64> {
+        let budget = IMAGE_OVERHEAD_BYTES * FLAT_PIXELS_PER_BYTE;
+        let busy = FLAT_PIXELS_PER_BYTE / BUSY_PIXELS_PER_BYTE;
+        let both = union(*a, *b);
+        if both.area() > MAX_JOINED_PIXELS {
+            return None;
+        }
+        let overlap = (a.right().min(b.right()).saturating_sub(a.x.max(b.x)) as u64)
+            * (a.bottom().min(b.bottom()).saturating_sub(a.y.max(b.y)) as u64);
+        // Even if every added pixel were flat.
+        if both.area() + overlap - a.area() - b.area() > budget {
+            return None;
+        }
+        let (left, right) = if a.x <= b.x { (a, b) } else { (b, a) };
+        let mut cost = 0;
+        for y in both.y..both.bottom() {
+            // The parts of this row that neither rectangle covers.
+            let mut x = both.x;
+            for covered in [left, right] {
+                if covered.y <= y && y < covered.bottom() {
+                    cost += self.row_cost(y, x, covered.x, both.y, busy);
+                    x = x.max(covered.right());
+                }
+            }
+            cost += self.row_cost(y, x, both.right(), both.y, busy);
+            if cost > budget {
+                return None;
+            }
+        }
+        Some(cost)
+    }
+
+    /// Estimated cost of sending the unchanged pixels `[x0, x1)` of row `y`
+    /// in an image whose first row is `top`: `busy` per pixel, or one where
+    /// the row is a single colour or repeats the row above.
+    fn row_cost(&self, y: u32, x0: u32, x1: u32, top: u32, busy: u64) -> u64 {
+        if x0 >= x1 {
+            return 0;
+        }
+        let row = self.segment(&self.pixels, y, x0, x1);
+        let flat = is_uniform(row) || (y > top && row == self.segment(&self.pixels, y - 1, x0, x1));
+        (x1 - x0) as u64 * if flat { 1 } else { busy }
     }
 
     /// Splits the differences inside `rect` into bands of changed rows and,
