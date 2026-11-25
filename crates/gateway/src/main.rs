@@ -12,6 +12,7 @@ mod client_report;
 mod config;
 mod db;
 mod guacd;
+mod oidc;
 mod tunnel;
 
 use std::net::SocketAddr;
@@ -75,6 +76,15 @@ pub struct AppState {
     pub client_reports: bool,
     /// Which tunnel each page session opened, for client reports.
     pub tunnels: client_report::Tunnels,
+    /// Single sign-on, when `[oidc]` is configured.
+    pub oidc: Option<oidc::Oidc>,
+}
+
+impl AppState {
+    /// Whether the username and password form is offered.
+    pub fn password_login(&self) -> bool {
+        self.oidc.as_ref().is_none_or(|o| o.config.password_login)
+    }
 }
 
 /// Lets the page know which optional features are on.
@@ -179,6 +189,9 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/auth/logout", post(api::logout))
         .route("/auth/me", get(api::me))
         .route("/auth/password", put(api::change_password))
+        .route("/auth/providers", get(oidc::providers))
+        .route("/auth/oidc/login", get(oidc::login))
+        .route("/auth/oidc/callback", get(oidc::callback))
         .route(
             "/connections",
             get(api::list_connections).post(api::create_connection),
@@ -304,6 +317,14 @@ async fn main() -> anyhow::Result<()> {
         warn!(dir = %config.server.static_dir.display(), "static_dir has no index.html");
     }
 
+    let oidc = config.oidc.clone().map(oidc::Oidc::new).transpose()?;
+    if let Some(oidc) = &oidc {
+        info!(
+            issuer = %oidc.config.issuer,
+            password_login = oidc.config.password_login,
+            "single sign-on through OpenID Connect"
+        );
+    }
     let db = open_database(&config).await?;
     bootstrap::seed(&db, &config).await?;
 
@@ -312,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         client_reports: cli.client_reports,
         tunnels: Default::default(),
+        oidc,
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!(%listen, "gateway listening");
@@ -379,6 +401,7 @@ mod tests {
             db,
             client_reports: false,
             tunnels: Default::default(),
+            oidc: None,
         });
         TestApp {
             router: router(state.clone()),

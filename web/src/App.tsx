@@ -28,7 +28,12 @@ export default function App() {
   }, []);
 
   const signOut = useCallback(async () => {
-    await api.logout().catch(() => {});
+    const result = await api.logout().catch(() => undefined);
+    if (result?.logoutUrl) {
+      // Signed in through the identity provider: sign out there too.
+      window.location.assign(result.logoutUrl);
+      return;
+    }
     setAuth(SIGNED_OUT);
   }, []);
 

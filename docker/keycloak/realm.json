@@ -1,0 +1,61 @@
+{
+  "realm": "molcajete",
+  "enabled": true,
+  "sslRequired": "none",
+  "groups": [{"name": "molcajete-admins"}, {"name": "staff"}],
+  "clients": [
+    {
+      "clientId": "molcajete",
+      "name": "molcajete",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "molcajete-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://localhost:18083/api/auth/oidc/callback"],
+      "webOrigins": ["http://localhost:18083"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:18083/"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@example.test",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Admin",
+      "credentials": [{"type": "password", "value": "alice-password", "temporary": false}],
+      "groups": ["molcajete-admins"]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@example.test",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Staff",
+      "credentials": [{"type": "password", "value": "bob-password", "temporary": false}],
+      "groups": ["staff"]
+    }
+  ]
+}

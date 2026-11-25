@@ -113,6 +113,11 @@ account is created and its random password is logged. To recover access:
 echo 'new-password' | molcajete-gateway --config gateway.toml set-password admin
 ```
 
+People can also sign in through an OpenID Connect identity provider
+(Keycloak, Authentik, Entra ID, …) with an `[oidc]` section: users are created
+on their first sign-in, their roles and user groups can follow the provider's
+groups, and the password form can be turned off. See [single sign-on](docs/deployment.md#single-sign-on-openid-connect).
+
 The web UI (`web/`) is React with the [Astryx](https://astryx.atmeta.com)
 design system. For UI work, run `SKIP_UI=1 scripts/build-web.sh` once and
 `bun run dev` in `web/`; it proxies the API and the tunnel to a gateway on

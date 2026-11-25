@@ -114,8 +114,63 @@ gateway (pod) -> host.orb.internal:4822 -> molcajeted (launchd agent, 127.0.0.1:
 - The client offers two WebSocket subprotocols (`Sec-WebSocket-Protocol: molcajete-binary-v1, guacamole`) and the gateway answers with one. A proxy must pass that header in both directions, as nginx does by default; one that drops it from the request leaves the tunnel on the text protocol, one that drops it from the response makes the browser refuse the connection. With `molcajete-binary-v1` most messages are binary WebSocket frames, which nginx forwards like text ones. Do not let a proxy negotiate `permessage-deflate` on this path: the payload is already compressed images and video.
 - `X-Real-IP` and `X-Forwarded-For` are overwritten with `$remote_addr`, not appended to. The Tailscale ingress in between replaces `X-Forwarded-For` with its own peer address, so the gateway logs `X-Real-IP` first.
 - If nginx runs in Docker with published ports, `$remote_addr` may be the Docker bridge gateway for every client; use host networking to see real client addresses.
-- Authentication is the gateway's login page: users and their Argon2id password hashes are in the database, sessions are `HttpOnly`, `SameSite=Strict` cookies (`Secure` behind `X-Forwarded-Proto: https`). Once public, the remote desktops depend on those passwords: use long ones, and restrict client addresses at the proxy or put single sign-on in front.
+- Authentication is the gateway's login page: users and their Argon2id password hashes are in the database, sessions are `HttpOnly`, `SameSite=Strict` cookies (`Secure` behind `X-Forwarded-Proto: https`). Once public, the remote desktops depend on those passwords: use long ones, and restrict client addresses at the proxy or sign in through your identity provider instead ([single sign-on](#single-sign-on-openid-connect)).
 - The proxy must pass `Host` (or `X-Forwarded-Host`) through unchanged: the gateway refuses state-changing requests and tunnels whose `Origin` does not match it.
+
+### Single sign-on (OpenID Connect)
+
+With an `[oidc]` section the login page offers *Sign in with …* next to (or instead of) the password form. The gateway runs the authorization code flow with PKCE against any OpenID Connect provider (Keycloak, Authentik, Okta, Google Workspace, Entra ID) and then issues the same `molcajete_session` cookie as a password login.
+
+```toml
+[oidc]
+issuer = "https://sso.example.com/realms/example"   # exactly the ID token's iss
+client_id = "molcajete"
+client_secret_file = "/run/secrets/oidc-client-secret"
+redirect_url = "https://molcajete.example.com/api/auth/oidc/callback"
+display_name = "Example SSO"
+admin_groups = ["molcajete-admins"]
+post_logout_redirect_url = "https://molcajete.example.com/"
+```
+
+| Key | Default | |
+| --- | --- | --- |
+| `issuer` | | Discovery reads `<issuer>/.well-known/openid-configuration`; the value must match the provider's `iss` exactly (mind trailing slashes). |
+| `client_id` | | |
+| `client_secret`, `client_secret_file` | none | Or the `MOLCAJETE_OIDC_CLIENT_SECRET` environment variable, which wins. Without any, the gateway is a public client (PKCE only). |
+| `redirect_url` | | The browser-visible URL of `/api/auth/oidc/callback`; register it at the provider. |
+| `scopes` | `["profile", "email"]` | Requested besides `openid`. Add the scope that releases groups if the provider needs one. |
+| `username_claim` | `preferred_username` | Claim holding the molcajete username. A dotted path reads nested claims. |
+| `groups_claim` | `groups` | Claim holding a list of group names (dotted paths work, e.g. `realm_access.roles`). |
+| `display_name` | `single sign-on` | The button says *Sign in with &lt;display_name&gt;*. |
+| `admin_groups` | `[]` | Members of any of these provider groups get the `admin` role. |
+| `connection_manager_groups` | `[]` | Members of any of these (and none of `admin_groups`) get the `connection_manager` role. |
+| `sync_role` | `true` | With either list, the user's own role is set from them on every sign-in, down to `user` for someone who left them. `false` only ever raises it. |
+| `sync_groups` | `false` | Make the user a member of exactly the molcajete user groups named in `groups_claim` on every sign-in. |
+| `create_groups` | `false` | With `sync_groups`, create a group (role `user`, no grants) for a provider group that has none here; otherwise such names are skipped. |
+| `group_prefix` | none | With `sync_groups`, sync only provider groups whose names start with this (names are kept as they are). |
+| `auto_create_users` | `true` | Create users on their first sign-in, with no connections. `false` lets in only users an administrator created first (matched by username). |
+| `password_login` | `true` | `false` hides the password form and refuses `POST /api/auth/login`. |
+| `post_logout_redirect_url` | none | Where the provider sends the browser after signing out there; register it at the provider. |
+
+How it behaves:
+
+- The ID token's signature, issuer, audience, expiry, nonce and access token hash are checked. Claims missing from the ID token are read from the userinfo endpoint. Discovery and signing keys are cached for ten minutes and fetched again when a signature does not verify.
+- The `state`, `nonce` and PKCE verifier of a sign-in in progress are kept in the database (`molcajete_oidc_login`, ten minutes, used once) and the state also in an `HttpOnly`, `SameSite=Lax` cookie (`molcajete_oidc_state`), so a callback is accepted once and only in the browser that started it. Several gateway replicas can share the work as long as they share the database.
+- Users are linked to the provider's `iss` and `sub` (`molcajete_user_identity`), so a user renamed at the provider keeps their account; the local username follows when the new one is free. On the first sign-in an existing user with the same username is linked, unless already linked to someone else at the provider. Use a username claim people cannot change themselves at the provider: whoever arrives with the name `admin` is linked to the local `admin` account.
+- Users created on sign-in have no password and cannot use the password form; an administrator may still set one in *Users*. With single sign-on configured, administrators may also create users without a password. Disabled users are refused, whichever way they sign in.
+- Signing out of a session opened through the provider also signs out there, when the provider advertises an `end_session_endpoint` (RP-initiated logout with `id_token_hint`).
+- Failed sign-ins return to the login page with a short message (`?login_error=<code>`); the reason is in the gateway log (`single sign-on failed`).
+- **Break-glass** with `password_login = false`: set `password_login = true` (or remove the line), restart, run `set-password <name>` (see the README) and sign in with that password; then turn it off again.
+- Roles and groups from the provider, on every sign-in:
+  - `admin_groups` and `connection_manager_groups` set the user's own role. A user's effective role is still the highest of their own and their groups' roles, so with `sync_groups` a molcajete group with the `admin` role is another way to make administrators.
+  - `sync_groups` matches provider group names to molcajete user groups exactly and removes memberships in groups the claim does not name, including ones an administrator added by hand: with it on, the provider decides every membership. Give the groups (or the ones `create_groups` made) their connections, folders and role in *Groups*.
+  - Neither may leave no enabled administrator. When a sign-in would, that change is skipped with a warning in the log and the user still signs in; demote the last administrator by hand after making someone else one.
+
+Provider notes:
+
+- **Keycloak**: issuer `https://<host>/realms/<realm>`. Create a confidential OpenID Connect client with the standard flow, the redirect URL and *Valid post logout redirect URIs*. For groups add a *Group Membership* mapper with token claim name `groups`, *Full group path* off and *Add to ID token* on. `docker/keycloak/compose.yml` is a ready test realm (gateway config in `docker/keycloak/gateway.keycloak.toml`).
+- **Authentik**: create an OAuth2/OpenID provider and application; the issuer is `https://<host>/application/o/<application-slug>/`, including the trailing slash. The default `profile` scope mapping includes `groups` and `preferred_username`.
+- **Entra ID**: register an application with a web redirect URI and a client secret; the issuer is `https://login.microsoftonline.com/<tenant-id>/v2.0`. `preferred_username` is the user principal name (`user@domain`). For groups, set *Token configuration → Add groups claim*; Entra sends group object ids unless the groups come from on-premises AD, so list those ids in `admin_groups` (and use them as group names with `sync_groups`).
 
 ### Binary tunnel and mixed versions
 

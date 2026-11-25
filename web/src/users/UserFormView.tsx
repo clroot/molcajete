@@ -8,6 +8,7 @@ import {Banner} from '@astryxdesign/core/Banner';
 import {Divider} from '@astryxdesign/core/Divider';
 import {Text} from '@astryxdesign/core/Text';
 import {api, errorMessage, type Role, type UserDetail} from '../api';
+import {useApiData} from '../useApiData';
 import {FormActions, FormDrawerLayout} from '../shell/FormDrawer';
 import {MIN_PASSWORD_LENGTH, PASSWORD_RULE, isPasswordTooShort} from '../auth/password';
 import {ROLES, roleLabel} from '../access/roles';
@@ -49,6 +50,10 @@ export default function UserFormView({userId, title, initial, choices, isSelf, o
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
   const update = (patch: Partial<UserFormValues>) => setValues(v => ({...v, ...patch}));
+  // With single sign-on, new users may sign in through the provider only.
+  const providers = useApiData(api.providers);
+  const hasSso = providers.status === 'ready' && providers.data.oidc !== null;
+  const isPasswordRequired = isNew && !hasSso;
 
   // The highest role among the selected groups raises the user's own.
   const groupRole = choices.groups
@@ -62,7 +67,7 @@ export default function UserFormView({userId, title, initial, choices, isSelf, o
       setError('Enter a username.');
       return;
     }
-    if ((isNew && !password) || isPasswordTooShort(password)) {
+    if ((isPasswordRequired && !password) || isPasswordTooShort(password)) {
       setError(`The password needs at least ${MIN_PASSWORD_LENGTH} characters.`);
       return;
     }
@@ -109,13 +114,9 @@ export default function UserFormView({userId, title, initial, choices, isSelf, o
               value={password}
               onChange={setPassword}
               autoComplete="new-password"
-              description={
-                isNew
-                  ? PASSWORD_RULE
-                  : 'Leave empty to keep the current password. A new one signs the user out.'
-              }
+              description={passwordDescription(isNew, hasSso)}
               status={isPasswordTooShort(password) ? {type: 'error', message: PASSWORD_RULE} : undefined}
-              isRequired={isNew}
+              isRequired={isPasswordRequired}
             />
           </VStack>
 
@@ -176,4 +177,9 @@ export default function UserFormView({userId, title, initial, choices, isSelf, o
       </form>
     </FormDrawerLayout>
   );
+}
+function passwordDescription(isNew: boolean, hasSso: boolean) {
+  if (!isNew) return 'Leave empty to keep the current password. A new one signs the user out.';
+  if (hasSso) return `${PASSWORD_RULE} Leave empty for a user who signs in only with single sign-on.`;
+  return PASSWORD_RULE;
 }

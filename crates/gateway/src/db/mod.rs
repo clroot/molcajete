@@ -10,6 +10,7 @@ mod connections;
 mod folders;
 mod grants;
 mod groups;
+mod oidc;
 mod sessions;
 mod users;
 
@@ -26,6 +27,7 @@ pub use connections::ConnectionRecord;
 pub use folders::Folder;
 pub use grants::{Access, Principal, Target};
 pub use groups::{Group, GroupUpdate};
+pub use oidc::PendingLogin;
 pub use users::{NewUser, Role, User, UserUpdate};
 
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("migrations/sqlite");
@@ -200,6 +202,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
         for table in [
+            "molcajete_oidc_login",
+            "molcajete_user_identity",
             "molcajete_session",
             "molcajete_connection_permission",
             "molcajete_connection_group_permission",
