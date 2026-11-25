@@ -13,7 +13,7 @@ written in Rust and compiled to WebAssembly.
 |---|---|---|
 | `molcajete-protocol` | protocol code in libguac / guacamole-common / guacamole-common-js | complete: streaming parser, encoder, typed instructions, video framing |
 | `molcajete-client` (wasm) | `guacamole-common-js` (`Guacamole.Client`, `Display`, `Keyboard`, `Mouse`, …) | WebGL2 renderer, WebCodecs video, input, clipboard, audio, recording playback |
-| `molcajete-gateway` | the Guacamole web application (`guacamole-common`, JDBC authentication, session recording) | WebSocket tunnel, web UI, users, groups, connections and grants in PostgreSQL, MySQL or SQLite, single sign-on, session recordings |
+| `molcajete-gateway` | the Guacamole web application (`guacamole-common`, JDBC authentication, session recording) | WebSocket tunnel, web UI, users, groups, connections and grants in PostgreSQL, MySQL or SQLite, single sign-on, session recordings, audit log |
 | `molcajete-daemon` (`molcajeted`) | `guacd` + libguac + protocol plugins | VNC, SSH, RDP (incl. audio); video mode (AV1/H.265/H.264) for busy areas |
 
 The gateway is wire-compatible with the stock `guacd`, and accepts the same
@@ -73,6 +73,9 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
 - **Session recordings** in Guacamole's format, for stock guacd and
   molcajeted alike, played back in the browser with seeking, or turned into
   video with `guacenc`.
+- **Audit log** of sign-ins and administrative changes: who changed what,
+  from where, field by field with secrets redacted; filtered and exported
+  as CSV in the web UI, and written to the log for a SIEM.
 - **Observability.** JSON logs, Prometheus metrics for every stage of the
   frame pipeline, CPU profiles for Pyroscope, performance reports from the
   browser, and a Grafana dashboard.
@@ -138,7 +141,7 @@ session.connect(session.tunnel_url("wss://example.com/websocket-tunnel", "vnc"))
 
 - [docs/administration.md](docs/administration.md): users and passwords,
   roles, groups, connections, folders and grants, single sign-on, session
-  recordings, the JSON API.
+  recordings, the audit log, the JSON API.
 - [docs/deployment.md](docs/deployment.md): images, Docker Compose,
   Kubernetes, molcajeted on macOS, the configuration reference, reverse
   proxies, upgrading.

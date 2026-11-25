@@ -92,6 +92,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajete_gateway_tunnels_total` | counter | connection, protocol, status | Closed tunnels by Guacamole status code |
 | `molcajete_gateway_tunnel_duration_seconds` | histogram | connection, protocol | Tunnel length |
 | `molcajete_gateway_relayed_bytes_total` | counter | connection, protocol, direction | Bytes relayed: `to_browser` (as read from the daemon), `to_guacd` |
+| `molcajete_gateway_audit_write_failures_total` | counter | | Audit log entries that could not be stored in the database (the change itself went through and the `audit` log line was written) |
 
 ### Browser reports
 
@@ -161,17 +162,28 @@ A `client report` carries the `tunnel_id` and `guacd_id` of the tunnel its page 
 
 ### Sign-ins and changes
 
-The gateway logs who signed in and who changed what. Changes carry the acting user as `by`.
+Every entry of the [audit log](administration.md#audit-log) (sign-ins and their failures, sign-outs, changes to users, groups, connections, folders and grants, recordings downloaded or deleted) is also one log line with the target `audit`. Its message is the action, such as `user.update`; with `--log-format json` the line carries `target: "audit"` and these fields, empty when they do not apply:
+
+| Field | |
+| --- | --- |
+| `entry` | The entry's id in `molcajete_audit_log` |
+| `action` | `login.failure`, `connection.update`, ... ([the list](administration.md#actions)) |
+| `actor`, `actor_id` | Username at the time (or the name a failed sign-in gave) and user id |
+| `source` | The browser's address, or `configuration file`, `first start`, `command line` |
+| `target_type`, `target_id`, `target_name` | What the entry is about |
+| `changes` | The changed fields as a JSON object serialized into a string, secrets replaced by `[redacted]` |
+
+The line is written before the entry is stored, so a SIEM gets it even when the database write fails (`cannot store an audit log entry`, `molcajete_gateway_audit_write_failures_total`). In Loki:
+
+```logql
+{namespace="molcajete", container="gateway"} | json | target="audit" | action="login.failure"
+```
+
+Other lines about sign-ins and recordings:
 
 | `message` | Fields |
 | --- | --- |
-| `login`, `login failed`, `password changed` | `username` |
-| `single sign-on`, `single sign-on failed` | `username`; `code` and `error` on failure (the browser only sees `?login_error=<code>`) |
-| `created a user on their first single sign-on`, `linked an existing user to their identity at the provider`, `renamed after the provider`, `groups follow the provider` | the user and provider details |
-| `user created`, `user updated`, `user deleted`, `group created`, `group updated`, `group deleted` | `by` and the user or group |
-| `connection created`, `connection updated`, `connection deleted`, `connection moved`, `connection access changed` | `by`, `connection` |
-| `folder created`, `folder renamed`, `folder moved`, `folder deleted`, `folder access changed` | `by`, `folder` |
-| `recording downloaded` (with `?download=true` only, not playback), `recording deleted` | `by`, `recording` |
+| `single sign-on failed` | `code` and `error` (the browser only sees `?login_error=<code>`) |
 | `recording the session`, `recording complete`, `deleted an old recording`, `writing the recording failed; the rest of the session is not recorded`, `cannot start the recording; refusing the session` | `recording`, `file`, `bytes`, `error` |
 | `created the first administrator; sign in and change this password` | `username`, `password` (only for an empty database) |
 

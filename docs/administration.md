@@ -1,6 +1,6 @@
 # Administration
 
-Who can sign in, what they can open, and what is recorded. Everything here is done in the gateway's web UI (*Connections*, *Users*, *Groups*, *Recordings*) or its JSON API, and stored in the gateway's database. The settings in `gateway.toml` that these features read are listed in the [configuration reference](deployment.md#configuration-reference).
+Who can sign in, what they can open, what is recorded, and who changed what. Everything here is done in the gateway's web UI (*Connections*, *Users*, *Groups*, *Recordings*, *Audit log*) or its JSON API, and stored in the gateway's database. The settings in `gateway.toml` that these features read are listed in the [configuration reference](deployment.md#configuration-reference).
 
 ## Users and passwords
 
@@ -254,7 +254,7 @@ molcajeted's zstd images and video streams are unknown to those tools; a session
 
 The player plays in the browser at 1×, 2×, 4× or 8×, pauses, and seeks anywhere with the position slider. Audio is not played back. Seeking backwards replays from the start. Seeking to the end of an hour of a screen that changed 20 times a second for the whole hour took 2.8 s with molcajete's formats, 5.0 s with the PNG images of an ordinary recorded molcajeted session and 16.2 s for a stock guacd recording; ordinary desktop sessions change much less and seek proportionally faster ([architecture](architecture.md) has the measurements).
 
-Only administrators can list, play, download or delete recordings; every other request gets 403. Downloads are logged with the administrator's name.
+Only administrators can list, play, download or delete recordings; every other request gets 403. Downloads and deletions go into the [audit log](#audit-log).
 
 ### Retention
 
@@ -264,6 +264,53 @@ Recordings are kept until an administrator deletes them, unless `[recordings]` s
 - `max_total_size` deletes the oldest recordings once all of them together take more than that.
 
 Retention runs when the gateway starts and every ten minutes. Sessions still being recorded are never deleted. Files are named `YYYYMMDD-HHMMSS_<connection>_<id>.guac` (UTC start time) in the recordings directory; keep that directory on persistent storage, see the [configuration reference](deployment.md#recordings).
+
+## Audit log
+
+The gateway keeps a record of every administrative change and every sign-in in its database (`molcajete_audit_log`): who did it, from which address, what they did, to what, and which fields changed. It answers questions such as "who changed the password of connection X last week" or "who made user Y an administrator". Administrators read it under *Audit log*.
+
+### What an entry holds
+
+| Field | |
+| --- | --- |
+| Time | When it happened. |
+| Actor | The user who did it: their id and their username at the time. A failed sign-in has the username that was typed, and no id when no such user exists. Changes made from the configuration file, at first start or with `set-password` have no actor; the page shows them as *Gateway*. |
+| Source address | The browser's address as the gateway logs it: `X-Real-IP`, else the first `X-Forwarded-For` address, followed by the proxy that sent it (`203.0.113.9 (via 10.0.0.2)`); `configuration file`, `first start` or `command line` for changes not made in a browser. |
+| Action | What happened; see below. |
+| Target | The user, group, connection, folder or recording, with its id and its name at the time. |
+| Changes | Each changed field with its value before and after; lists (groups, members, grants) as what was added and removed. Details such as why a sign-in failed are here too. |
+
+**Secrets are never stored.** Passwords, private keys, passphrases and secrets show only that they were set or changed, as `[redacted]`, never their value. This covers the user's password and the connection parameters `password`, `passphrase`, `private-key`, `client-key` and their variants (`sftp-password`, `gateway-password`, `sftp-private-key`, ...). Grants, members and folders are shown by name rather than id, as they were named at the time.
+
+### Actions
+
+| Action | When |
+| --- | --- |
+| `login.success`, `login.failure` | Password sign-in. Failures carry `reason`: `unknown_user`, `wrong_password`, `disabled` or `no_password` (a single sign-on account). |
+| `logout` | Signing out. Sessions that expire are not recorded. |
+| `user.password` | A user changed their own password. |
+| `oidc.login.success`, `oidc.login.failure` | Single sign-on. Failures carry the `reason` the browser sees (`expired`, `cancelled`, `not_allowed`, ...) and the `error` the gateway logged. |
+| `oidc.user.create`, `oidc.user.link`, `oidc.user.rename`, `oidc.user.groups`, `oidc.user.role` | What the provider changed at sign-in: a user created on their first sign-in or linked to their identity, renamed after the provider, groups or role set from the provider's groups. The actor is the user signing in. |
+| `user.create`, `user.update`, `user.delete` | Users, including their role, disabled state, groups and grants. A password set by an administrator shows as a changed `password`. |
+| `group.create`, `group.update`, `group.delete` | Groups, including their role, members and grants. |
+| `connection.create`, `connection.update`, `connection.delete`, `connection.move` | Connections and their parameters and settings. |
+| `connection.access`, `folder.access` | Who is granted a connection or folder (users and groups added and removed). |
+| `folder.create`, `folder.rename`, `folder.move`, `folder.delete` | Folders. |
+| `recording.download`, `recording.delete` | Recordings downloaded (playing one back in the page is not recorded) or deleted. |
+
+The names are stable, so filters and alert rules can rely on them; `GET /api/audit/actions` lists them.
+
+### Reading it
+
+*Audit log* lists entries newest first. Filter by who did it (username or user id), by action (one action, or any action of a kind such as every `user` action), by target (name or id) and by dates; open an entry to see what changed. *Export CSV* downloads every entry that matches the filters (up to 100 000) with the columns `time` (UTC), `action`, `actor`, `actor_id`, `source_address`, `target_type`, `target_id`, `target_name` and `changes` (JSON). Values a spreadsheet would read as a formula start with `'`.
+
+Only administrators read the audit log; connection managers' changes are in it, but they cannot see it.
+
+Each entry is also written to the gateway's log as one line with the target `audit`, for a SIEM or log store ([observability.md](observability.md#sign-ins-and-changes)). The entry is stored right after the change succeeds. If storing it fails, the change still stands, the log line is still written, and the gateway logs an error and counts it in `molcajete_gateway_audit_write_failures_total`.
+
+### Retention
+
+Entries older than `[audit] retention_days` (365 by default) are deleted when the gateway starts and every hour after that; `0` keeps them forever. See the [configuration reference](deployment.md#audit).
 
 ## JSON API
 
@@ -290,5 +337,14 @@ curl -b cookies -OJ 'https://molcajete.example.com/api/recordings/<id>/file?down
 | `/api/users`, `/api/users/{id}`, `/api/groups`, `/api/groups/{id}` | `POST`, `GET`, `PUT`, `DELETE` | administrators |
 | `/api/recordings`, `/api/recordings/{id}` | `GET`, `DELETE` | administrators |
 | `/api/recordings/{id}/file` | `GET` (range requests; `?download=true` to save) | administrators |
+| `/api/audit` | `GET` (filters below; `?format=csv` for a CSV download) | administrators |
+| `/api/audit/actions` | `GET` (every action name) | administrators |
+
+`GET /api/audit` returns `{"entries": […], "hasMore": true|false}`, newest first. Its query parameters, all optional: `actor` (username or user id), `action` (an action, or a prefix of whole parts such as `user` or `oidc.user`), `targetType` (`user`, `group`, `connection`, `folder`, `recording`), `target` (id or name), `from` and `to` (Unix milliseconds; `to` excluded), `limit` (default 100, at most 1000) and `offset`.
+
+```sh
+curl -b cookies 'https://molcajete.example.com/api/audit?action=login.failure&limit=20'
+curl -b cookies -OJ 'https://molcajete.example.com/api/audit?target=office-pc&format=csv'
+```
 
 Users carry `role` and, for scripts written before roles, `isAdmin` (true for an effective role of administrator). Requests that create or change a user accept either; `role` wins when both are given. Leaving a field out of a `PUT` keeps its current value, including lists of members, groups and grants.
