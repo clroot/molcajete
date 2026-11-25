@@ -385,6 +385,10 @@ molcajeted logs `binary` in `connection established`.
 
 **Passwords.** Argon2id hashes, computed off the async workers. A login for an unknown username is verified against a dummy hash, so the response time does not reveal which usernames exist. Users created through single sign-on store `!`, which no password matches. At start the gateway imports `[[users]]` (as administrators) and `[[connections]]` from its configuration file and, when there are no users at all, creates `admin` with a random password it logs (`bootstrap.rs`).
 
+**Client addresses** (`proxy.rs`). `X-Real-IP`, else the rightmost `X-Forwarded-For` address that is not itself a trusted proxy, is believed only when the TCP peer is in `[server] trusted_proxies`; otherwise the peer is the client. The `Client` extractor gives the address (for throttling) and its display form (`ClientAddress`, for logs and the audit log).
+
+**Throttling** (`throttle.rs`). Failed password sign-ins are counted in memory in sliding windows per client address (IPv6 per /64) and per username; past a limit `POST /api/auth/login` answers `429` with `Retry-After` before the database or Argon2 is touched. Refused attempts are not counted, so a lockout ends when the window passes. A success forgets only that address's failures for that username, and marks the address as known for the user, which exempts it from the username limit for `known_address_days`: a distributed guess is stopped without locking the user out of their usual addresses. Argon2 verifications (sign-in and password change) take a slot of a semaphore sized to the CPUs; waiting longer than `verification_wait_secs` gives `503`. The single sign-on callback is not throttled: it checks no password, and each callback needs a sign-in started from the same browser. Counters are per replica; a shared store would be needed to throttle across replicas.
+
 **OpenID Connect** (`oidc/mod.rs`). The authorization code flow with PKCE:
 
 ```
@@ -808,7 +812,6 @@ Tracked as issues:
 - Active sessions and connection history for administrators, ending sessions (#49)
 - File transfer: SFTP in SSH sessions and drive redirection in RDP (#53); the protocol's `file`/`pipe`/`filesystem` objects are not handled yet
 - Read-only and clipboard restrictions in the connection form (#54)
-- Throttling repeated failed logins (#55)
 - Fuzzing the parsers that read untrusted input (#56)
 - API tokens for automation and one-time links for embedded sessions (#57)
 - Edge cases older remote-desktop projects have fixed: keyboard layouts, AltGr, dead keys, stuck keys, clipboard fallbacks and more (#63)
@@ -818,7 +821,7 @@ Not yet tracked:
 
 1. **molcajeted protocols.** Telnet and Kubernetes (the web UI already treats them as terminals for stock guacd). SSH: agent forwarding, italics and colour emoji. RDP: RemoteApp, receiving EGFX/H.264 and relaying the server's stream as is, AAC/Opus audio, Kerberos, bulk compression once IronRDP can reactivate with it.
 2. **Input.** Audio input (microphone), touch and multi-touch, an on-screen keyboard.
-3. **Gateway.** LDAP, TLS to the daemon, an HTTP tunnel for networks without WebSocket. Connection credentials kept in HashiCorp Vault or OpenBao (KV) and referenced from a parameter, instead of encrypted in the database.
+3. **Gateway.** LDAP, TLS to the daemon, an HTTP tunnel for networks without WebSocket. A general per-address rate limit for the API and for opening tunnels (only failed sign-ins are limited; the nginx example limits requests and connections per address), failed-sign-in counters shared between replicas, and connection credentials kept in HashiCorp Vault or OpenBao (KV) and referenced from a parameter, instead of encrypted in the database.
 4. **Recordings.** Checkpoints (copies of the layers every so often) so that seeking backward does not replay from the start, at the price of GPU memory and of video streams whose decoder state cannot be copied; playing audio; showing the key log of a recording with keys; recording in molcajeted for deployments without the gateway.
 5. **Renderer.** Batching solid fills, a WebGPU backend (`copyExternalImageToTexture`/`importExternalTexture` to cut upload costs; only `Renderer` needs replacing), recovering from a lost WebGL context.
 6. **molcajeted encoding.** Pacing from a measured link rate and per-connection limits (the byte budget is a fixed 8 MiB/s); building a frame off the connection's task (images are encoded in parallel, but the session loop still waits for the frame); running the video encode alongside the image phase; backing off scroll and move detection where it keeps finding nothing; lossy WebP as in guacd 1.6. zstd images: the cost of one more image was estimated for PNG and not revisited; indexed images could be uploaded as indices and expanded by a shader; a faster Zstandard decoder for wasm than `ruzstd`.

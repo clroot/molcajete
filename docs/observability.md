@@ -92,6 +92,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajete_gateway_tunnels_total` | counter | connection, protocol, status | Closed tunnels by Guacamole status code |
 | `molcajete_gateway_tunnel_duration_seconds` | histogram | connection, protocol | Tunnel length |
 | `molcajete_gateway_relayed_bytes_total` | counter | connection, protocol, direction | Bytes relayed: `to_browser` (as read from the daemon), `to_guacd` |
+| `molcajete_gateway_logins_throttled_total` | counter | reason | Password sign-ins refused before the password was checked: `address` or `username` (too many failures, `429`), `busy` (no free password check within `verification_wait_secs`, `503`). See [Repeated failed sign-ins](administration.md#repeated-failed-sign-ins) |
 | `molcajete_gateway_audit_write_failures_total` | counter | | Audit log entries that could not be stored in the database (the change itself went through and the `audit` log line was written) |
 
 ### Browser reports
@@ -184,6 +185,7 @@ Other lines about sign-ins and recordings:
 | `message` | Fields |
 | --- | --- |
 | `single sign-on failed` | `code` and `error` (the browser only sees `?login_error=<code>`) |
+| `too many failed sign-ins; refusing more for a while` | `reason` (`address`, `username`), `username`, `source`, `retry_after` (seconds); once per lockout, like `login.throttled` |
 | `recording the session`, `recording complete`, `deleted an old recording`, `writing the recording failed; the rest of the session is not recorded`, `cannot start the recording; refusing the session` | `recording`, `file`, `bytes`, `error` |
 | `created the first administrator; sign in and change this password` | `username`, `password` (only for an empty database) |
 

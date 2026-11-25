@@ -29,6 +29,20 @@ Administrators manage users under *Users*: username, password, role, groups, dir
 
 A login session lasts 12 hours (`[auth] session_ttl_hours`). The session cookie is `HttpOnly` and `SameSite=Strict`, and `Secure` when the browser reached the gateway over HTTPS.
 
+### Repeated failed sign-ins
+
+The gateway counts failed password sign-ins and, past a limit, refuses further attempts for a while with `429 Too Many Requests` and a `Retry-After` header. The login page shows *Too many failed sign-ins. Try again in 5 minutes.* Refused attempts are turned away before the password is checked, and do not count as failures themselves.
+
+- **Per address.** 10 failures from one client address within 5 minutes, whatever usernames were tried, and that address is refused for any username until the oldest of them is 5 minutes old. Other addresses are not affected. An IPv6 address counts as its /64.
+- **Per username.** 20 failures for one username within 15 minutes, from any number of addresses, and that username is refused, which stops a guess spread over many addresses. Unknown usernames are counted and answered in the same way, so the answer does not tell whether a user exists.
+- **The user's own addresses stay open.** An address the user signed in from within the last 30 days is exempt from the username limit (not from the address limit), so someone guessing a user's password from elsewhere cannot lock them out of their usual places. From a new address the user waits like anyone else, or signs in through [single sign-on](#single-sign-on-openid-connect), which is not throttled: the identity provider checks the password and throttles its own form.
+- **A successful sign-in** forgets that address's failures for that username only. Signing in to one's own account does not clear guesses at another account from the same address.
+- **Password checks run a few at a time** (as many as the server has CPUs), so a burst of sign-ins cannot take the CPU from open sessions. A sign-in that waits more than 10 seconds for its turn gets `503` and can be retried.
+
+The counters are kept in memory, per gateway replica, and a restart clears them, which is also the way to lift a lockout early. Each lockout is recorded once in the audit log as `login.throttled` and counted in `molcajete_gateway_logins_throttled_total` ([observability.md](observability.md#gateway)); the limits are set in [`[auth.throttle]`](deployment.md#auth).
+
+Behind a reverse proxy, the client's address is only known when the proxy is listed in [`[server] trusted_proxies`](deployment.md#reverse-proxy). Otherwise every user has the proxy's address and they share the per-address limit: a few typing mistakes anywhere would lock everyone out for five minutes.
+
 ### Recovering access
 
 `set-password` sets a user's password from standard input and makes the account an enabled administrator, creating it if it does not exist. It works directly on the database, so the gateway does not need to be running:
@@ -283,7 +297,7 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | --- | --- |
 | Time | When it happened. |
 | Actor | The user who did it: their id and their username at the time. A failed sign-in has the username that was typed, and no id when no such user exists. Changes made from the configuration file, at first start or with `set-password` have no actor; the page shows them as *Gateway*. |
-| Source address | The browser's address as the gateway logs it: `X-Real-IP`, else the first `X-Forwarded-For` address, followed by the proxy that sent it (`203.0.113.9 (via 10.0.0.2)`); `configuration file`, `first start` or `command line` for changes not made in a browser. |
+| Source address | The browser's address as the gateway logs it: behind a [trusted proxy](deployment.md#reverse-proxy) the address the proxy reports, followed by the proxy (`203.0.113.9 (via 10.0.0.2)`), otherwise the TCP peer; `configuration file`, `first start` or `command line` for changes not made in a browser. |
 | Action | What happened; see below. |
 | Target | The user, group, connection, folder or recording, with its id and its name at the time. |
 | Changes | Each changed field with its value before and after; lists (groups, members, grants) as what was added and removed. Details such as why a sign-in failed are here too. |
@@ -295,6 +309,7 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | Action | When |
 | --- | --- |
 | `login.success`, `login.failure` | Password sign-in. Failures carry `reason`: `unknown_user`, `wrong_password`, `disabled` or `no_password` (a single sign-on account). |
+| `login.throttled` | Too many failed sign-ins: attempts are refused for a while ([Repeated failed sign-ins](#repeated-failed-sign-ins)). Recorded once when the lockout starts, with the username typed in that attempt, `reason` (`address` or `username`) and `retryAfterSecs`. |
 | `logout` | Signing out. Sessions that expire are not recorded. |
 | `user.password` | A user changed their own password. |
 | `oidc.login.success`, `oidc.login.failure` | Single sign-on. Failures carry the `reason` the browser sees (`expired`, `cancelled`, `not_allowed`, ...) and the `error` the gateway logged. |
