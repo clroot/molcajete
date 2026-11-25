@@ -1,0 +1,46 @@
+
+# <KEY>: <Summary as a capitalized, imperative sentence.>
+#
+# <Body: why the change was needed and what it does now.>
+#
+# ------------------------------------------------------------------------
+# Follows the Apache Guacamole commit conventions, adapted for molcajete.
+#
+# Subject line
+#   <KEY>: <Summary>.
+#   - KEY is the GitHub issue the change belongs to, written as GH-<n>
+#     (do not use "#<n>": git strips lines that start with "#").
+#     With no issue, use the component instead: gateway, client, daemon,
+#     protocol, telemetry, web, deploy, docker, docs.
+#   - Summary starts with a capital letter, uses the imperative mood
+#     ("Add", "Fix", "Handle", not "Added" / "Fixes"), and ends with a
+#     period. Keep it within about 72 characters.
+#   - Every commit for one issue uses the same KEY, so the history of an
+#     issue reads as a series: GH-12: Add ..., GH-12: Address review
+#     feedback on ...
+#   - Merge commits: <KEY>: Merge <summary in lowercase>.
+#       GH-12: Merge serial console protocol support.
+#
+# Body (optional for trivial changes, separated by one blank line)
+#   - Wrap at 72 characters.
+#   - Describe the problem first: what happened, under which conditions,
+#     and why. Then describe the behavior after the change ("The terminal
+#     is now kept at least one character in each dimension...").
+#   - Mention related issues by KEY ("GH-7 removed ..., so ...").
+#   - For several independent changes, use "- " bullets and indent
+#     continuation lines by two spaces. Group them under short headings
+#     ending in ":" when there are many.
+#   - Mention small side fixes at the end ("Also fixes ...").
+#
+# Examples
+#   GH-12: Handle terminal dimensions with no valid copy or draw range.
+#
+#   A viewport smaller than one character produced a terminal with zero
+#   rows or columns, after which redraws requested empty column ranges
+#   and hit the assertion in fit_to_range(), aborting the connection.
+#
+#   The terminal is now kept at least one character in each dimension,
+#   and copy and set operations ignore requests with no valid range.
+#
+#   gateway: Log X-Real-IP before X-Forwarded-For.
+# ------------------------------------------------------------------------
