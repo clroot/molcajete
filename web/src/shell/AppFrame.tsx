@@ -14,13 +14,13 @@ import {
   SignalIcon,
   ClockIcon,
 } from '@heroicons/react/24/outline';
-import type {User} from '../api';
+import type {Me} from '../api';
 import {href, type Route} from '../route';
 import Logo from './Logo';
 import ChangePasswordDialog from '../auth/ChangePasswordDialog';
 
 type Props = {
-  user: User;
+  user: Me;
   route: Route;
   onSignOut: () => void;
   children: ReactNode;
@@ -42,7 +42,9 @@ export default function AppFrame({user, route, onSignOut, children}: Props) {
           footer={
             <SideNavSection title="Account" isHeaderHidden>
               <SideNavItem label={user.username} icon={UserCircleIcon} isDisabled />
-              <SideNavItem label="Change password" icon={KeyIcon} onClick={() => setIsPasswordOpen(true)} />
+              {user.hasPassword && (
+                <SideNavItem label="Change password" icon={KeyIcon} onClick={() => setIsPasswordOpen(true)} />
+              )}
               <SideNavItem label="Sign out" icon={ArrowRightStartOnRectangleIcon} onClick={onSignOut} />
             </SideNavSection>
           }>

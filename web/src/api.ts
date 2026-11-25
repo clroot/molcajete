@@ -17,6 +17,12 @@ export type User = {
   lastLoginAt: number | null;
 };
 
+/** The signed-in user. */
+export type Me = User & {
+  /** False for users created through single sign-on or without a password: there is none to change. */
+  hasPassword: boolean;
+};
+
 /** What a user or group is granted directly. */
 export type Grants = {
   /** Connection ids. */
@@ -236,8 +242,8 @@ function authProviders(): Promise<AuthProviders> {
 }
 
 export const api = {
-  me: () => request<User>('GET', 'auth/me'),
-  login: (username: string, password: string) => request<User>('POST', 'auth/login', {username, password}),
+  me: () => request<Me>('GET', 'auth/me'),
+  login: (username: string, password: string) => request<Me>('POST', 'auth/login', {username, password}),
   /** `logoutUrl`: where to sign out at the identity provider too. */
   logout: () => request<{logoutUrl?: string} | undefined>('POST', 'auth/logout'),
   providers: authProviders,

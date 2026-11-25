@@ -9,7 +9,7 @@ import {Card} from '@astryxdesign/core/Card';
 import {Banner} from '@astryxdesign/core/Banner';
 import {Divider} from '@astryxdesign/core/Divider';
 import {Spinner} from '@astryxdesign/core/Spinner';
-import {api, errorMessage, OIDC_LOGIN_URL, type AuthProviders, type User} from '../api';
+import {api, errorMessage, OIDC_LOGIN_URL, type AuthProviders, type Me} from '../api';
 import {takeLoginError} from './loginError';
 import Logo from '../shell/Logo';
 
@@ -32,7 +32,7 @@ const PASSWORD_ONLY: AuthProviders = {passwordLogin: true, oidc: null};
 // it is shown the first time the login page appears only.
 let errorAtStartup = takeLoginError();
 
-export default function LoginPage({onSignedIn}: {onSignedIn: (user: User) => void}) {
+export default function LoginPage({onSignedIn}: {onSignedIn: (user: Me) => void}) {
   const [providers, setProviders] = useState<AuthProviders | null>(null);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
