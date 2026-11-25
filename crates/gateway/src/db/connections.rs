@@ -99,6 +99,16 @@ pub struct ConnectionSummary {
     /// Display parameters the session page starts from (RDP).
     pub dpi: Option<String>,
     pub resize_method: Option<String>,
+    /// The `read-only`, `disable-copy` and `disable-paste` parameters, so
+    /// the session page can say what is turned off.
+    pub read_only: bool,
+    pub disable_copy: bool,
+    pub disable_paste: bool,
+}
+
+/// A boolean guacd parameter: on only when `"true"`, as guacd reads it.
+fn flag(row: &AnyRow, column: &str) -> Result<bool, sqlx::Error> {
+    Ok(row.try_get::<Option<String>, _>(column)?.as_deref() == Some("true"))
 }
 
 /// Whether a stored parameter row holds a credential: a sensitive name, or
@@ -130,7 +140,9 @@ impl Database {
         let select = "SELECT c.connection_id, c.name, c.protocol, c.guacd_host, c.guacd_port, \
                       c.parent_id, \
                       h.parameter_value AS hostname, p.parameter_value AS port, \
-                      d.parameter_value AS dpi, r.parameter_value AS resize_method \
+                      d.parameter_value AS dpi, r.parameter_value AS resize_method, \
+                      ro.parameter_value AS read_only, dc.parameter_value AS disable_copy, \
+                      dp.parameter_value AS disable_paste \
                       FROM molcajete_connection c \
                       LEFT JOIN molcajete_connection_parameter h \
                         ON h.connection_id = c.connection_id AND h.parameter_name = 'hostname' \
@@ -140,7 +152,15 @@ impl Database {
                         ON d.connection_id = c.connection_id AND d.parameter_name = 'dpi' \
                       LEFT JOIN molcajete_connection_parameter r \
                         ON r.connection_id = c.connection_id \
-                        AND r.parameter_name = 'resize-method'";
+                        AND r.parameter_name = 'resize-method' \
+                      LEFT JOIN molcajete_connection_parameter ro \
+                        ON ro.connection_id = c.connection_id AND ro.parameter_name = 'read-only' \
+                      LEFT JOIN molcajete_connection_parameter dc \
+                        ON dc.connection_id = c.connection_id \
+                        AND dc.parameter_name = 'disable-copy' \
+                      LEFT JOIN molcajete_connection_parameter dp \
+                        ON dp.connection_id = c.connection_id \
+                        AND dp.parameter_name = 'disable-paste'";
         let rows = if user.effective_role.can_manage_connections() {
             let sql = format!("{select} ORDER BY c.name, c.connection_id");
             query!(self, &sql).fetch_all(&self.pool).await?
@@ -170,6 +190,9 @@ impl Database {
                     parent_id: row.try_get("parent_id")?,
                     dpi: row.try_get("dpi")?,
                     resize_method: row.try_get("resize_method")?,
+                    read_only: flag(row, "read_only")?,
+                    disable_copy: flag(row, "disable_copy")?,
+                    disable_paste: flag(row, "disable_paste")?,
                 })
             })
             .collect::<Result<_, sqlx::Error>>()
@@ -657,6 +680,10 @@ mod tests {
             changed.clear_secrets.insert("password".into());
             changed.attributes = BTreeMap::from([(attributes::RECORD_KEYS.into(), "true".into())]);
             changed.parameters.insert("dpi".into(), "144".into());
+            changed.parameters.insert("read-only".into(), "true".into());
+            changed
+                .parameters
+                .insert("disable-paste".into(), "true".into());
             changed
                 .parameters
                 .insert("resize-method".into(), "display-update".into());
@@ -705,6 +732,16 @@ mod tests {
                 (Some("144"), Some("display-update")),
                 "{name}"
             );
+            assert_eq!(
+                (
+                    summaries[1].read_only,
+                    summaries[1].disable_copy,
+                    summaries[1].disable_paste
+                ),
+                (true, false, true),
+                "{name}"
+            );
+            assert!(!summaries[0].read_only, "{name}");
             assert_eq!(
                 (
                     summaries[0].dpi.as_deref(),

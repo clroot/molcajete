@@ -311,7 +311,7 @@ Keep-alive: `nop` every 5 s, a tunnel ping every second (its round trip is repor
 
 **Mouse.** Pointer Events with pointer capture. Wheel deltas accumulate in 53 px steps (as in the stock client).
 
-**Clipboard.** Both directions as UTF-8 `clipboard` streams in 3 KiB blobs (`send_clipboard`). `required` requests (missing credentials) are answered with `argv` streams (`send_argv`), which also carry display parameters during a session (section 4.8).
+**Clipboard.** Both directions as UTF-8 `clipboard` streams in 3 KiB blobs (`send_clipboard`). The daemon enforces a connection's `read-only`, `disable-copy` and `disable-paste`; the connection list gives the session page these three flags (`readOnly`, `disableCopy`, `disablePaste`) so that it shows a *Read-only* badge and the session menu only offers the clipboard directions that work. `required` requests (missing credentials) are answered with `argv` streams (`send_argv`), which also carry display parameters during a session (section 4.8).
 
 **Terminals.** SSH sessions are drawn on the server (section 6.7), so the browser has no text to select, copy or paste. For terminal protocols the page turns on terminal shortcuts (`set_terminal_shortcuts`): `molcajete.js` listens on the container in the capture phase, ahead of the client's own listeners in either mode, and keeps the keys it handles from the remote side.
 
@@ -840,7 +840,6 @@ Tracked as issues:
 
 - Sharing a running session through links, and administrators shadowing sessions (#48); joining with `select,$id` is refused by molcajeted today
 - File transfer: SFTP in SSH sessions and drive redirection in RDP (#53); the protocol's `file`/`pipe`/`filesystem` objects are not handled yet
-- Read-only and clipboard restrictions in the connection form (#54)
 - API tokens for automation and one-time links for embedded sessions (#57)
 - Edge cases older remote-desktop projects have fixed: keyboard layouts, AltGr, dead keys, stuck keys, clipboard fallbacks and more (#63)
 

@@ -17,7 +17,7 @@ import SessionMenu, {type ScaleMode} from './SessionMenu';
 import SessionMenuButton from './SessionMenuButton';
 import SessionGuide from './SessionGuide';
 import {readPreference, writePreference} from './storage';
-import {AudioHint, LinkStatus, StatsPanel, UnstableNotice} from './SessionBadges';
+import {AudioHint, LinkStatus, ReadOnlyBadge, StatsPanel, UnstableNotice} from './SessionBadges';
 import {unlockAudio} from './audio';
 import {hasLinks, isTerminal} from './terminal';
 import {useCopyFeedback} from './useCopyFeedback';
@@ -36,7 +36,12 @@ const hasRemoteDisplay = (protocol: string | null) => protocol === 'rdp';
 export default function SessionPage({connectionId}: {connectionId: string}) {
   const displayRef = useRef<HTMLDivElement>(null);
   const [session, dispatch] = useSessionEvents();
-  const {name: connectionName, protocol, display: connectionDisplay} = useConnection(connectionId);
+  const {
+    name: connectionName,
+    protocol,
+    display: connectionDisplay,
+    restrictions,
+  } = useConnection(connectionId);
   const [remoteComposition, setRemoteComposition] = useRemoteComposition(connectionId);
   const displayChoices = useDisplayChoices(connectionId);
   const display = effectiveDisplay(displayChoices.choices, connectionDisplay);
@@ -139,6 +144,7 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
       {showStats && session.stats && <StatsPanel stats={session.stats} mode={mode ?? '?'} />}
       {isConnected && terminal && session.link && <LinkStatus url={session.link} />}
       {isConnected && session.isAudioBlocked && <AudioHint />}
+      {isConnected && restrictions.readOnly && <ReadOnlyBadge />}
 
       {isConnected && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
       {isConnected && isGuideDue && !session.required && !isMenuOpen && (
@@ -163,6 +169,7 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
         onOpenChange={setMenuOpen}
         connectionName={connectionName}
         isTerminal={terminal}
+        restrictions={restrictions}
         clipboard={session.clipboard}
         onClipboardChange={text => {
           dispatch({type: 'clipboard', detail: text});

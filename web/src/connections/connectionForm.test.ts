@@ -98,6 +98,33 @@ describe('connection form', () => {
     }
   });
 
+  test('round-trips the clipboard and input switches on every protocol', () => {
+    for (const protocol of ['vnc', 'rdp', 'ssh', 'telnet', 'kubernetes']) {
+      const restricted = {
+        ...rdp,
+        protocol,
+        parameters: {
+          hostname: '10.0.0.20',
+          'read-only': 'true',
+          'disable-copy': 'true',
+          'disable-paste': 'true',
+        },
+      };
+      const form = toConnectionForm(restricted);
+      expect(form.fields).toMatchObject({
+        'read-only': 'true',
+        'disable-copy': 'true',
+        'disable-paste': 'true',
+      });
+      expect(form.extras).toEqual([]);
+      expect(toConnection(form)).toEqual({ok: true, connection: restricted});
+      // A switch turned off is left out, so guacd's default (allowed) applies.
+      form.fields['disable-copy'] = '';
+      const result = toConnection(form);
+      expect(result.ok && 'disable-copy' in result.connection.parameters).toBe(false);
+    }
+  });
+
   test('keeps recording choices as attributes, not parameters', () => {
     const recorded = {...rdp, attributes: {'record-sessions': 'true', 'record-exclude-mouse': 'true'}};
     const form = toConnectionForm(recorded);

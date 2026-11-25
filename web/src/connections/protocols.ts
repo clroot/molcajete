@@ -16,6 +16,8 @@ export type ParameterField = {
   onValue?: string;
   /** Set when a new connection takes this protocol. */
   defaultValue?: string;
+  /** Shown under *Clipboard and input* instead of with the protocol's settings. */
+  section?: 'input';
 };
 
 export type Protocol = {
@@ -46,7 +48,37 @@ const password: ParameterField = {
   description: 'Leave it empty to type it in when connecting instead of storing it.',
 };
 
-export const PROTOCOLS: Protocol[] = [
+/** What users may do in a session; every protocol has these. */
+const INPUT_RESTRICTIONS: ParameterField[] = [
+  {
+    name: 'read-only',
+    label: 'Read-only',
+    kind: 'switch',
+    description: 'Users see the session, but their keys, clicks and touches are not sent.',
+    section: 'input',
+  },
+  {
+    name: 'disable-copy',
+    label: 'Block copying from the remote side',
+    kind: 'switch',
+    description: "Text copied on the remote computer does not reach the user's clipboard.",
+    section: 'input',
+  },
+  {
+    name: 'disable-paste',
+    label: 'Block pasting into the remote side',
+    kind: 'switch',
+    description: "The user's clipboard is not sent to the remote computer.",
+    section: 'input',
+  },
+];
+
+const withInputRestrictions = (protocol: Protocol): Protocol => ({
+  ...protocol,
+  fields: [...protocol.fields, ...INPUT_RESTRICTIONS],
+});
+
+const PROTOCOL_SETTINGS: Protocol[] = [
   {
     value: 'vnc',
     label: 'VNC',
@@ -152,6 +184,8 @@ export const PROTOCOLS: Protocol[] = [
     ],
   },
 ];
+
+export const PROTOCOLS: Protocol[] = PROTOCOL_SETTINGS.map(withInputRestrictions);
 
 export function protocolInfo(value: string): Protocol {
   return PROTOCOLS.find(p => p.value === value) ?? PROTOCOLS[0];

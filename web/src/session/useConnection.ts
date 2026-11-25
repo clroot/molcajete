@@ -2,17 +2,27 @@ import {useEffect, useState} from 'react';
 import {api} from '../api';
 import type {ConnectionDisplay} from './displaySettings';
 
-type ConnectionInfo = {name: string; protocol: string | null; display: ConnectionDisplay};
+/** What the connection turns off for its users. */
+export type Restrictions = {readOnly: boolean; disableCopy: boolean; disablePaste: boolean};
+
+type ConnectionInfo = {
+  name: string;
+  protocol: string | null;
+  display: ConnectionDisplay;
+  restrictions: Restrictions;
+};
 
 /**
  * The connection's configured name (the id until it loads), protocol
- * (`null` until it loads) and display parameters; also sets the tab title.
+ * (`null` until it loads), display parameters and restrictions; also sets
+ * the tab title.
  */
 export function useConnection(connectionId: string) {
   const [connection, setConnection] = useState<ConnectionInfo>({
     name: connectionId,
     protocol: null,
     display: {dpi: null, resizeMethod: null},
+    restrictions: {readOnly: false, disableCopy: false, disablePaste: false},
   });
   useEffect(() => {
     let isCurrent = true;
@@ -25,6 +35,11 @@ export function useConnection(connectionId: string) {
             protocol: found.protocol,
             // Older gateways do not send them.
             display: {dpi: found.dpi ?? null, resizeMethod: found.resizeMethod ?? null},
+            restrictions: {
+              readOnly: found.readOnly ?? false,
+              disableCopy: found.disableCopy ?? false,
+              disablePaste: found.disablePaste ?? false,
+            },
           });
         }
       },
