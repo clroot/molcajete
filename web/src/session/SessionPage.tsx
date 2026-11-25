@@ -12,6 +12,9 @@ import {useRemoteComposition} from './useRemoteComposition';
 import StatusOverlay from './StatusOverlay';
 import CredentialsDialog from './CredentialsDialog';
 import SessionMenu, {type ScaleMode} from './SessionMenu';
+import SessionMenuButton from './SessionMenuButton';
+import SessionGuide from './SessionGuide';
+import {readPreference, writePreference} from './storage';
 import {StatsPanel, UnstableNotice} from './SessionBadges';
 
 const styles = stylex.create({
@@ -31,6 +34,7 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [scaleMode, setScaleMode] = useState<ScaleMode>('fit');
   const [showStats, setShowStats] = useState(false);
+  const [hasSeenGuide, setHasSeenGuide] = useState(() => readPreference('sessionGuideSeen', false));
 
   const onEvent = useCallback(
     (event: SessionEvent) => {
@@ -69,7 +73,14 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
   const toggleMenu = useCallback(() => setMenuOpen(!isMenuOpen), [isMenuOpen, setMenuOpen]);
   useMenuShortcut(toggleMenu);
 
+  const dismissGuide = () => {
+    setHasSeenGuide(true);
+    writePreference('sessionGuideSeen', true);
+    client()?.focus();
+  };
+
   const {status} = session;
+  const isConnected = status.kind === 'connected';
   return (
     <>
       <div ref={displayRef} {...stylex.props(styles.display)} />
@@ -84,6 +95,11 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
       )}
       {status.kind === 'connected' && session.isUnstable && <UnstableNotice />}
       {showStats && session.stats && <StatsPanel stats={session.stats} mode={mode ?? '?'} />}
+
+      {isConnected && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
+      {isConnected && !hasSeenGuide && !session.required && !isMenuOpen && (
+        <SessionGuide onDismiss={dismissGuide} />
+      )}
 
       {session.required && (
         <CredentialsDialog
