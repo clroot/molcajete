@@ -75,7 +75,13 @@ export default function RecordingsPage() {
       key: 'includeKeys',
       header: 'Contents',
       width: pixel(130),
-      renderCell: r => (r.includeKeys ? <Badge variant="warning" label="Key presses" /> : null),
+      renderCell: r =>
+        r.includeKeys ? (
+          <HStack gap={2} vAlign="center">
+            <StatusDot variant="warning" label="Includes key presses" />
+            <Text>Key presses</Text>
+          </HStack>
+        ) : null,
     },
     {
       key: 'actions',

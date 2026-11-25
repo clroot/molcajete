@@ -24,9 +24,8 @@ import {formatClock, formatSize, SPEEDS} from './format';
 import {usePlayer, type PlayerState} from './usePlayer';
 
 const styles = stylex.create({
-  page: {position: 'fixed', inset: 0},
-  display: {position: 'relative', height: '100%', backgroundColor: 'black', overflow: 'hidden'},
-  overlay: {position: 'absolute', inset: 0},
+  // Over the whole page, so that it needs no element of its own around the display.
+  overlay: {position: 'fixed', inset: 0},
   card: {width: '100%', maxWidth: 420},
 });
 
@@ -39,7 +38,7 @@ export default function PlaybackPage({recordingId}: {recordingId: string}) {
   const {state, play, pause, seek, setSpeed} = usePlayer(displayRef, recordingId);
 
   return (
-    <div {...stylex.props(styles.page)}>
+    <>
       <Layout
         height="fill"
         header={
@@ -72,12 +71,8 @@ export default function PlaybackPage({recordingId}: {recordingId: string}) {
           </LayoutHeader>
         }
         content={
-          <LayoutContent padding={0} isScrollable={false}>
-            <div {...stylex.props(styles.display)}>
-              <div ref={displayRef} {...stylex.props(styles.overlay)} />
-              {state.kind !== 'ready' && <PlayerOverlay state={state} />}
-            </div>
-          </LayoutContent>
+          // The client puts its canvas into the content region.
+          <LayoutContent ref={displayRef} padding={0} isScrollable={false} label="Recorded session" />
         }
         footer={
           <LayoutFooter hasDivider padding={3}>
@@ -85,7 +80,8 @@ export default function PlaybackPage({recordingId}: {recordingId: string}) {
           </LayoutFooter>
         }
       />
-    </div>
+      {state.kind !== 'ready' && <PlayerOverlay state={state} />}
+    </>
   );
 }
 
