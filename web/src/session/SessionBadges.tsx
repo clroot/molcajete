@@ -5,7 +5,7 @@ import {Icon} from '@astryxdesign/core/Icon';
 import {Kbd} from '@astryxdesign/core/Kbd';
 import {StatusDot} from '@astryxdesign/core/StatusDot';
 import {Text} from '@astryxdesign/core/Text';
-import {SpeakerXMarkIcon} from '@heroicons/react/24/outline';
+import {EyeIcon, SpeakerXMarkIcon} from '@heroicons/react/24/outline';
 import {formatStats, type SessionStats} from './client';
 import {terminalKeys} from './terminal';
 
@@ -20,6 +20,8 @@ const styles = stylex.create({
     pointerEvents: 'none',
   },
   topRight: {position: 'fixed', top: 8, right: 8, pointerEvents: 'none'},
+  // Under the read-only badge when both show.
+  secondTopRight: {top: 56},
   bottomLeft: {
     position: 'fixed',
     bottom: 8,
@@ -52,6 +54,31 @@ export function UnstableNotice() {
       <HStack gap={2} vAlign="center">
         <StatusDot variant="warning" label="Unstable" isPulsing />
         <Text>Connection unstable</Text>
+      </HStack>
+    </Card>
+  );
+}
+
+/** Others connected to this session: always on screen while an administrator watches. */
+export function WatchersNotice({
+  administrators,
+  others,
+  isSecond = false,
+}: {
+  administrators: string[];
+  others: number;
+  /** Shown under another badge in the same corner. */
+  isSecond?: boolean;
+}) {
+  const text =
+    administrators.length > 0
+      ? `${administrators.join(', ')} (administrator) ${administrators.length === 1 ? 'is' : 'are'} watching`
+      : `${others} ${others === 1 ? 'person is' : 'people are'} connected to this session`;
+  return (
+    <Card padding={2} elevation="med" xstyle={[styles.topRight, isSecond && styles.secondTopRight]}>
+      <HStack gap={2} vAlign="center">
+        <Icon icon={EyeIcon} color={administrators.length > 0 ? 'warning' : 'secondary'} size="sm" />
+        <Text>{text}</Text>
       </HStack>
     </Card>
   );

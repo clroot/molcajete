@@ -19,10 +19,17 @@ export type LiveSession = {
   rttMs: number | null;
   recordingId: string | null;
   guacdId: string;
+  /** For someone who joined another session: that session's id. */
+  joinedTo: string | null;
+  /** How they joined: a share link, or an administrator watching. */
+  joinKind: 'link' | 'shadow' | null;
+  /** Someone who joined and only watches. */
+  readOnly: boolean;
 };
 
 /** Why someone else ended a session. */
-export type EndReason = 'admin' | 'user_disabled' | 'user_deleted' | 'access_revoked';
+export type EndReason =
+  'admin' | 'user_disabled' | 'user_deleted' | 'access_revoked' | 'owner_left' | 'link_revoked';
 
 /** A closed session (`GET /api/history`). */
 export type HistoryEntry = {

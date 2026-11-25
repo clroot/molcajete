@@ -1,6 +1,7 @@
 // Full-screen remote session: the wasm client renders into the display;
 // connection states show over it, and Ctrl+Alt+Shift opens the session menu.
 import {useCallback, useEffect, useRef, useState} from 'react';
+import {useToast} from '@astryxdesign/core/Toast';
 import * as stylex from '@stylexjs/stylex';
 import {href, navigate} from '../route';
 import type {SessionEvent} from './client';
@@ -17,7 +18,16 @@ import SessionMenu, {type ScaleMode} from './SessionMenu';
 import SessionMenuButton from './SessionMenuButton';
 import SessionGuide from './SessionGuide';
 import {readPreference, writePreference} from './storage';
-import {AudioHint, LinkStatus, ReadOnlyBadge, StatsPanel, UnstableNotice} from './SessionBadges';
+import {
+  AudioHint,
+  LinkStatus,
+  ReadOnlyBadge,
+  StatsPanel,
+  UnstableNotice,
+  WatchersNotice,
+} from './SessionBadges';
+import SharingSection from './SharingSection';
+import {newPageId, useSharedSession, type Participant} from './sharing';
 import {unlockAudio} from './audio';
 import {hasLinks, isTerminal} from './terminal';
 import {useCopyFeedback} from './useCopyFeedback';
@@ -78,14 +88,18 @@ export default function SessionPage({connectionId, ticket}: Props) {
     (detail: string) => dispatch({type: 'failed', title: 'The client could not start', detail}),
     [dispatch],
   );
+  // Names this page's tunnel for sharing it; a new one for every connect.
+  const [pageId, setPageId] = useState(newPageId);
   // Read at every connect, so a reconnect starts with the latest choices.
-  const tunnelParameters = useCallback(
-    () => ({
+  const tunnelParameters = useCallback(() => {
+    const page = newPageId();
+    setPageId(page);
+    return {
       ...tunnelOverrides(readDisplayChoices(connectionId)),
       ...(ticketId === undefined ? {} : {ticket: ticketId}),
-    }),
-    [connectionId, ticketId],
-  );
+      page,
+    };
+  }, [connectionId, ticketId]);
   const {client, mode, connect} = useMolcajeteClient({
     displayRef,
     connectionId,
@@ -144,6 +158,11 @@ export default function SessionPage({connectionId, ticket}: Props) {
 
   const {status} = session;
   const isConnected = status.kind === 'connected';
+  // A session opened by a one-time link has no signed-in user to share it.
+  const {shared, reload: reloadShared} = useSharedSession(pageId, isConnected && ticketId === undefined);
+  const participants = shared?.participants;
+  useJoinToasts(participants);
+  const administrators = (participants ?? []).filter(p => p.kind === 'shadow').map(p => p.username);
   return (
     <>
       <div ref={displayRef} {...stylex.props(styles.display)} />
@@ -161,6 +180,13 @@ export default function SessionPage({connectionId, ticket}: Props) {
       {isConnected && terminal && session.link && <LinkStatus url={session.link} />}
       {isConnected && session.isAudioBlocked && <AudioHint />}
       {isConnected && restrictions.readOnly && <ReadOnlyBadge />}
+      {participants && participants.length > 0 && (
+        <WatchersNotice
+          administrators={administrators}
+          others={participants.length}
+          isSecond={isConnected && restrictions.readOnly}
+        />
+      )}
 
       {isConnected && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
       {isConnected && isGuideDue && !session.required && !isMenuOpen && (
@@ -219,7 +245,36 @@ export default function SessionPage({connectionId, ticket}: Props) {
               }
             : leave
         }
+        sharing={shared && <SharingSection pageId={pageId} shared={shared} onChange={reloadShared} />}
       />
     </>
   );
+}
+
+/** Says who joined or left the session since the last check. */
+function useJoinToasts(participants: Participant[] | undefined) {
+  const showToast = useToast();
+  const previous = useRef<Participant[] | null>(null);
+  useEffect(() => {
+    if (!participants) {
+      previous.current = null;
+      return;
+    }
+    const before = previous.current;
+    previous.current = participants;
+    if (before === null) return;
+    const ids = new Set(before.map(p => p.id));
+    for (const p of participants.filter(p => !ids.has(p.id))) {
+      showToast({
+        body:
+          p.kind === 'shadow'
+            ? `${p.username}, an administrator, is watching this session.`
+            : `${p.username} joined this session${p.readOnly ? ' to watch' : ''}.`,
+      });
+    }
+    const now = new Set(participants.map(p => p.id));
+    for (const p of before.filter(p => !now.has(p.id))) {
+      showToast({body: `${p.username} left this session.`});
+    }
+  }, [participants, showToast]);
 }

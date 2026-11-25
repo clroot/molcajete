@@ -11,6 +11,7 @@ import GroupsPage from './groups/GroupsPage';
 import SessionPage from './session/SessionPage';
 import TicketSessionPage from './session/TicketSessionPage';
 import TokensPage from './tokens/TokensPage';
+import JoinedSessionPage from './session/JoinedSessionPage';
 import RecordingsPage from './recordings/RecordingsPage';
 import PlaybackPage from './recordings/PlaybackPage';
 import AuditPage from './audit/AuditPage';
@@ -69,6 +70,12 @@ function SignedInApp({user, onSignOut}: {user: Me; onSignOut: () => void}) {
   const route = useRoute();
   if (route.name === 'session') {
     return <SessionPage key={route.connectionId} connectionId={route.connectionId} />;
+  }
+  if (route.name === 'join') {
+    return <JoinedSessionPage key={route.token} kind="link" id={route.token} />;
+  }
+  if (route.name === 'watch' && user.isAdmin) {
+    return <JoinedSessionPage key={route.sessionId} kind="watch" id={route.sessionId} />;
   }
   if (route.name === 'playback' && user.isAdmin) {
     return <PlaybackPage key={route.recordingId} recordingId={route.recordingId} />;

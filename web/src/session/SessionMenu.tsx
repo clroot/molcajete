@@ -1,3 +1,4 @@
+import type {ReactNode} from 'react';
 import {Drawer, DrawerHeader} from '@astryxdesign/core/Drawer';
 import {Layout, LayoutContent, LayoutFooter} from '@astryxdesign/core/Layout';
 import {HStack, VStack} from '@astryxdesign/core/Stack';
@@ -51,6 +52,8 @@ type Props = {
   onRemoteCompositionChange: (isRemote: boolean) => void;
   onCtrlAltDel: () => void;
   onDisconnect: () => void;
+  /** Who joined and the share links, when the gateway knows the session. */
+  sharing?: ReactNode;
 };
 
 const CLIPBOARD_HELP = {
@@ -108,7 +111,7 @@ function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Pro
   );
 }
 
-/** The Ctrl+Alt+Shift menu: clipboard, display, input, stats and keys. */
+/** The Ctrl+Alt+Shift menu: clipboard, display, input, stats, sharing and keys. */
 export default function SessionMenu(props: Props) {
   const {isOpen, onOpenChange, connectionName, remoteDisplay} = props;
   const isDisplayFixed = remoteDisplay !== null && !remoteDisplay.canChange;
@@ -185,6 +188,7 @@ export default function SessionMenu(props: Props) {
                 value={props.showStats}
                 onChange={props.onShowStatsChange}
               />
+              {props.sharing}
             </VStack>
           </LayoutContent>
         }
