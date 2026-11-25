@@ -272,6 +272,8 @@ mod tests {
             guacd_host: None,
             guacd_port: None,
             parameters: BTreeMap::new(),
+            stored_secrets: Default::default(),
+            clear_secrets: Default::default(),
             parent_id: parent.map(str::to_owned),
             attributes: BTreeMap::new(),
         })

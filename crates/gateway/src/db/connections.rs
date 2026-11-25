@@ -1,7 +1,7 @@
 //! `molcajete_connection`, `molcajete_connection_parameter` and
 //! `molcajete_connection_attribute`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
@@ -9,6 +9,7 @@ use sqlx::any::AnyRow;
 
 use super::grants::REACHABLE;
 use super::{Database, DbError, DbResult, User, now_millis, query};
+use crate::secrets::{self, SecretError};
 
 /// A connection with all of its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,8 +25,20 @@ pub struct ConnectionRecord {
     #[serde(default)]
     pub guacd_port: Option<u16>,
     /// Protocol parameters sent in the `connect` instruction.
+    ///
+    /// Credentials ([`secrets::is_sensitive`]) are write-only: saving
+    /// encrypts them, and a connection read back leaves them out and names
+    /// them in `stored_secrets` instead ([`Database::connection_secrets`]
+    /// decrypts them for the guacd handshake). Saving a connection without
+    /// a credential keeps the stored one unless `clear_secrets` names it.
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+    /// Credentials that have a stored value. Ignored when saving.
+    #[serde(default, skip_deserializing)]
+    pub stored_secrets: BTreeSet<String>,
+    /// Stored credentials to remove when saving. Never returned.
+    #[serde(default, skip_serializing)]
+    pub clear_secrets: BTreeSet<String>,
     /// The folder it is in; `None` at the top level. Set when creating;
     /// [`Database::update_connection`] leaves it alone (see
     /// [`Database::move_connection`]).
@@ -82,6 +95,28 @@ pub struct ConnectionSummary {
     /// Display parameters the session page starts from (RDP).
     pub dpi: Option<String>,
     pub resize_method: Option<String>,
+}
+
+/// Whether a stored parameter row holds a credential: a sensitive name, or
+/// a value that is encrypted (also under a name no longer on the list).
+fn is_secret_row(name: &str, value: &str) -> bool {
+    secrets::is_sensitive(name) || secrets::is_sealed(value)
+}
+
+/// `WHERE` condition matching the rows that may hold credentials; bind its
+/// values with [`bind_secret_rows`].
+fn secret_rows_filter() -> String {
+    let names = vec!["?"; secrets::SENSITIVE_PARAMETERS.len()].join(", ");
+    format!("(parameter_name IN ({names}) OR parameter_value LIKE 'enc:v1:%')")
+}
+
+type AnyQuery<'q> = sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>;
+
+fn bind_secret_rows(mut query: AnyQuery<'_>) -> AnyQuery<'_> {
+    for name in secrets::SENSITIVE_PARAMETERS {
+        query = query.bind(*name);
+    }
+    query
 }
 
 fn guacd_port(row: &AnyRow) -> Result<Option<u16>, sqlx::Error> {
@@ -161,6 +196,17 @@ impl Database {
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
+        let mut parameters = BTreeMap::new();
+        let mut stored_secrets = BTreeSet::new();
+        for r in &params {
+            let name: String = r.try_get("parameter_name")?;
+            let value: String = r.try_get("parameter_value")?;
+            if is_secret_row(&name, &value) {
+                stored_secrets.insert(name);
+            } else {
+                parameters.insert(name, value);
+            }
+        }
         let attributes = query!(
             self,
             "SELECT attribute_name, attribute_value FROM molcajete_connection_attribute \
@@ -175,16 +221,40 @@ impl Database {
             protocol: row.try_get("protocol")?,
             guacd_host: row.try_get("guacd_host")?,
             guacd_port: guacd_port(&row)?,
-            parameters: params
-                .iter()
-                .map(|r| Ok((r.try_get("parameter_name")?, r.try_get("parameter_value")?)))
-                .collect::<Result<_, sqlx::Error>>()?,
+            parameters,
+            stored_secrets,
+            clear_secrets: BTreeSet::new(),
             parent_id: row.try_get("parent_id")?,
             attributes: attributes
                 .iter()
                 .map(|r| Ok((r.try_get("attribute_name")?, r.try_get("attribute_value")?)))
                 .collect::<Result<_, sqlx::Error>>()?,
         })
+    }
+
+    /// The decrypted credentials of a connection, for the guacd handshake
+    /// only.
+    pub async fn connection_secrets(&self, id: &str) -> DbResult<BTreeMap<String, String>> {
+        let sql = format!(
+            "SELECT parameter_name, parameter_value FROM molcajete_connection_parameter \
+             WHERE connection_id = ? AND {}",
+            secret_rows_filter()
+        );
+        let rows = bind_secret_rows(query!(self, &sql).bind(id))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut values = BTreeMap::new();
+        for r in &rows {
+            let name: String = r.try_get("parameter_name")?;
+            let value: String = r.try_get("parameter_value")?;
+            if secrets::is_sealed(&value) {
+                let plain = self.secrets()?.open(id, &name, &value)?;
+                values.insert(name, plain);
+            } else if secrets::is_sensitive(&name) {
+                values.insert(name, value);
+            }
+        }
+        Ok(values)
     }
 
     /// The connection, if the user may open it: connection managers and
@@ -273,6 +343,26 @@ impl Database {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        // Stored credentials without a new value stay as they are.
+        let stored = query!(
+            self,
+            "SELECT parameter_name, parameter_value FROM molcajete_connection_parameter \
+             WHERE connection_id = ?"
+        )
+        .bind(&c.id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut kept = Vec::new();
+        for r in &stored {
+            let name: String = r.try_get("parameter_name")?;
+            let value: String = r.try_get("parameter_value")?;
+            if is_secret_row(&name, &value)
+                && !c.parameters.contains_key(&name)
+                && !c.clear_secrets.contains(&name)
+            {
+                kept.push((name, value));
+            }
+        }
         query!(
             self,
             "DELETE FROM molcajete_connection_parameter WHERE connection_id = ?"
@@ -280,6 +370,9 @@ impl Database {
         .bind(&c.id)
         .execute(&mut *tx)
         .await?;
+        for (name, value) in &kept {
+            self.insert_parameter(&mut tx, &c.id, name, value).await?;
+        }
         self.insert_parameters(&mut tx, &c.id, &c.parameters)
             .await?;
         query!(
@@ -295,6 +388,7 @@ impl Database {
         self.connection(&c.id).await
     }
 
+    /// Inserts parameters given in plain text, encrypting credentials.
     async fn insert_parameters(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -302,18 +396,124 @@ impl Database {
         parameters: &BTreeMap<String, String>,
     ) -> DbResult<()> {
         for (name, value) in parameters {
-            query!(
-                self,
-                "INSERT INTO molcajete_connection_parameter \
-                 (connection_id, parameter_name, parameter_value) VALUES (?, ?, ?)"
-            )
-            .bind(id)
-            .bind(name.as_str())
-            .bind(value.as_str())
-            .execute(&mut **tx)
-            .await?;
+            if secrets::is_sensitive(name) {
+                let sealed = self.secrets()?.seal(id, name, value);
+                self.insert_parameter(tx, id, name, &sealed).await?;
+            } else {
+                self.insert_parameter(tx, id, name, value).await?;
+            }
         }
         Ok(())
+    }
+
+    /// Inserts one parameter as it is to be stored.
+    async fn insert_parameter(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        id: &str,
+        name: &str,
+        stored: &str,
+    ) -> DbResult<()> {
+        query!(
+            self,
+            "INSERT INTO molcajete_connection_parameter \
+             (connection_id, parameter_name, parameter_value) VALUES (?, ?, ?)"
+        )
+        .bind(id)
+        .bind(name)
+        .bind(stored)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether any stored credential is encrypted (with any key).
+    pub async fn has_sealed_secrets(&self) -> DbResult<bool> {
+        let row = query!(
+            self,
+            "SELECT COUNT(*) AS n FROM molcajete_connection_parameter \
+             WHERE parameter_value LIKE 'enc:v1:%'"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<i64, _>("n")? > 0)
+    }
+
+    /// Run on every start: encrypts credentials stored in plain text (by a
+    /// gateway before encryption, or under a name newly added to
+    /// [`secrets::SENSITIVE_PARAMETERS`]), all in one transaction, and
+    /// checks that every encrypted value is under a configured key.
+    /// Returns how many values were encrypted.
+    pub async fn seal_plaintext_secrets(&self) -> DbResult<usize> {
+        let keys = self.secrets()?;
+        self.rewrite_secrets(|id, name, value| match secrets::key_id(value) {
+            Some(key_id) if !keys.knows(key_id) => Err(SecretError::UnknownKey {
+                key_id: key_id.to_owned(),
+            }),
+            Some(_) => Ok(None),
+            None => Ok(Some(keys.seal(id, name, value))),
+        })
+        .await
+    }
+
+    /// `molcajete-gateway rotate-key`: re-encrypts every credential that is
+    /// not under the current key with it, in one transaction. Returns how
+    /// many values were re-encrypted.
+    pub async fn rotate_secrets(&self) -> DbResult<usize> {
+        let keys = self.secrets()?;
+        self.rewrite_secrets(|id, name, value| {
+            if secrets::key_id(value) == Some(keys.current_id()) {
+                return Ok(None);
+            }
+            let plain = if secrets::is_sealed(value) {
+                keys.open(id, name, value)?
+            } else {
+                value.to_owned()
+            };
+            Ok(Some(keys.seal(id, name, &plain)))
+        })
+        .await
+    }
+
+    /// Replaces each stored credential for which `rewrite` returns a new
+    /// stored value, in one transaction; an error rolls everything back.
+    async fn rewrite_secrets(
+        &self,
+        rewrite: impl Fn(&str, &str, &str) -> Result<Option<String>, SecretError>,
+    ) -> DbResult<usize> {
+        let mut tx = self.pool.begin().await?;
+        let sql = format!(
+            "SELECT connection_id, parameter_name, parameter_value \
+             FROM molcajete_connection_parameter WHERE {}",
+            secret_rows_filter()
+        );
+        let rows = bind_secret_rows(query!(self, &sql))
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut changed = 0;
+        for r in &rows {
+            let id: String = r.try_get("connection_id")?;
+            let name: String = r.try_get("parameter_name")?;
+            let value: String = r.try_get("parameter_value")?;
+            if !is_secret_row(&name, &value) {
+                continue;
+            }
+            if let Some(stored) = rewrite(&id, &name, &value)? {
+                query!(
+                    self,
+                    "UPDATE molcajete_connection_parameter SET parameter_value = ? \
+                     WHERE connection_id = ? AND parameter_name = ?"
+                )
+                .bind(stored)
+                .bind(&id)
+                .bind(&name)
+                .execute(&mut *tx)
+                .await?;
+                changed += 1;
+            }
+        }
+        tx.commit().await?;
+        Ok(changed)
     }
 
     async fn insert_attributes(
@@ -350,6 +550,38 @@ impl Database {
         }
         Ok(())
     }
+
+    /// A parameter exactly as the database holds it.
+    #[cfg(test)]
+    pub async fn stored_parameter(&self, id: &str, name: &str) -> Option<String> {
+        query!(
+            self,
+            "SELECT parameter_value FROM molcajete_connection_parameter \
+             WHERE connection_id = ? AND parameter_name = ?"
+        )
+        .bind(id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap()
+        .map(|row| row.try_get("parameter_value").unwrap())
+    }
+
+    /// Stores a parameter as it is, as a gateway before encryption did.
+    #[cfg(test)]
+    pub async fn store_plain_parameter(&self, id: &str, name: &str, value: &str) {
+        query!(
+            self,
+            "INSERT INTO molcajete_connection_parameter \
+             (connection_id, parameter_name, parameter_value) VALUES (?, ?, ?)"
+        )
+        .bind(id)
+        .bind(name)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -370,9 +602,26 @@ mod tests {
                 ("port".into(), "5900".into()),
                 ("password".into(), "secret".into()),
             ]),
+            stored_secrets: BTreeSet::new(),
+            clear_secrets: BTreeSet::new(),
             parent_id: None,
             attributes: BTreeMap::from([(attributes::RECORD.into(), "true".into())]),
         }
+    }
+
+    /// `c` as it reads back: credentials named, not shown.
+    fn as_read(mut c: ConnectionRecord) -> ConnectionRecord {
+        let (secret, plain) = std::mem::take(&mut c.parameters)
+            .into_iter()
+            .partition(|(name, _)| secrets::is_sensitive(name));
+        c.parameters = plain;
+        c.stored_secrets = c
+            .stored_secrets
+            .into_iter()
+            .chain(secret.into_keys())
+            .collect();
+        c.clear_secrets.clear();
+        c
     }
 
     #[tokio::test]
@@ -383,7 +632,7 @@ mod tests {
                 .create_connection(&record("desktop", "Desktop"))
                 .await
                 .unwrap();
-            assert_eq!(desktop, record("desktop", "Desktop"), "{name}");
+            assert_eq!(desktop, as_read(record("desktop", "Desktop")), "{name}");
             assert!(
                 matches!(
                     db.create_connection(&record("desktop", "Again")).await,
@@ -399,6 +648,7 @@ mod tests {
             changed.guacd_host = Some("127.0.0.1".into());
             changed.guacd_port = Some(4823);
             changed.parameters.remove("password");
+            changed.clear_secrets.insert("password".into());
             changed.attributes = BTreeMap::from([(attributes::RECORD_KEYS.into(), "true".into())]);
             changed.parameters.insert("dpi".into(), "144".into());
             changed
@@ -406,7 +656,7 @@ mod tests {
                 .insert("resize-method".into(), "display-update".into());
             assert_eq!(
                 db.update_connection(&changed).await.unwrap(),
-                changed,
+                as_read(changed),
                 "{name}"
             );
             assert!(
@@ -496,6 +746,120 @@ mod tests {
                 "{name}"
             );
             assert!(!db.connection_exists("desktop").await.unwrap(), "{name}");
+        }
+    }
+
+    fn plain(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn credentials_are_encrypted_at_rest() {
+        use crate::secrets::SecretKeys;
+        use crate::secrets::tests::{KEY_A, KEY_B};
+
+        for (db, _dir) in every_backend().await {
+            let name = db.dialect().name();
+            let mut ssh = record("ssh", "SSH");
+            ssh.parameters
+                .insert("private-key".into(), "-----BEGIN KEY-----".into());
+            db.create_connection(&ssh).await.unwrap();
+            for param in ["password", "private-key"] {
+                let stored = db.stored_parameter("ssh", param).await.unwrap();
+                assert!(secrets::is_sealed(&stored), "{name} {param}");
+                assert!(!stored.contains("secret") && !stored.contains("BEGIN"));
+            }
+            assert_eq!(
+                db.stored_parameter("ssh", "hostname").await.as_deref(),
+                Some("10.0.0.5")
+            );
+            let read = db.connection("ssh").await.unwrap();
+            assert!(!read.parameters.contains_key("password"), "{name}");
+            assert_eq!(
+                db.connection_secrets("ssh").await.unwrap(),
+                plain(&[
+                    ("password", "secret"),
+                    ("private-key", "-----BEGIN KEY-----")
+                ]),
+                "{name}"
+            );
+
+            // Saving what was read keeps the credentials; a new value
+            // replaces one, and only an explicit clear removes one.
+            db.update_connection(&read).await.unwrap();
+            assert_eq!(db.connection_secrets("ssh").await.unwrap().len(), 2);
+            let mut edit = read.clone();
+            edit.parameters.insert("password".into(), "changed".into());
+            edit.clear_secrets.insert("private-key".into());
+            let saved = db.update_connection(&edit).await.unwrap();
+            assert_eq!(saved.stored_secrets, BTreeSet::from(["password".into()]));
+            assert_eq!(
+                db.connection_secrets("ssh").await.unwrap(),
+                plain(&[("password", "changed")]),
+                "{name}"
+            );
+
+            // Plain values left by an older gateway are encrypted on start,
+            // once.
+            let mut old = record("old", "Old");
+            old.parameters.clear();
+            db.create_connection(&old).await.unwrap();
+            db.store_plain_parameter("old", "password", "legacy").await;
+            db.store_plain_parameter("old", "sftp-password", "legacy sftp")
+                .await;
+            db.store_plain_parameter("old", "hostname", "10.0.0.6")
+                .await;
+            assert_eq!(db.seal_plaintext_secrets().await.unwrap(), 2, "{name}");
+            assert_eq!(db.seal_plaintext_secrets().await.unwrap(), 0, "{name}");
+            let stored = db.stored_parameter("old", "password").await.unwrap();
+            assert!(secrets::is_sealed(&stored), "{name}");
+            assert_eq!(
+                db.stored_parameter("old", "hostname").await.as_deref(),
+                Some("10.0.0.6")
+            );
+            assert_eq!(
+                db.connection_secrets("old").await.unwrap(),
+                plain(&[("password", "legacy"), ("sftp-password", "legacy sftp")]),
+                "{name}"
+            );
+
+            // Rotation: the new key reads the old one's values with it as a
+            // previous key, and re-encrypts all of them.
+            let rotating = db
+                .clone()
+                .with_secrets(SecretKeys::from_base64(KEY_B, &[KEY_A]).unwrap());
+            assert_eq!(rotating.rotate_secrets().await.unwrap(), 3, "{name}");
+            assert_eq!(rotating.rotate_secrets().await.unwrap(), 0, "{name}");
+            let new_only = db
+                .clone()
+                .with_secrets(SecretKeys::from_base64(KEY_B, &[]).unwrap());
+            new_only.seal_plaintext_secrets().await.unwrap();
+            assert_eq!(
+                new_only.connection_secrets("old").await.unwrap()["password"],
+                "legacy"
+            );
+            assert_eq!(
+                new_only.connection_secrets("ssh").await.unwrap()["password"],
+                "changed"
+            );
+            // The old key alone no longer opens anything, and says so.
+            assert!(
+                matches!(
+                    db.seal_plaintext_secrets().await,
+                    Err(DbError::Secret(SecretError::UnknownKey { .. }))
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    db.connection_secrets("ssh").await,
+                    Err(DbError::Secret(SecretError::UnknownKey { .. }))
+                ),
+                "{name}"
+            );
         }
     }
 }

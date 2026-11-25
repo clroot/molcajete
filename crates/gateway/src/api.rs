@@ -67,6 +67,13 @@ impl From<DbError> for ApiError {
                 Self::bad_request("At least one enabled administrator must remain.")
             }
             DbError::Invalid(message) => Self::bad_request(message),
+            DbError::Secret(err) => {
+                error!(error = %err, "stored connection credentials");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Stored connection credentials could not be read.",
+                )
+            }
             DbError::Other(err) => {
                 error!(error = %err, "database error");
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Database error.")
@@ -283,6 +290,8 @@ pub async fn list_connections(
     Ok(Json(state.db.connection_summaries(&user).await?))
 }
 
+/// Stored credentials are never returned, to anyone: the connection names
+/// them in `storedSecrets` instead.
 pub async fn get_connection(
     State(state): State<Arc<AppState>>,
     ConnectionManager(_): ConnectionManager,
@@ -338,6 +347,12 @@ fn validate_connection(mut c: ConnectionRecord) -> ApiResult<ConnectionRecord> {
         parameters.insert(name, value);
     }
     c.parameters = parameters;
+    c.clear_secrets = c
+        .clear_secrets
+        .into_iter()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect();
     c.parent_id = c.parent_id.filter(|p| !p.is_empty());
     // Attributes are flags the gateway acts on; unset ones are left out.
     for name in c.attributes.keys() {
@@ -1442,6 +1457,8 @@ mod tests {
                 (" hostname ".into(), "10.0.0.5".into()),
                 ("empty".into(), String::new()),
             ]),
+            stored_secrets: Default::default(),
+            clear_secrets: [" password ".into(), " ".into()].into(),
             parent_id: Some(String::new()),
             attributes: BTreeMap::from([
                 (attributes::RECORD.into(), "true".into()),
@@ -1464,6 +1481,7 @@ mod tests {
             c.attributes,
             BTreeMap::from([(attributes::RECORD.into(), "true".into())])
         );
+        assert_eq!(c.clear_secrets, ["password".to_owned()].into());
         let mut unknown = record("x");
         unknown.attributes.insert("hostname".into(), "true".into());
         assert!(validate_connection(unknown).is_err());

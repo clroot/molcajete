@@ -201,7 +201,19 @@ async fn serve_tunnel(
     let defaults = &state.config.guacd;
     let guacd_host = connection.guacd_host.as_deref().unwrap_or(&defaults.host);
     let guacd_port = connection.guacd_port.unwrap_or(defaults.port);
-    let parameters = request.parameters(&connection.parameters);
+    // Stored credentials are decrypted here, for the handshake only.
+    let mut stored = connection.parameters.clone();
+    match state.db.connection_secrets(&connection.id).await {
+        Ok(secrets) => stored.extend(secrets),
+        Err(err) => {
+            error!(connection = %connection.id, error = %err, "reading the connection's credentials failed");
+            counter!("molcajete_gateway_tunnels_rejected_total", "reason" => "credentials")
+                .increment(1);
+            let _ = socket.send(close_message(Status::SERVER_ERROR)).await;
+            return;
+        }
+    }
+    let parameters = request.parameters(&stored);
     let record = recording::wanted(&state.config.recordings, &connection);
     if record && !connection.flag(attributes::RECORD_MOLCAJETE_FORMATS) {
         recording::stock_formats_only(&mut request.info);
