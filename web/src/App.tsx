@@ -11,6 +11,7 @@ import GroupsPage from './groups/GroupsPage';
 import SessionPage from './session/SessionPage';
 import RecordingsPage from './recordings/RecordingsPage';
 import PlaybackPage from './recordings/PlaybackPage';
+import AuditPage from './audit/AuditPage';
 
 type Auth = {status: 'checking'} | {status: 'signedOut'} | {status: 'signedIn'; user: User};
 
@@ -69,6 +70,8 @@ function SignedInApp({user, onSignOut}: {user: User; onSignOut: () => void}) {
         <GroupsPage />
       ) : route.name === 'recordings' && user.isAdmin ? (
         <RecordingsPage />
+      ) : route.name === 'audit' && user.isAdmin ? (
+        <AuditPage />
       ) : (
         <ConnectionsPage user={user} />
       )}

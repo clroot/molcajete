@@ -106,6 +106,52 @@ export type Recording = {
   sizeBytes: number;
 };
 
+/** One entry of the audit log (`/api/audit`). */
+export type AuditEntry = {
+  id: string;
+  occurredAt: number;
+  /** Null for someone not signed in, or the gateway itself. */
+  actorId: string | null;
+  /** The actor's username at the time, or the name a failed sign-in gave. */
+  actorName: string | null;
+  sourceAddress: string | null;
+  /** Such as `user.update`; `GET /api/audit/actions` lists them. */
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  targetName: string | null;
+  /** `{field: {from, to}}`, `{field: {added, removed}}` or a detail value; secrets redacted. */
+  changes: Record<string, unknown> | null;
+};
+
+/** What `GET /api/audit` narrows to; empty fields do not filter. */
+export type AuditFilter = {
+  actor?: string;
+  /** An action, or a prefix of whole parts such as `user`. */
+  action?: string;
+  target?: string;
+  /** Unix milliseconds, inclusive. */
+  from?: number;
+  /** Unix milliseconds, exclusive. */
+  to?: number;
+};
+
+export type AuditPage = {entries: AuditEntry[]; hasMore: boolean};
+
+/** The query string of `/api/audit` for `filter`, plus `extra` (paging, format). */
+export function auditQuery(filter: AuditFilter, extra: Record<string, string | number> = {}): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries({...filter, ...extra})) {
+    if (value !== undefined && value !== '') params.set(key, String(value));
+  }
+  return params.toString();
+}
+
+/** Where every entry matching `filter` downloads as CSV. */
+export function auditCsvUrl(filter: AuditFilter): string {
+  return new URL(`api/audit?${auditQuery(filter, {format: 'csv'})}`, document.baseURI).href;
+}
+
 /** Optional features of the gateway (`/api/settings`). */
 export type GatewaySettings = {clientReports: boolean; recordings: boolean};
 
@@ -225,6 +271,10 @@ export const api = {
   recordings: () => request<Recording[]>('GET', 'recordings'),
   recording: (recordingId: string) => request<Recording>('GET', `recordings/${id(recordingId)}`),
   deleteRecording: (recordingId: string) => request<void>('DELETE', `recordings/${id(recordingId)}`),
+
+  auditLog: (filter: AuditFilter, limit: number, offset: number) =>
+    request<AuditPage>('GET', `audit?${auditQuery(filter, {limit, offset})}`),
+  auditActions: () => request<string[]>('GET', 'audit/actions'),
 
   settings: () => request<GatewaySettings>('GET', 'settings'),
 };
