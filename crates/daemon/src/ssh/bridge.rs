@@ -23,6 +23,7 @@ use super::render::{Pointer, Renderer};
 use super::settings::Settings;
 use super::terminal::{Size, Terminal};
 use crate::display::Display;
+use crate::files::{self, Transfers};
 use crate::io::GuacWriter;
 use crate::send_error;
 use crate::session::{self, ClientEvent, Input, InputDecoder};
@@ -85,6 +86,8 @@ pub struct Bridge {
     clipboard: String,
     dirty: bool,
     dirty_since: Instant,
+    /// SFTP, when the connection has it (`enable-sftp`).
+    files: Option<Transfers>,
 }
 
 impl Bridge {
@@ -94,6 +97,7 @@ impl Bridge {
         display: Display,
         writer: GuacWriter,
         ssh: mpsc::UnboundedSender<Outgoing>,
+        files: Option<Transfers>,
     ) -> Self {
         let size = renderer.grid_size(display.width(), display.height());
         let mut bridge = Self {
@@ -108,6 +112,7 @@ impl Bridge {
             clipboard: String::new(),
             dirty: true,
             dirty_since: Instant::now(),
+            files,
         };
         bridge.renderer.invalidate(size);
         bridge.set_pointer(PointerKind::Text);
@@ -172,6 +177,9 @@ impl Bridge {
                     }
                     _ => {}
                 },
+                reply = files::next_reply(&mut self.files) => {
+                    reply.write(self.writer.buffer());
+                }
                 _ = sleep_until(deadline), if deadline.is_some() => {}
                 _ = keepalive.tick() => {
                     // A stalled client must not freeze the screen forever.
@@ -328,6 +336,16 @@ impl Bridge {
                 timestamp,
                 received,
             } => self.display.ack(timestamp, received),
+            ClientEvent::File(event) => {
+                if let Some(files) = &mut self.files {
+                    files.event(event, self.writer.buffer());
+                }
+            }
+            ClientEvent::Ack { stream, status } => {
+                if let Some(files) = &mut self.files {
+                    files.ack(stream, status);
+                }
+            }
             ClientEvent::Disconnect => return false,
             _ => {}
         }

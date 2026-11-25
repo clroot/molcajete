@@ -3,7 +3,7 @@
 //! [`ClientEvent`]s (including reassembly of inbound `clipboard` / `argv`
 //! streams), and a few common outbound messages.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::display::{Display, SyncReply};
+use crate::files::FileEvent;
 use crate::handshake::ClientInfo;
 use crate::io::{GuacReader, GuacWriter, Output};
 use crate::video::VideoEncoders;
@@ -61,6 +62,8 @@ pub enum ClientEvent {
         stream: i32,
         status: Status,
     },
+    /// File transfer (see [`crate::files`]), for sessions that accept it.
+    File(FileEvent),
     Disconnect,
 }
 
@@ -105,9 +108,20 @@ const MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Default)]
 pub struct InputDecoder {
     streams: HashMap<i32, Inbound>,
+    /// File transfer is accepted (see [`InputDecoder::accept_files`]).
+    files: bool,
+    /// Open upload streams, whose data is passed on as it arrives instead
+    /// of being collected.
+    uploads: HashSet<i32>,
 }
 
 impl InputDecoder {
+    /// Decodes `put`, `file` and `get` into [`ClientEvent::File`] instead of
+    /// refusing them.
+    pub fn accept_files(&mut self) {
+        self.files = true;
+    }
+
     /// Decodes one instruction. Acknowledgements owed to the client are
     /// appended to `out`.
     pub fn decode(&mut self, ins: &Input, out: &mut Output) -> Option<ClientEvent> {
@@ -153,6 +167,7 @@ impl InputDecoder {
                 if !self.may_open(stream, out) {
                     return None;
                 }
+                self.abandon_upload(stream);
                 self.streams.insert(
                     stream,
                     Inbound {
@@ -168,6 +183,7 @@ impl InputDecoder {
                 if !self.may_open(stream, out) {
                     return None;
                 }
+                self.abandon_upload(stream);
                 let name = ins.arg(2).to_owned();
                 self.streams.insert(
                     stream,
@@ -179,6 +195,52 @@ impl InputDecoder {
                 ack(out, stream, "OK", Status::SUCCESS);
                 None
             }
+            "blob" if self.uploads.contains(&(int(0)? as i32)) => {
+                let stream = int(0)? as i32;
+                let b64 = base64::engine::general_purpose::STANDARD;
+                match b64.decode(ins.arg(1).as_bytes()) {
+                    Ok(data) => Some(ClientEvent::File(FileEvent::Data { stream, data })),
+                    Err(_) => {
+                        self.uploads.remove(&stream);
+                        ack(out, stream, "Invalid base64", Status::CLIENT_BAD_REQUEST);
+                        Some(ClientEvent::File(FileEvent::End {
+                            stream,
+                            aborted: true,
+                        }))
+                    }
+                }
+            }
+            "end" if self.uploads.contains(&(int(0)? as i32)) => {
+                let stream = int(0)? as i32;
+                self.uploads.remove(&stream);
+                Some(ClientEvent::File(FileEvent::End {
+                    stream,
+                    aborted: false,
+                }))
+            }
+            "file" | "put" if self.files => {
+                let put = ins.opcode == "put";
+                let (stream, object, name) = if put {
+                    (int(1)? as i32, Some(int(0)? as i32), ins.arg(3))
+                } else {
+                    (int(0)? as i32, None, ins.arg(2))
+                };
+                if !self.may_open(stream, out) {
+                    return None;
+                }
+                // A stream index the client reuses starts over.
+                self.streams.remove(&stream);
+                self.uploads.insert(stream);
+                Some(ClientEvent::File(FileEvent::Open {
+                    stream,
+                    object,
+                    name: name.to_owned(),
+                }))
+            }
+            "get" if self.files => Some(ClientEvent::File(FileEvent::Get {
+                object: int(0)? as i32,
+                name: ins.arg(1).to_owned(),
+            })),
             "blob" => {
                 let stream = int(0)? as i32;
                 let data = ins.arg(1);
@@ -213,8 +275,15 @@ impl InputDecoder {
                     InboundKind::Argv(name) => ClientEvent::Argv { name, value: text },
                 })
             }
-            "file" | "pipe" | "audio" | "put" => {
+            "file" | "pipe" | "audio" => {
                 if let Some(stream) = int(0) {
+                    ack(out, stream as i32, "Unsupported", Status::UNSUPPORTED);
+                }
+                None
+            }
+            // `put,<object>,<stream>,...`
+            "put" => {
+                if let Some(stream) = int(1) {
                     ack(out, stream as i32, "Unsupported", Status::UNSUPPORTED);
                 }
                 None
@@ -223,10 +292,21 @@ impl InputDecoder {
         }
     }
 
+    /// A stream index of an upload the client reuses for something else:
+    /// the upload gets no more data, and is deleted with the session's
+    /// other incomplete uploads.
+    fn abandon_upload(&mut self, stream: i32) {
+        self.uploads.remove(&stream);
+    }
+
     /// Whether the client may open (or reopen) `stream`; acknowledges the
     /// refusal if not.
     fn may_open(&self, stream: i32, out: &mut Output) -> bool {
-        if self.streams.len() < MAX_INBOUND_STREAMS || self.streams.contains_key(&stream) {
+        let open = self.streams.len() + self.uploads.len();
+        if open < MAX_INBOUND_STREAMS
+            || self.streams.contains_key(&stream)
+            || self.uploads.contains(&stream)
+        {
             return true;
         }
         ack(out, stream, "Too many streams", Status::CLIENT_TOO_MANY);
@@ -503,6 +583,90 @@ mod tests {
         assert_eq!(statuses(&out), ["0", "0"]);
         assert_eq!(
             d.decode(&ins("3.end,1.2;"), &mut out),
+            Some(ClientEvent::Clipboard("hi".into()))
+        );
+    }
+
+    #[test]
+    fn file_streams_are_refused_unless_accepted() {
+        let mut d = InputDecoder::default();
+        let mut out = Output::text();
+        assert_eq!(
+            d.decode(&ins("4.file,1.2,10.text/plain,5.a.txt;"), &mut out),
+            None
+        );
+        assert_eq!(
+            d.decode(&ins("3.put,1.0,1.3,10.text/plain,2./a;"), &mut out),
+            None
+        );
+        assert_eq!(d.decode(&ins("3.get,1.0,1./;"), &mut out), None);
+        let acks = parse_all(&out).unwrap();
+        let refused: Vec<_> = acks.iter().map(|a| (a.arg(0), a.arg(2))).collect();
+        assert_eq!(refused, [("2", "256"), ("3", "256")]);
+    }
+
+    #[test]
+    fn file_streams_pass_data_through() {
+        let mut d = InputDecoder::default();
+        d.accept_files();
+        let mut out = Output::text();
+        let file = |e: FileEvent| Some(ClientEvent::File(e));
+        assert_eq!(
+            d.decode(&ins("3.put,1.0,1.3,10.text/plain,6./a.txt;"), &mut out),
+            file(FileEvent::Open {
+                stream: 3,
+                object: Some(0),
+                name: "/a.txt".into()
+            })
+        );
+        assert_eq!(
+            d.decode(&ins("4.blob,1.3,4.aGk=;"), &mut out),
+            file(FileEvent::Data {
+                stream: 3,
+                data: b"hi".to_vec()
+            })
+        );
+        assert_eq!(
+            d.decode(&ins("3.end,1.3;"), &mut out),
+            file(FileEvent::End {
+                stream: 3,
+                aborted: false
+            })
+        );
+        // The task acknowledges, not the decoder.
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(
+            d.decode(&ins("4.file,1.4,10.text/plain,5.b.txt;"), &mut out),
+            file(FileEvent::Open {
+                stream: 4,
+                object: None,
+                name: "b.txt".into()
+            })
+        );
+        assert_eq!(
+            d.decode(&ins("4.blob,1.4,3.!!!;"), &mut out),
+            file(FileEvent::End {
+                stream: 4,
+                aborted: true
+            })
+        );
+        assert_eq!(
+            statuses(&out),
+            [Status::CLIENT_BAD_REQUEST.code().to_string()]
+        );
+        assert_eq!(
+            d.decode(&ins("3.get,1.0,4./dir;"), &mut out),
+            file(FileEvent::Get {
+                object: 0,
+                name: "/dir".into()
+            })
+        );
+        // Clipboard streams are collected as before.
+        out.clear();
+        d.decode(&ins("9.clipboard,1.5,10.text/plain;"), &mut out);
+        d.decode(&ins("4.blob,1.5,4.aGk=;"), &mut out);
+        assert_eq!(
+            d.decode(&ins("3.end,1.5;"), &mut out),
             Some(ClientEvent::Clipboard("hi".into()))
         );
     }

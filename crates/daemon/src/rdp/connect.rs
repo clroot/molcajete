@@ -179,10 +179,21 @@ fn connector_config(settings: &Settings) -> ironrdp_connector::Config {
     }
 }
 
+/// A directory on this host redirected to the server as a drive
+/// (`enable-drive`).
+pub struct Drive {
+    pub name: String,
+    pub root: std::path::PathBuf,
+}
+
+/// Device ID of the redirected drive.
+const DRIVE_DEVICE_ID: u32 = 1;
+
 fn build_connector(
     settings: &Settings,
     client_addr: std::net::SocketAddr,
     sound: Option<&SoundSink>,
+    drive: Option<&Drive>,
 ) -> ClientConnector {
     // Display Control is offered even with resize-method=none: the client can
     // turn resizing on during the session and change the scale with it.
@@ -201,19 +212,26 @@ fn build_connector(
         });
     }
     let clipboard = GuacClipboard::new(!settings.disable_copy);
-    let connector = ClientConnector::new(connector_config(settings), client_addr)
+    let mut connector = ClientConnector::new(connector_config(settings), client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(ironrdp_cliprdr::Cliprdr::new(Box::new(clipboard)));
+    // Device redirection (RDPDR) carries the drive. Windows also only starts
+    // RDPSND once RDPDR has completed its capability exchange, so sound
+    // needs it even with no devices to redirect.
+    if let Some(drive) = drive {
+        let backend = super::drive::DriveBackend::new(drive.root.to_string_lossy().into_owned());
+        connector = connector.with_static_channel(
+            ironrdp_rdpdr::Rdpdr::new(Box::new(backend), "molcajete".to_owned())
+                .with_drives(Some(vec![(DRIVE_DEVICE_ID, drive.name.clone())])),
+        );
+    } else if sound.is_some() {
+        connector = connector.with_static_channel(ironrdp_rdpdr::Rdpdr::new(
+            Box::new(ironrdp_rdpdr::NoopRdpdrBackend),
+            "molcajete".to_owned(),
+        ));
+    }
     match sound {
-        // Windows only starts RDPSND once the device redirection channel
-        // (RDPDR) has completed its capability exchange, even with no
-        // devices to redirect.
-        Some(sound) => connector
-            .with_static_channel(ironrdp_rdpdr::Rdpdr::new(
-                Box::new(ironrdp_rdpdr::NoopRdpdrBackend),
-                "molcajete".to_owned(),
-            ))
-            .with_static_channel(sound.static_channel()),
+        Some(sound) => connector.with_static_channel(sound.static_channel()),
         None => connector,
     }
 }
@@ -234,6 +252,7 @@ pub async fn begin(
     settings: &Settings,
     jump: &Chain,
     sound: Option<&SoundSink>,
+    drive: Option<&Drive>,
 ) -> Result<Negotiated, ConnectError> {
     let upstream = jump
         .connect(&settings.hostname, settings.port)
@@ -242,7 +261,7 @@ pub async fn begin(
     let client_addr = upstream.local_addr();
     let tcp = CountingStream::new(upstream, remote::received_bytes("rdp"));
 
-    let mut connector = build_connector(settings, client_addr, sound);
+    let mut connector = build_connector(settings, client_addr, sound, drive);
     let mut framed = TokioFramed::new(tcp);
     let should_upgrade = with_timeout(ironrdp_tokio::connect_begin(&mut framed, &mut connector))
         .await?
@@ -375,7 +394,7 @@ mod tests {
 
     #[test]
     fn connector_starts_in_initial_state() {
-        let connector = build_connector(&settings(), "127.0.0.1:1".parse().unwrap(), None);
+        let connector = build_connector(&settings(), "127.0.0.1:1".parse().unwrap(), None, None);
         assert!(matches!(
             connector.state,
             ironrdp_connector::ClientConnectorState::ConnectionInitiationSendRequest
@@ -392,7 +411,7 @@ mod tests {
     #[test]
     fn the_graphics_pipeline_is_offered_unless_disabled() {
         let registered = |settings: &Settings| {
-            let connector = build_connector(settings, "127.0.0.1:1".parse().unwrap(), None);
+            let connector = build_connector(settings, "127.0.0.1:1".parse().unwrap(), None, None);
             let offered = connector.config.support_dyn_vc_gfx_protocol;
             let channel = connector
                 .static_channels
@@ -415,7 +434,7 @@ mod tests {
         let mut s = settings();
         s.audio = Some(AudioEncoding::L16);
         let (sink, _output) = crate::rdp::audio::output(AudioEncoding::L16);
-        let connector = build_connector(&s, "127.0.0.1:1".parse().unwrap(), Some(&sink));
+        let connector = build_connector(&s, "127.0.0.1:1".parse().unwrap(), Some(&sink), None);
         assert!(connector.config.enable_audio_playback);
         assert!(
             connector
@@ -433,8 +452,34 @@ mod tests {
     }
 
     #[test]
+    fn a_drive_is_announced_on_rdpdr_without_audio() {
+        let drive = Drive {
+            name: "Files".into(),
+            root: std::env::temp_dir(),
+        };
+        let connector = build_connector(
+            &settings(),
+            "127.0.0.1:1".parse().unwrap(),
+            None,
+            Some(&drive),
+        );
+        assert!(!connector.config.enable_audio_playback);
+        let rdpdr = connector
+            .static_channels
+            .get_by_type::<ironrdp_rdpdr::Rdpdr>()
+            .and_then(|channel| channel.channel_processor_downcast_ref::<ironrdp_rdpdr::Rdpdr>())
+            .expect("RDPDR");
+        assert!(
+            rdpdr
+                .downcast_backend::<crate::rdp::drive::DriveBackend>()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn credentials_are_requested_only_for_nla() {
-        let mut connector = build_connector(&settings(), "127.0.0.1:1".parse().unwrap(), None);
+        let mut connector =
+            build_connector(&settings(), "127.0.0.1:1".parse().unwrap(), None, None);
         // TLS (or still negotiating): the server authenticates by itself.
         assert!(missing_credentials(&connector).is_empty());
         connector.state = ironrdp_connector::ClientConnectorState::Credssp {
@@ -481,7 +526,7 @@ mod tests {
         let mut s = settings();
         s.hostname = "127.0.0.1".into();
         s.port = port;
-        let error = begin(&s, &Chain::default(), None)
+        let error = begin(&s, &Chain::default(), None, None)
             .await
             .err()
             .expect("connection must fail");

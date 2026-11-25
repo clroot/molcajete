@@ -9,6 +9,7 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 mod display;
+mod files;
 #[doc(hidden)]
 pub mod fuzzing;
 mod handshake;
@@ -78,10 +79,10 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr) {
     }
 
     let connection_id = format!("${}", uuid::Uuid::new_v4());
-    let (protocol, args) = match selected.as_str() {
-        "vnc" => ("vnc", vnc::ARGS),
-        "ssh" => ("ssh", ssh::ARGS),
-        "rdp" => ("rdp", rdp::ARGS),
+    let (protocol, args, file_args) = match selected.as_str() {
+        "vnc" => ("vnc", vnc::ARGS, &[][..]),
+        "ssh" => ("ssh", ssh::ARGS, files::SSH_ARGS),
+        "rdp" => ("rdp", rdp::ARGS, files::RDP_ARGS),
         other => {
             warn!(%peer, protocol = other, "unsupported protocol requested");
             connection_done("unknown", "unsupported");
@@ -98,7 +99,12 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr) {
     // gateway logs as `guacd_id`.
     let span = info_span!("connection", id = %connection_id, protocol, %peer);
     // Every protocol can go through SSH jump hosts.
-    let args: Vec<&'static str> = args.iter().chain(jump::ARGS).copied().collect();
+    let args: Vec<&'static str> = args
+        .iter()
+        .chain(file_args)
+        .chain(jump::ARGS)
+        .copied()
+        .collect();
     session(reader, writer, protocol, &args, connection_id)
         .instrument(span)
         .await;

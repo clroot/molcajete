@@ -16,6 +16,7 @@ mod bench;
 mod clipboard;
 mod connect;
 mod display_control;
+mod drive;
 mod gfx;
 mod graphics;
 mod keyboard;
@@ -32,6 +33,7 @@ use tracing::{info, warn};
 use self::active::{EarlyInput, Session};
 use self::connect::ConnectError;
 use self::settings::Settings;
+use crate::files;
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
 use crate::jump::Chain;
@@ -168,6 +170,7 @@ async fn connect_and_run(
         jump_hosts = jump.hops().len(),
         "connecting to RDP server"
     );
+    let drive = open_drive(settings).await;
     let (sound, audio) = match settings.audio {
         Some(encoding) => {
             let (sink, output) = audio::output(encoding);
@@ -176,7 +179,12 @@ async fn connect_and_run(
         None => (None, None),
     };
     let mut negotiated = match client
-        .alongside(connect::begin(settings, jump, sound.as_ref()))
+        .alongside(connect::begin(
+            settings,
+            jump,
+            sound.as_ref(),
+            drive.as_ref().map(|(_, drive)| drive),
+        ))
         .await
     {
         None => return,
@@ -199,8 +207,32 @@ async fn connect_and_run(
     };
 
     let early = std::mem::take(&mut client.early);
-    let session = Session::new(settings, info, client.writer, result, framed, audio);
+    let files = drive.map(|(directory, _)| {
+        client.decoder.accept_files();
+        files::Transfers::drive(directory, client.writer.buffer())
+    });
+    let session = Session::new(settings, info, client.writer, result, framed, audio, files);
     session.run(client.inputs, &mut client.decoder, early).await;
+}
+
+/// The drive's directory, opened (and created if asked) before connecting.
+/// A drive whose directory cannot be opened is left out; the session goes
+/// ahead without it.
+async fn open_drive(settings: &Settings) -> Option<(files::Drive, connect::Drive)> {
+    let drive = settings.drive.as_ref()?;
+    match files::Drive::open(drive.clone()).await {
+        Ok(opened) => {
+            let channel = connect::Drive {
+                name: drive.name.clone(),
+                root: opened.root().to_owned(),
+            };
+            Some((opened, channel))
+        }
+        Err(err) => {
+            warn!(path = %drive.path.display(), error = %err, "cannot open the drive directory");
+            None
+        }
+    }
 }
 
 async fn report(writer: &mut GuacWriter, settings: &Settings, err: ConnectError) {
