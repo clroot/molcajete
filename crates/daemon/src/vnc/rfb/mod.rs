@@ -36,6 +36,21 @@ pub use writer::RfbWriter;
 /// Size of the buffer wrapped around the socket's read half.
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Largest framebuffer accepted from a server, in pixels: as many as 8192 x 8192, the largest
+/// display a client may ask for. Every rectangle lies within the framebuffer, so this also
+/// bounds what decoding one may allocate, whatever sizes a server announces.
+const MAX_FRAMEBUFFER_PIXELS: u32 = 8192 * 8192;
+
+/// Refuses framebuffers larger than [`MAX_FRAMEBUFFER_PIXELS`].
+fn check_framebuffer_size(width: u16, height: u16) -> Result<(), RfbError> {
+    if u32::from(width) * u32::from(height) > MAX_FRAMEBUFFER_PIXELS {
+        return Err(RfbError::Protocol(format!(
+            "framebuffer of {width}x{height} pixels is too large"
+        )));
+    }
+    Ok(())
+}
+
 /// Encoding and pseudo-encoding numbers understood by this client.
 pub mod encoding {
     pub const RAW: i32 = 0;
@@ -327,6 +342,10 @@ pub(crate) async fn fuzz(data: &[u8]) {
         }
         1 if rest.len() >= 4 => {
             let size = (u16_at(rest, 0), u16_at(rest, 2));
+            // What the handshake accepts.
+            if check_framebuffer_size(size.0, size.1).is_err() {
+                return;
+            }
             rest = &rest[4..];
             size
         }

@@ -7,7 +7,9 @@ use tracing::{debug, trace, warn};
 
 use super::pixel::{self, BYTES_PER_PIXEL};
 use super::zrle::ZrleDecoder;
-use super::{RfbError, RfbEvent, Screen, SharedState, encoding, hextile, lock_shared};
+use super::{
+    RfbError, RfbEvent, Screen, SharedState, check_framebuffer_size, encoding, hextile, lock_shared,
+};
 use crate::jump::UpstreamReader;
 use crate::remote::CountingStream;
 
@@ -21,6 +23,8 @@ const RESIZE_REQUESTED_BY_US: u16 = 1;
 
 /// Larger clipboard contents are discarded.
 const MAX_CUT_TEXT_LEN: usize = 16 * 1024 * 1024;
+/// Largest buffer allocated for data before it has arrived (see [`read_into`]).
+const UPFRONT_ALLOCATION: usize = 1024 * 1024;
 /// Larger cursor images are discarded.
 const MAX_CURSOR_SIZE: u16 = 1024;
 
@@ -122,9 +126,9 @@ impl<R: AsyncRead + Unpin> RfbReader<R> {
         match encoding {
             encoding::RAW => {
                 self.check_bounds(x, y, width, height)?;
-                let mut rgba =
-                    vec![0u8; usize::from(width) * usize::from(height) * BYTES_PER_PIXEL];
-                self.input.read_exact(&mut rgba).await?;
+                let mut rgba = Vec::new();
+                let len = usize::from(width) * usize::from(height) * BYTES_PER_PIXEL;
+                read_into(&mut self.input, &mut rgba, len).await?;
                 pixel::convert_in_place(&mut rgba);
                 Ok(pixels(x, y, width, height, rgba))
             }
@@ -163,14 +167,12 @@ impl<R: AsyncRead + Unpin> RfbReader<R> {
                         "ZRLE payload of {len} bytes is too large for a {width}x{height} rectangle"
                     )));
                 }
-                self.input
-                    .read_exact(self.zrle.compressed_buffer(len))
-                    .await?;
+                read_into(&mut self.input, self.zrle.compressed_buffer(), len).await?;
                 let rgba = self.zrle.decode(width, height)?;
                 Ok(pixels(x, y, width, height, rgba))
             }
             encoding::CURSOR => self.read_cursor(x, y, width, height).await,
-            encoding::DESKTOP_SIZE => Ok(self.resize(width, height)),
+            encoding::DESKTOP_SIZE => self.resize(width, height),
             encoding::EXTENDED_DESKTOP_SIZE => {
                 self.read_extended_desktop_size(x, y, width, height).await
             }
@@ -318,17 +320,18 @@ impl<R: AsyncRead + Unpin> RfbReader<R> {
             warn!(status, cause, "server rejected SetDesktopSize");
             return Ok(RectOutcome::Nothing);
         }
-        Ok(self.resize(width, height))
+        self.resize(width, height)
     }
 
-    fn resize(&mut self, width: u16, height: u16) -> RectOutcome {
+    fn resize(&mut self, width: u16, height: u16) -> Result<RectOutcome, RfbError> {
         if (width, height) == (self.width, self.height) {
-            return RectOutcome::Nothing;
+            return Ok(RectOutcome::Nothing);
         }
+        check_framebuffer_size(width, height)?;
         debug!(width, height, "framebuffer resized");
         self.width = width;
         self.height = height;
-        RectOutcome::Event(RfbEvent::Resize { width, height })
+        Ok(RectOutcome::Event(RfbEvent::Resize { width, height }))
     }
 
     /// Reads the rest of a ServerCutText message. Returns `None` for contents that are skipped.
@@ -347,8 +350,8 @@ impl<R: AsyncRead + Unpin> RfbReader<R> {
             self.skip(len).await?;
             return Ok(None);
         }
-        let mut latin1 = vec![0u8; len];
-        self.input.read_exact(&mut latin1).await?;
+        let mut latin1 = Vec::new();
+        read_into(&mut self.input, &mut latin1, len).await?;
         Ok(Some(latin1.into_iter().map(char::from).collect()))
     }
 
@@ -362,6 +365,23 @@ impl<R: AsyncRead + Unpin> RfbReader<R> {
         }
         Ok(())
     }
+}
+
+/// Replaces the content of `buffer` with the next `len` bytes of `input`. Beyond
+/// [`UPFRONT_ALLOCATION`] the buffer grows as the data arrives, so that a length a server
+/// announces cannot make the reader allocate memory for data the server never sends.
+async fn read_into<R: AsyncRead + Unpin>(
+    input: &mut R,
+    buffer: &mut Vec<u8>,
+    len: usize,
+) -> Result<(), RfbError> {
+    buffer.clear();
+    buffer.reserve(len.min(UPFRONT_ALLOCATION));
+    let read = input.take(len as u64).read_to_end(buffer).await?;
+    if read < len {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+    }
+    Ok(())
 }
 
 /// Wraps decoded pixels in an event, using [`RfbEvent::Fill`] for single-colour content.
@@ -385,4 +405,23 @@ fn pixels(x: u16, y: u16, width: u16, height: u16, rgba: Vec<u8>) -> RectOutcome
             rgba,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_into_allocates_for_data_that_arrives() {
+        let mut buffer = Vec::new();
+        let result = read_into(&mut &[7u8; 100][..], &mut buffer, 1 << 30).await;
+        assert!(matches!(result, Err(RfbError::Io(_))));
+        assert_eq!(buffer.len(), 100);
+        assert!(buffer.capacity() <= 2 * UPFRONT_ALLOCATION);
+
+        read_into(&mut &[1u8, 2, 3, 4][..], &mut buffer, 3)
+            .await
+            .unwrap();
+        assert_eq!(buffer, [1, 2, 3]);
+    }
 }

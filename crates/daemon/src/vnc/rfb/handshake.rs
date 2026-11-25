@@ -195,6 +195,7 @@ where
 {
     let width = input.read_u16().await?;
     let height = input.read_u16().await?;
+    super::check_framebuffer_size(width, height)?;
     let mut native_format = [0u8; 16];
     input.read_exact(&mut native_format).await?;
     debug!(?native_format, "server's native pixel format");

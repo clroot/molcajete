@@ -1299,6 +1299,106 @@ async fn rect_outside_framebuffer_is_rejected() {
     timed(server).await.unwrap();
 }
 
+/// A framebuffer of more than 8192 x 8192 pixels would let every rectangle allocate gigabytes.
+#[tokio::test]
+async fn oversized_framebuffer_is_refused() {
+    let (options, server) = mock_server(|stream| async move {
+        let mut peer = Peer::new(stream, false);
+        peer.send(b"RFB 003.008\n").await;
+        peer.expect(b"RFB 003.008\n").await;
+        peer.send(&[1, 1]).await;
+        peer.expect(&[1]).await;
+        peer.send(&0u32.to_be_bytes()).await;
+        peer.expect(&[1]).await;
+        let mut init = vec![0xff, 0xff, 0xff, 0xff];
+        init.extend_from_slice(&EXPECTED_SET_PIXEL_FORMAT[4..]);
+        init.extend_from_slice(&0u32.to_be_bytes());
+        peer.send(&init).await;
+        peer.finish().await;
+    })
+    .await;
+
+    assert!(matches!(
+        timed(connect(&options)).await,
+        Err(RfbError::Protocol(_))
+    ));
+    timed(server).await.unwrap();
+}
+
+#[tokio::test]
+async fn resize_beyond_the_limit_is_refused() {
+    for oversized in [
+        rect(0, 0, 8193, 8192, DESKTOP_SIZE, &[]),
+        rect(
+            0,
+            0,
+            0xffff,
+            0xffff,
+            EXTENDED_DESKTOP_SIZE,
+            &extended_desktop_size_body(1, 0xffff, 0xffff, 0),
+        ),
+    ] {
+        let (options, server) = mock_server(move |stream| async move {
+            let mut peer = Peer::new(stream, false);
+            peer.handshake(32, 32).await;
+            // As large as allowed, and in any shape.
+            peer.send(&update(&[rect(0, 0, 0xffff, 1024, DESKTOP_SIZE, &[])]))
+                .await;
+            peer.send(&update(&[oversized])).await;
+            peer.finish().await;
+        })
+        .await;
+
+        let (mut reader, writer, _) = timed(connect(&options)).await.unwrap();
+        assert_eq!(
+            next(&mut reader).await,
+            RfbEvent::Resize {
+                width: 0xffff,
+                height: 1024
+            }
+        );
+        assert_eq!(next(&mut reader).await, RfbEvent::UpdateEnd);
+        assert!(matches!(
+            timed(reader.next_event()).await,
+            Err(RfbError::Protocol(_))
+        ));
+        assert_eq!(reader.framebuffer_size(), (0xffff, 1024));
+        drop((reader, writer));
+        timed(server).await.unwrap();
+    }
+}
+
+/// Lengths of pixel data, ZRLE payloads and clipboard text that the server announces but does
+/// not send end the connection without the reader having allocated for them.
+#[tokio::test]
+async fn announced_lengths_wait_for_their_data() {
+    let raw = rect(0, 0, 8192, 8192, RAW, &[1, 2, 3, 4]);
+    let zrle = rect(0, 0, 8192, 8192, ZRLE, &(64u32 << 20).to_be_bytes());
+    let mut cut_text = vec![3, 0, 0, 0];
+    cut_text.extend_from_slice(&(15u32 << 20).to_be_bytes());
+    cut_text.extend_from_slice(b"short");
+    for message in [update(&[raw]), update(&[zrle]), cut_text] {
+        let (options, server) = mock_server(move |stream| async move {
+            let mut peer = Peer::new(stream, false);
+            peer.handshake(8192, 8192).await;
+            peer.send(&message).await;
+            // Closing the connection is the end of the data.
+            drop(peer);
+        })
+        .await;
+
+        let (mut reader, writer, _) = timed(connect(&options)).await.unwrap();
+        match timed(reader.next_event()).await {
+            Err(RfbError::Io(err)) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+            other => panic!("expected the end of the data, got {other:?}"),
+        }
+        drop((reader, writer));
+        timed(server).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn client_message_encoding() {
     let (options, server) = mock_server(|stream| async move {
