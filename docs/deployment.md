@@ -197,7 +197,7 @@ Everything is off by default and costs nothing unless enabled (metrics calls are
 | `--client-reports` | `MOLCAJETE_CLIENT_REPORTS` | gateway | Accepts browser performance reports (`POST /api/telemetry/client`) |
 | `RUST_LOG` | | both | Log level filter (default `info`) |
 
-The images default to `MOLCAJETE_LOG_FORMAT=json`. The gateway also reads `MOLCAJETE_CONFIG`, `MOLCAJETE_LISTEN` and `MOLCAJETE_STATIC_DIR`; molcajeted reads `MOLCAJETED_BIND_HOST`, `MOLCAJETED_BIND_PORT`, `MOLCAJETED_VIDEO`, `MOLCAJETED_FFMPEG` and `MOLCAJETED_IMAGE_ZSTD`.
+The images default to `MOLCAJETE_LOG_FORMAT=json`. The gateway also reads `MOLCAJETE_CONFIG`, `MOLCAJETE_LISTEN` and `MOLCAJETE_STATIC_DIR`; molcajeted reads `MOLCAJETED_BIND_HOST`, `MOLCAJETED_BIND_PORT`, `MOLCAJETED_VIDEO`, `MOLCAJETED_FFMPEG`, `MOLCAJETED_IMAGE_ZSTD` and `MOLCAJETED_ENCODE_THREADS` (threads that encode the images of a frame side by side, shared by all sessions: `0`, the default, for half the available cores and at most 8; `1` encodes on each session's own thread).
 
 ### Profiling
 
@@ -230,7 +230,7 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | `molcajeted_frame_flush_seconds` | histogram | protocol | CPU time to diff and encode one frame |
 | `molcajeted_flush_phase_seconds` | histogram | protocol, phase | Time per flush phase: `video`, `scroll`, `moves`, `pixels` (includes image encoding), `refine` |
 | `molcajeted_copies_total` | counter | protocol, phase | Copies found by `scroll` and by `moves` detection; compare with that phase's share of `molcajeted_flush_phase_seconds` to see what the detection costs per copy |
-| `molcajeted_image_encode_seconds` | histogram | protocol, format | Encoding one image (`png`, `jpeg`, `zstd`: the zstd image type, see below) |
+| `molcajeted_image_encode_seconds` | histogram | protocol, format | Encoding one image (`png`, `jpeg`, `zstd`: the zstd image type, see below). Images of a frame are encoded in parallel, so these add up to more than the `pixels` phase |
 | `molcajeted_image_encoded_bytes` | histogram | protocol, format | Size of one encoded image: many small images cost the client a decode each |
 | `molcajeted_image_bytes_total`, `molcajeted_image_pixels_total` | counter | protocol, format | Encoded size and pixels processed (compression efficiency) |
 | `molcajeted_video_encode_seconds` | histogram | codec, key | Encoding one video frame (including the ffmpeg round trip) |
@@ -238,6 +238,7 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | `molcajeted_video_streams_total`, `molcajeted_video_failures_total` | counter | codec | Video mode starts and encoder failures |
 | `molcajeted_frames_total` | counter | protocol | Frames (`sync`) sent |
 | `molcajeted_frame_encoded_bytes` | histogram | protocol | Encoded image bytes per frame |
+| `molcajeted_frame_images` | histogram | protocol | Images per frame (fills and copies not counted): the client decodes each, and the daemon encodes them side by side |
 | `molcajeted_client_ack_seconds` | histogram | protocol | From sending a frame to the client's ack arriving: network round trip + the time the frame's data takes to arrive (`molcajete_client_frame_receive_seconds`) + browser processing |
 | `molcajeted_client_ack_wait_seconds` | histogram | protocol | How long an ack then waited for the session loop (busy building a frame or handling server data); not part of `client_ack` |
 | `molcajeted_client_apply_seconds` | histogram | protocol | How long the client says it took to apply a frame (decoding and drawing, without waiting behind earlier frames); only molcajete clients report it, and it sets the frame interval for them |
@@ -285,7 +286,7 @@ Main events of the JSON logs. In Loki, extract the fields with `| json`.
 | `tunnel established` / `tunnel closed` | gateway | `tunnel_id`, `connection`, `session`, `peer`, `guacd_id`, `handshake_ms`, `duration_s`, `bytes_to_browser`, `status` |
 | `client report` | gateway | `session`, `fps_avg`, `fps_min`, `frame_lag_ms_avg/max`, `frame_present_ms_avg/max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `display_width/height` |
 | `connection established` / `connection closed` | molcajeted | `id`, `protocol`, `peer`, `width`, `height`, `image`, `video`, `duration_s` |
-| `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `scroll_copies`, `move_copies`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*`, `video_*` |
+| `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `frame_images_max`, `scroll_copies`, `move_copies`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*`, `video_*` |
 | `video mode started` | molcajeted | `codec`, area, `kbps` |
 
 Keys to follow one session end to end:

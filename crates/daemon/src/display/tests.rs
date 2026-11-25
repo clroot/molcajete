@@ -842,6 +842,55 @@ fn windows_moved_on_a_large_screen_are_found_by_sampling() {
     );
 }
 
+/// Encoding the images of a frame side by side changes nothing in what is
+/// sent: the same instructions in the same order as one after another.
+#[test]
+fn images_encoded_side_by_side_are_sent_in_order() {
+    let pool: &'static rayon::ThreadPool = Box::leak(Box::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool"),
+    ));
+    let (w, h) = (480u32, 320u32);
+    for zstd in [false, true] {
+        let (mut serial, mut serial_client, _) = setup_for(w, h, zstd);
+        let (mut parallel, mut parallel_client, _) = setup_for(w, h, zstd);
+        serial.pool = None;
+        parallel.pool = Some(pool);
+        let mut rng = Rng(0x5eed + zstd as u64);
+        let mut most_images = 0;
+        for _ in 0..30 {
+            for _ in 0..1 + rng.below(8) {
+                let (x, y) = (rng.below(w), rng.below(h));
+                let (rw, rh) = (
+                    1 + rng.below((w - x).min(160)),
+                    1 + rng.below((h - y).min(90)),
+                );
+                let block = match rng.below(4) {
+                    0 => window_block(rw, rh, rng.next()),
+                    1 => photo_block(rw, rh, rng.next()),
+                    2 => [rng.below(256) as u8, 40, 80, 255].repeat((rw * rh) as usize),
+                    _ => {
+                        let seed = rng.next();
+                        (0..rh)
+                            .flat_map(|r| text_row(rw, seed.wrapping_add(r as u64)))
+                            .collect()
+                    }
+                };
+                serial.put(x, y, rw, rh, &block);
+                parallel.put(x, y, rw, rh, &block);
+            }
+            let (expected, sent) = flush_into(&mut serial, &mut serial_client);
+            let (stats, out) = flush_into(&mut parallel, &mut parallel_client);
+            assert_eq!(out, sent);
+            assert_eq!(stats.images, expected.images);
+            most_images = most_images.max(stats.images);
+        }
+        assert!(most_images > 3, "at most {most_images} images per frame");
+    }
+}
+
 #[test]
 fn row_differences_of_a_segment_follow_from_the_whole_row() {
     let w = 300u32;

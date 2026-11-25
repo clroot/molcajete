@@ -89,6 +89,7 @@ struct Totals {
     move_copies: u64,
     frames: u64,
     frame_bytes: u64,
+    frame_images_max: u32,
     ack: Timing,
     ack_wait: Timing,
     png: Timing,
@@ -111,6 +112,7 @@ pub(super) struct DisplayMetrics {
     move_copies: Counter,
     frames: Counter,
     frame_bytes: Histogram,
+    frame_images: Histogram,
     client_ack: Histogram,
     client_apply: Histogram,
     ack_wait: Histogram,
@@ -140,6 +142,7 @@ impl DisplayMetrics {
             move_copies: Counter::noop(),
             frames: Counter::noop(),
             frame_bytes: Histogram::noop(),
+            frame_images: Histogram::noop(),
             client_ack: Histogram::noop(),
             client_apply: Histogram::noop(),
             ack_wait: Histogram::noop(),
@@ -182,6 +185,7 @@ impl DisplayMetrics {
             move_copies: copies("moves"),
             frames: counter!("molcajeted_frames_total", &labels),
             frame_bytes: histogram!("molcajeted_frame_encoded_bytes", &labels),
+            frame_images: histogram!("molcajeted_frame_images", &labels),
             client_ack: histogram!("molcajeted_client_ack_seconds", &labels),
             client_apply: histogram!("molcajeted_client_apply_seconds", &labels),
             ack_wait: histogram!("molcajeted_client_ack_wait_seconds", &labels),
@@ -235,10 +239,12 @@ impl DisplayMetrics {
         self.totals.flush.add(elapsed);
     }
 
-    /// A frame was closed with `sync`.
-    pub(super) fn frame(&mut self, encoded_bytes: usize, unacked: usize) {
+    /// A frame of `images` images was closed with `sync`.
+    pub(super) fn frame(&mut self, encoded_bytes: usize, images: u32, unacked: usize) {
         self.frames.increment(1);
         self.frame_bytes.record(encoded_bytes as f64);
+        self.frame_images.record(images as f64);
+        self.totals.frame_images_max = self.totals.frame_images_max.max(images);
         self.unacked.record(unacked as f64);
         self.totals.frames += 1;
         self.totals.frame_bytes += encoded_bytes as u64;
@@ -311,6 +317,7 @@ impl DisplayMetrics {
             frames = t.frames,
             fps_avg = t.frames as f64 / seconds.max(1e-3),
             encoded_bytes = t.frame_bytes,
+            frame_images_max = t.frame_images_max,
             flush_ms_avg = t.flush.avg_ms(),
             flush_ms_max = t.flush.max_ms(),
             scroll_ms_avg = t.phases[Phase::Scroll as usize].avg_ms(),

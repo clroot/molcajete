@@ -71,6 +71,11 @@ struct Cli {
         action = clap::ArgAction::Set
     )]
     image_zstd: bool,
+    /// Threads that encode the images of a frame side by side, shared by
+    /// all sessions: 0 for half the available cores (at most 8), 1 to
+    /// encode on the session's own thread.
+    #[arg(long, env = "MOLCAJETED_ENCODE_THREADS", default_value_t = 0)]
+    encode_threads: usize,
     #[command(flatten)]
     telemetry: molcajete_telemetry::TelemetryArgs,
 }
@@ -201,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
     molcajete_telemetry::init_logging(cli.telemetry.log_format, "info,pprof=warn");
     molcajete_telemetry::start(&cli.telemetry, "molcajeted").await?;
     display::set_zstd_images(cli.image_zstd);
+    display::set_encode_threads(cli.encode_threads);
     let allowed: Vec<_> = cli
         .video
         .iter()
