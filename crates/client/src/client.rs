@@ -27,7 +27,7 @@ use crate::geom::Rect;
 use crate::gl::CanvasTarget;
 use crate::input::{self, Composition, Keyboard, WheelAccumulator};
 use crate::scope;
-use crate::tunnel::{Tunnel, TunnelHandlers};
+use crate::tunnel::{Tunnel, TunnelHandlers, TunnelMessage};
 use crate::{display::Display, gl::Renderer};
 
 type ResizeCallback = Closure<dyn FnMut(js_sys::Array)>;
@@ -68,6 +68,86 @@ pub enum ScaleMode {
     Native,
 }
 
+/// Data of a `blob`: base64 text of the instruction, or raw bytes of a
+/// binary record, as a view of the received message.
+enum BlobData<'a> {
+    Base64(&'a str),
+    Raw(js_sys::Uint8Array),
+}
+
+impl BlobData<'_> {
+    fn to_vec(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Base64(text) => B64.decode(text.as_bytes()).ok(),
+            Self::Raw(view) => Some(view.to_vec()),
+        }
+    }
+}
+
+/// The data of a stream that is used as a whole once it ends.
+///
+/// Raw blobs are kept as views of the messages they arrived in, so an
+/// image that came in one blob reaches the decoder without a copy. Base64
+/// blobs are decoded into wasm memory, as is everything in the unlikely
+/// case that both kinds arrive on one stream.
+#[derive(Default)]
+struct StreamData {
+    bytes: Vec<u8>,
+    views: Vec<js_sys::Uint8Array>,
+}
+
+impl StreamData {
+    fn push(&mut self, data: BlobData<'_>) {
+        match data {
+            BlobData::Raw(view) if self.bytes.is_empty() => self.views.push(view),
+            BlobData::Raw(view) => self.bytes.extend_from_slice(&view.to_vec()),
+            BlobData::Base64(text) => {
+                for view in self.views.drain(..) {
+                    self.bytes.extend_from_slice(&view.to_vec());
+                }
+                let _ = B64.decode_vec(text.as_bytes(), &mut self.bytes);
+            }
+        }
+    }
+
+    fn into_vec(mut self) -> Vec<u8> {
+        for view in self.views.drain(..) {
+            self.bytes.extend_from_slice(&view.to_vec());
+        }
+        self.bytes
+    }
+
+    /// The data as an encoded image for the decoder, and whether its header
+    /// says it is opaque (`crate::image::is_opaque`). The array is the view
+    /// itself when everything arrived in one raw blob, a new one otherwise.
+    fn into_image(mut self, mimetype: &str) -> (js_sys::Uint8Array, bool) {
+        let data = match self.views.len() {
+            0 => {
+                let opaque = crate::image::is_opaque(&self.bytes, mimetype);
+                return (js_sys::Uint8Array::from(self.bytes.as_slice()), opaque);
+            }
+            1 => self.views.remove(0),
+            _ => {
+                let total = self.views.iter().map(js_sys::Uint8Array::length).sum();
+                let joined = js_sys::Uint8Array::new_with_length(total);
+                let mut offset = 0;
+                for view in &self.views {
+                    joined.set(view, offset);
+                    offset += view.length();
+                }
+                joined
+            }
+        };
+        // JPEG needs no look at the data; for the others the start of the
+        // image is enough, and only that much is copied into wasm.
+        let opaque = mimetype == "image/jpeg" || {
+            let prefix = data.length().min(crate::image::OPACITY_PREFIX_BYTES);
+            crate::image::is_opaque(&data.subarray(0, prefix).to_vec(), mimetype)
+        };
+        (data, opaque)
+    }
+}
+
 enum InStream {
     /// Compressed video decoded with WebCodecs into a layer.
     Video(crate::video::VideoStream),
@@ -75,11 +155,11 @@ enum InStream {
     AudioForward,
     Image {
         mimetype: String,
-        data: Vec<u8>,
+        data: StreamData,
         slot: ImageSlot,
     },
     Clipboard {
-        data: Vec<u8>,
+        data: StreamData,
     },
     Audio,
 }
@@ -143,6 +223,8 @@ pub struct Inner {
     audio: HashMap<i32, RawAudioPlayer>,
     /// Forward audio streams to the page instead of playing them here.
     audio_forward: bool,
+    /// Offer the binary tunnel subprotocol when connecting.
+    binary_tunnel: bool,
     scale_mode: ScaleMode,
     auto_resize: bool,
     pending_resize: Option<(u32, u32)>,
@@ -292,6 +374,7 @@ impl Inner {
                 audio_context: None,
                 audio: HashMap::new(),
                 audio_forward: false,
+                binary_tunnel: true,
                 scale_mode: ScaleMode::Fit,
                 auto_resize: true,
                 pending_resize: None,
@@ -481,6 +564,7 @@ impl Inner {
         let weak_close = self.self_ref.clone();
         let tunnel = Tunnel::connect(
             url,
+            self.binary_tunnel,
             TunnelHandlers {
                 on_open: Box::new(move || {
                     with_inner(&weak_open, |inner| {
@@ -488,8 +572,11 @@ impl Inner {
                         inner.set_state(State::Waiting);
                     })
                 }),
-                on_message: Box::new(move |text| {
-                    with_inner(&weak_msg, |inner| inner.receive(text))
+                on_message: Box::new(move |message| {
+                    with_inner(&weak_msg, |inner| match message {
+                        TunnelMessage::Text(text) => inner.receive(text),
+                        TunnelMessage::Binary(buffer) => inner.receive_binary(buffer),
+                    })
                 }),
                 on_close: Box::new(move |code, reason| {
                     with_inner(&weak_close, |inner| inner.on_tunnel_closed(code, &reason))
@@ -576,6 +663,20 @@ impl Inner {
     // Instruction handling
     // ------------------------------------------------------------------
 
+    /// Whether to offer the binary tunnel subprotocol (raw stream data) to
+    /// the gateway. Applies to the next [`Inner::connect`].
+    pub fn set_binary_tunnel(&mut self, enabled: bool) {
+        self.binary_tunnel = enabled;
+    }
+
+    /// The WebSocket subprotocol in use (empty when not connected).
+    pub fn tunnel_protocol(&self) -> String {
+        self.tunnel
+            .as_ref()
+            .map(Tunnel::protocol)
+            .unwrap_or_default()
+    }
+
     fn receive(&mut self, text: String) {
         self.last_received = now();
         self.counters.bytes += text.len() as u64;
@@ -583,13 +684,78 @@ impl Inner {
             return;
         };
         parser.feed(text.as_bytes());
+        if self.drain(&mut parser) {
+            self.parser = Some(parser);
+            self.display.process();
+        }
+    }
+
+    /// A binary message: whole records (`molcajete_protocol::binary`).
+    /// Instruction text is copied into the parser; stream data stays where
+    /// it is, as views of `message`.
+    fn receive_binary(&mut self, message: js_sys::ArrayBuffer) {
+        use molcajete_protocol::binary::{
+            BLOB_HEADER_LEN, HEADER_LEN, TAG_BLOB, TAG_INSTRUCTIONS, parse_header,
+        };
+
+        self.last_received = now();
+        let bytes = js_sys::Uint8Array::new(&message);
+        let total = bytes.length() as usize;
+        self.counters.bytes += total as u64;
+        let Some(mut parser) = self.parser.take() else {
+            return;
+        };
+        let mut offset = 0;
+        while offset < total {
+            // The header, and with it the stream index of a blob.
+            let mut header = [0u8; BLOB_HEADER_LEN];
+            let available = (total - offset).min(BLOB_HEADER_LEN);
+            bytes
+                .subarray(offset as u32, (offset + available) as u32)
+                .copy_to(&mut header[..available]);
+            let record = parse_header(&header[..available])
+                .map(|(tag, length)| (tag, offset + HEADER_LEN, offset + HEADER_LEN + length))
+                .filter(|&(tag, body, end)| {
+                    end <= total && (tag != TAG_BLOB || end - body >= BLOB_HEADER_LEN - HEADER_LEN)
+                });
+            let Some((tag, body, end)) = record else {
+                self.fail(Status::SERVER_ERROR, "protocol error: malformed record");
+                return;
+            };
+            match tag {
+                TAG_INSTRUCTIONS => {
+                    parser.feed_with(end - body, |out| {
+                        bytes.subarray(body as u32, end as u32).copy_to(out)
+                    });
+                    if !self.drain(&mut parser) {
+                        return;
+                    }
+                }
+                TAG_BLOB => {
+                    let stream =
+                        u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as i32;
+                    let data = bytes.subarray((offset + BLOB_HEADER_LEN) as u32, end as u32);
+                    self.on_blob(stream, BlobData::Raw(data));
+                }
+                // A kind of record this client does not know.
+                _ => {}
+            }
+            offset = end;
+        }
+        self.parser = Some(parser);
+        self.display.process();
+    }
+
+    /// Handles every complete instruction in the parser. Returns `false`
+    /// when the connection ended meanwhile (protocol error, `disconnect`).
+    fn drain(&mut self, parser: &mut Parser) -> bool {
         loop {
             let raw = match parser.next_raw() {
                 Ok(Some(raw)) => raw,
                 Ok(None) => break,
                 Err(err) => {
                     self.fail(Status::SERVER_ERROR, &format!("protocol error: {err}"));
-                    return;
+                    return false;
                 }
             };
             self.counters.instructions += 1;
@@ -618,11 +784,10 @@ impl Inner {
                 Err(err) => web_sys::console::warn_1(&err.to_string().into()),
             }
             if self.state == State::Disconnected {
-                return;
+                return false;
             }
         }
-        self.parser = Some(parser);
-        self.display.process();
+        true
     }
 
     fn enqueue(&mut self, op: DrawOp) {
@@ -820,7 +985,7 @@ impl Inner {
                     stream,
                     InStream::Image {
                         mimetype: mimetype.to_owned(),
-                        data: Vec::new(),
+                        data: StreamData::default(),
                         slot,
                     },
                 );
@@ -853,14 +1018,20 @@ impl Inner {
                     slot: slot.clone(),
                 });
                 let bytes = B64.decode(data.as_bytes()).unwrap_or_default();
-                self.decode_image(bytes, mimetype, slot);
+                let opaque = crate::image::is_opaque(&bytes, mimetype);
+                let data = js_sys::Uint8Array::from(bytes.as_slice());
+                self.decode_image(data, opaque, mimetype, slot);
             }
-            S::Blob { stream, data } => self.on_blob(stream, data),
+            S::Blob { stream, data } => self.on_blob(stream, BlobData::Base64(data)),
             S::End { stream } => self.on_end(stream),
             S::Audio { stream, mimetype } => self.on_audio(stream, mimetype),
             S::Clipboard { stream, .. } => {
-                self.streams
-                    .insert(stream, InStream::Clipboard { data: Vec::new() });
+                self.streams.insert(
+                    stream,
+                    InStream::Clipboard {
+                        data: StreamData::default(),
+                    },
+                );
             }
             S::File { stream, .. }
             | S::Pipe { stream, .. }
@@ -904,21 +1075,27 @@ impl Inner {
         }
     }
 
-    fn on_blob(&mut self, stream: i32, data: &str) {
+    fn on_blob(&mut self, stream: i32, data: BlobData<'_>) {
         match self.streams.get_mut(&stream) {
             Some(InStream::Image { data: buf, .. }) | Some(InStream::Clipboard { data: buf }) => {
-                let _ = B64.decode_vec(data.as_bytes(), buf);
+                buf.push(data);
             }
             Some(InStream::Audio) => {
-                if let (Ok(pcm), Some(player)) =
-                    (B64.decode(data.as_bytes()), self.audio.get_mut(&stream))
-                {
+                if let (Some(pcm), Some(player)) = (data.to_vec(), self.audio.get_mut(&stream)) {
                     player.play(&pcm);
                 }
             }
             Some(InStream::AudioForward) => {
-                if let Ok(pcm) = B64.decode(data.as_bytes()) {
-                    let pcm = js_sys::Uint8Array::from(pcm.as_slice());
+                // The page gets a buffer of its own: the worker transfers it,
+                // which would detach every other view of a received message.
+                let pcm = match data {
+                    BlobData::Base64(text) => B64
+                        .decode(text.as_bytes())
+                        .ok()
+                        .map(|pcm| js_sys::Uint8Array::from(pcm.as_slice())),
+                    BlobData::Raw(view) => Some(view.slice(0, view.length())),
+                };
+                if let Some(pcm) = pcm {
                     self.emit(
                         "audio-data",
                         object(&[("stream", JsValue::from(stream)), ("data", pcm.into())]),
@@ -927,10 +1104,13 @@ impl Inner {
             }
             Some(InStream::Video(video)) => {
                 let layer = video.layer;
-                let result = B64
-                    .decode(data.as_bytes())
-                    .map_err(|e| e.to_string())
-                    .and_then(|bytes| video.push(&bytes));
+                let result = match data {
+                    BlobData::Base64(text) => B64
+                        .decode(text.as_bytes())
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| video.push(&bytes)),
+                    BlobData::Raw(view) => video.push_view(&view),
+                };
                 match result {
                     Ok(slots) => {
                         for slot in slots {
@@ -960,9 +1140,12 @@ impl Inner {
                 mimetype,
                 data,
                 slot,
-            }) => self.decode_image(data, &mimetype, slot),
+            }) => {
+                let (data, opaque) = data.into_image(&mimetype);
+                self.decode_image(data, opaque, &mimetype, slot);
+            }
             Some(InStream::Clipboard { data }) => {
-                let text = String::from_utf8_lossy(&data).into_owned();
+                let text = String::from_utf8_lossy(&data.into_vec()).into_owned();
                 self.emit("clipboard", JsValue::from_str(&text));
             }
             Some(InStream::Audio) => {
@@ -1041,12 +1224,18 @@ impl Inner {
 
     /// Decodes an image off the main thread. The queued draw stays blocked
     /// until the decoded image is ready.
-    fn decode_image(&mut self, bytes: Vec<u8>, mimetype: &str, slot: ImageSlot) {
+    fn decode_image(
+        &mut self,
+        data: js_sys::Uint8Array,
+        opaque: bool,
+        mimetype: &str,
+        slot: ImageSlot,
+    ) {
         let weak = self.self_ref.clone();
         let mimetype = mimetype.to_owned();
         let started = scope::performance_now();
         wasm_bindgen_futures::spawn_local(async move {
-            slot.finish(match crate::image::decode(bytes, mimetype).await {
+            slot.finish(match crate::image::decode(data, mimetype, opaque).await {
                 Ok(image) => ImageState::Ready(image),
                 Err(err) => {
                     web_sys::console::warn_2(&"image decode failed".into(), &err);

@@ -5,6 +5,8 @@ type Reporter = InstanceType<Awaited<ReturnType<typeof loadReporter>>['SessionRe
 
 // `?main` runs the client on the main thread instead of a worker.
 const forceMainThread = new URLSearchParams(location.search).has('main');
+// `?text` keeps the tunnel on the Guacamole text protocol (base64 data).
+const forceTextTunnel = new URLSearchParams(location.search).has('text');
 
 type Options = {
   displayRef: RefObject<HTMLDivElement | null>;
@@ -45,6 +47,7 @@ export function useMolcajeteClient({displayRef, connectionId, onEvent, onStartFa
         const {MolcajeteSession} = await loadClient();
         const client = await MolcajeteSession.create(displayRef.current!, {
           worker: forceMainThread ? false : undefined,
+          binary: forceTextTunnel ? false : undefined,
         });
         if (!isCurrent) {
           client.free();
