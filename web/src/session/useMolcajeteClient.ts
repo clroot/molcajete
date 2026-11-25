@@ -16,6 +16,8 @@ type Options = {
   connectionId: string;
   /** Extra tunnel URL parameters, read at every connect. */
   tunnelParameters?: () => Record<string, string>;
+  /** Send performance reports when the gateway takes them (they need a sign-in). */
+  canReport?: boolean;
   onEvent: (event: SessionEvent) => void;
   /** The client could not be created (no WebGL2, wasm failed to load…). */
   onStartFailed: (message: string) => void;
@@ -29,6 +31,7 @@ export function useMolcajeteClient({
   displayRef,
   connectionId,
   tunnelParameters,
+  canReport = true,
   onEvent,
   onStartFailed,
 }: Options) {
@@ -42,7 +45,7 @@ export function useMolcajeteClient({
     reporterRef.current?.stop();
     reporterRef.current = null;
     // Performance reports are optional; the session works without them.
-    const reporting = await loadReporter().catch(() => null);
+    const reporting = canReport ? await loadReporter().catch(() => null) : null;
     if (reporting && (await reporting.clientReportsEnabled())) {
       reporterRef.current = new reporting.SessionReporter(connectionId, client.mode);
     }
@@ -52,7 +55,7 @@ export function useMolcajeteClient({
     }
     if (reporterRef.current) url += `&session=${encodeURIComponent(reporterRef.current.session)}`;
     client.connect(url);
-  }, [connectionId, tunnelParameters]);
+  }, [connectionId, tunnelParameters, canReport]);
 
   useEffect(() => {
     let isCurrent = true;

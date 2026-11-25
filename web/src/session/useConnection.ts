@@ -5,7 +5,7 @@ import type {ConnectionDisplay} from './displaySettings';
 /** What the connection turns off for its users. */
 export type Restrictions = {readOnly: boolean; disableCopy: boolean; disablePaste: boolean};
 
-type ConnectionInfo = {
+export type ConnectionInfo = {
   name: string;
   protocol: string | null;
   display: ConnectionDisplay;
@@ -15,16 +15,22 @@ type ConnectionInfo = {
 /**
  * The connection's configured name (the id until it loads), protocol
  * (`null` until it loads), display parameters and restrictions; also sets
- * the tab title.
+ * the tab title. `known` is used as it is instead of asking the API (a
+ * session opened by a one-time link has no sign-in to ask with).
  */
-export function useConnection(connectionId: string) {
-  const [connection, setConnection] = useState<ConnectionInfo>({
-    name: connectionId,
-    protocol: null,
-    display: {dpi: null, resizeMethod: null},
-    restrictions: {readOnly: false, disableCopy: false, disablePaste: false},
-  });
+export function useConnection(connectionId: string, known?: ConnectionInfo) {
+  const [connection, setConnection] = useState<ConnectionInfo>(
+    () =>
+      known ?? {
+        name: connectionId,
+        protocol: null,
+        display: {dpi: null, resizeMethod: null},
+        restrictions: {readOnly: false, disableCopy: false, disablePaste: false},
+      },
+  );
+  const isKnown = known !== undefined;
   useEffect(() => {
+    if (isKnown) return;
     let isCurrent = true;
     api.connections().then(
       list => {
@@ -48,7 +54,7 @@ export function useConnection(connectionId: string) {
     return () => {
       isCurrent = false;
     };
-  }, [connectionId]);
+  }, [connectionId, isKnown]);
 
   const {name} = connection;
   useEffect(() => {

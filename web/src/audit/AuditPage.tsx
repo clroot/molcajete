@@ -121,7 +121,7 @@ export default function AuditPage() {
   return (
     <PageFrame
       title="Audit log"
-      description="Changes to users, groups, connections and folders, sign-ins, and recordings opened."
+      description="Changes to users, groups, connections and folders, sign-ins, recordings opened, and API tokens and session links."
       action={
         <Button
           label="Export CSV"

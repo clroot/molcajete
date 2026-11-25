@@ -143,6 +143,11 @@ pub struct TicketInfo {
     /// Display parameters the session starts from.
     dpi: Option<String>,
     resize_method: Option<String>,
+    /// What the connection turns off (`read-only`, `disable-copy`,
+    /// `disable-paste`), for the page to say so.
+    read_only: bool,
+    disable_copy: bool,
+    disable_paste: bool,
     expires_at: i64,
 }
 
@@ -190,6 +195,7 @@ pub async fn info(
         Err(err) => return Err(err.into()),
     };
     let (_, connection) = resolve(&state, &found.user_id, &found.connection_id).await?;
+    let flag = |name: &str| connection.parameters.get(name).is_some_and(|v| v == "true");
     let mut display = connection.parameters.clone();
     display.extend(parameters(found.parameters.as_deref()));
     Ok(Json(TicketInfo {
@@ -198,6 +204,9 @@ pub async fn info(
         protocol: connection.protocol,
         dpi: display.remove("dpi"),
         resize_method: display.remove("resize-method"),
+        read_only: flag("read-only"),
+        disable_copy: flag("disable-copy"),
+        disable_paste: flag("disable-paste"),
         expires_at: found.expires_at,
     }))
 }

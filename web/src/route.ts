@@ -10,6 +10,8 @@ export type Route =
   | {name: 'audit'}
   | {name: 'activeSessions'}
   | {name: 'history'}
+  | {name: 'tokens'}
+  | {name: 'ticket'; ticket: string}
   | {name: 'session'; connectionId: string}
   | {name: 'playback'; recordingId: string};
 
@@ -18,12 +20,15 @@ export function parseRoute(hash: string): Route {
   if (session) return {name: 'session', connectionId: decodeURIComponent(session[1])};
   const playback = hash.match(/^#\/recordings\/(.+)$/);
   if (playback) return {name: 'playback', recordingId: decodeURIComponent(playback[1])};
+  const ticket = hash.match(/^#\/ticket\/(.+)$/);
+  if (ticket) return {name: 'ticket', ticket: decodeURIComponent(ticket[1])};
   if (hash === '#/users') return {name: 'users'};
   if (hash === '#/groups') return {name: 'groups'};
   if (hash === '#/recordings') return {name: 'recordings'};
   if (hash === '#/audit') return {name: 'audit'};
   if (hash === '#/sessions') return {name: 'activeSessions'};
   if (hash === '#/history') return {name: 'history'};
+  if (hash === '#/tokens') return {name: 'tokens'};
   return {name: 'connections'};
 }
 
@@ -35,6 +40,7 @@ export const href = {
   audit: '#/audit',
   activeSessions: '#/sessions',
   history: '#/history',
+  tokens: '#/tokens',
   playback: (recordingId: string) => `#/recordings/${encodeURIComponent(recordingId)}`,
   session: (connectionId: string) => `#/connect/${encodeURIComponent(connectionId)}`,
 };

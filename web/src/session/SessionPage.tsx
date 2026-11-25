@@ -7,7 +7,7 @@ import type {SessionEvent} from './client';
 import {useSessionEvents} from './useSessionEvents';
 import {useMolcajeteClient} from './useMolcajeteClient';
 import {useMenuShortcut} from './useMenuShortcut';
-import {useConnection} from './useConnection';
+import {useConnection, type ConnectionInfo} from './useConnection';
 import {useRemoteComposition} from './useRemoteComposition';
 import {effectiveDisplay, readDisplayChoices, tunnelOverrides, useDisplayChoices} from './displaySettings';
 import {screenDpi} from './displayScale';
@@ -33,7 +33,17 @@ const hasRemoteIme = (protocol: string | null) => protocol === 'rdp' || protocol
 /** Protocols whose scale and resizing the session menu changes. */
 const hasRemoteDisplay = (protocol: string | null) => protocol === 'rdp';
 
-export default function SessionPage({connectionId}: {connectionId: string}) {
+type Props = {
+  connectionId: string;
+  /**
+   * Opened by a one-time link: the ticket goes into the tunnel URL instead
+   * of the session cookie, and there is no connection list to go back to
+   * and no reconnecting (the ticket is used up).
+   */
+  ticket?: {ticket: string; connection: ConnectionInfo};
+};
+
+export default function SessionPage({connectionId, ticket}: Props) {
   const displayRef = useRef<HTMLDivElement>(null);
   const [session, dispatch] = useSessionEvents();
   const {
@@ -41,7 +51,8 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
     protocol,
     display: connectionDisplay,
     restrictions,
-  } = useConnection(connectionId);
+  } = useConnection(connectionId, ticket?.connection);
+  const ticketId = ticket?.ticket;
   const [remoteComposition, setRemoteComposition] = useRemoteComposition(connectionId);
   const displayChoices = useDisplayChoices(connectionId);
   const display = effectiveDisplay(displayChoices.choices, connectionDisplay);
@@ -69,13 +80,17 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
   );
   // Read at every connect, so a reconnect starts with the latest choices.
   const tunnelParameters = useCallback(
-    () => tunnelOverrides(readDisplayChoices(connectionId)),
-    [connectionId],
+    () => ({
+      ...tunnelOverrides(readDisplayChoices(connectionId)),
+      ...(ticketId === undefined ? {} : {ticket: ticketId}),
+    }),
+    [connectionId, ticketId],
   );
   const {client, mode, connect} = useMolcajeteClient({
     displayRef,
     connectionId,
     tunnelParameters,
+    canReport: ticketId === undefined,
     onEvent,
     onStartFailed,
   });
@@ -101,6 +116,7 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
     dispatch({type: 'reconnecting'});
     connect();
   };
+  const isTicket = ticketId !== undefined;
 
   const setMenuOpen = useCallback(
     (open: boolean) => {
@@ -136,8 +152,8 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
         <StatusOverlay
           status={status}
           connectionName={connectionName}
-          onReconnect={reconnect}
-          onLeave={leave}
+          onReconnect={isTicket ? undefined : reconnect}
+          onLeave={isTicket ? undefined : leave}
         />
       )}
       {status.kind === 'connected' && session.isUnstable && <UnstableNotice />}
@@ -155,7 +171,7 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
         <CredentialsDialog
           parameters={session.required}
           connectionName={connectionName}
-          onCancel={leave}
+          onCancel={isTicket ? () => client()?.disconnect() : leave}
           onSubmit={values => {
             for (const [name, value] of Object.entries(values)) client()?.send_argv(name, value);
             dispatch({type: 'answered'});
@@ -195,7 +211,14 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
         remoteComposition={hasRemoteIme(protocol) ? remoteComposition : null}
         onRemoteCompositionChange={setRemoteComposition}
         onCtrlAltDel={() => client()?.send_ctrl_alt_del()}
-        onDisconnect={leave}
+        onDisconnect={
+          isTicket
+            ? () => {
+                setMenuOpen(false);
+                client()?.disconnect();
+              }
+            : leave
+        }
       />
     </>
   );

@@ -9,6 +9,8 @@ import ConnectionsPage from './connections/ConnectionsPage';
 import UsersPage from './users/UsersPage';
 import GroupsPage from './groups/GroupsPage';
 import SessionPage from './session/SessionPage';
+import TicketSessionPage from './session/TicketSessionPage';
+import TokensPage from './tokens/TokensPage';
 import RecordingsPage from './recordings/RecordingsPage';
 import PlaybackPage from './recordings/PlaybackPage';
 import AuditPage from './audit/AuditPage';
@@ -21,6 +23,13 @@ const SIGNED_OUT: Auth = {status: 'signedOut'};
 const signedIn = (user: Me): Auth => ({status: 'signedIn', user});
 
 export default function App() {
+  const route = useRoute();
+  // A one-time session link opens its session without signing in.
+  if (route.name === 'ticket') return <TicketSessionPage key={route.ticket} ticket={route.ticket} />;
+  return <SignInGate />;
+}
+
+function SignInGate() {
   const [auth, setAuth] = useState<Auth>({status: 'checking'});
 
   useEffect(() => {
@@ -78,6 +87,8 @@ function SignedInApp({user, onSignOut}: {user: Me; onSignOut: () => void}) {
         <ActiveSessionsPage currentUser={user} />
       ) : route.name === 'history' && user.isAdmin ? (
         <HistoryPage />
+      ) : route.name === 'tokens' ? (
+        <TokensPage user={user} />
       ) : (
         <ConnectionsPage user={user} />
       )}
