@@ -13,7 +13,7 @@ written in Rust and compiled to WebAssembly.
 |---|---|---|
 | `molcajete-protocol` | protocol code in libguac / guacamole-common / guacamole-common-js | complete: streaming parser, encoder, typed instructions, video framing |
 | `molcajete-client` (wasm) | `guacamole-common-js` (`Guacamole.Client`, `Display`, `Keyboard`, `Mouse`, …) | WebGL2 renderer, WebCodecs video, input, clipboard, audio, recording playback |
-| `molcajete-gateway` | the Guacamole web application (`guacamole-common`, JDBC authentication, session recording) | WebSocket tunnel, web UI, users, groups, connections and grants in PostgreSQL, MySQL or SQLite, single sign-on, session recordings, active sessions and connection history, audit log |
+| `molcajete-gateway` | the Guacamole web application (`guacamole-common`, JDBC authentication, session recording) | WebSocket tunnel, web UI, users, groups, connections and grants in PostgreSQL, MySQL or SQLite, single sign-on, session recordings, active sessions and connection history, audit log, API tokens and one-time session links |
 | `molcajete-daemon` (`molcajeted`) | `guacd` + libguac + protocol plugins | VNC, SSH, RDP (incl. audio); video mode (AV1/H.265/H.264) for busy areas |
 
 The gateway is wire-compatible with the stock `guacd`, and accepts the same
@@ -132,21 +132,60 @@ client on the main thread instead of a worker, `?text` to keep the tunnel on
 the Guacamole text protocol (base64), and `?png` to receive lossless updates
 as PNG instead of zstd images.
 
-Embedding the client in another page:
+## Embedding
+
+Another application can put a molcajete session in its own pages without
+its users signing in to molcajete: its server asks the gateway for a
+one-time session link with an [API token](docs/administration.md#api-tokens)
+and hands the link to the browser.
+
+1. Once: create a user for the application (a plain user granted the
+   connections it may open is enough), sign in as it and create an API token
+   under *API tokens*. Keep the token on the application's server.
+2. For each session, on the server:
+
+   ```sh
+   curl -H "Authorization: Bearer $MOLCAJETE_TOKEN" -H 'Content-Type: application/json' \
+     -d '{}' https://molcajete.example.com/api/connections/office-pc/tickets
+   # {"url": "https://molcajete.example.com/#/ticket/3f9c…", "ticket": "3f9c…", "expiresAt": …}
+   ```
+
+3. In the page, within a minute (the link works once and expires after
+   `[api_tokens] ticket_ttl_seconds`):
+
+   ```html
+   <iframe src="https://molcajete.example.com/#/ticket/3f9c…"
+           allow="clipboard-read; clipboard-write; fullscreen" width="1280" height="800"></iframe>
+   ```
+
+The session runs as the token's owner and appears in the audit log
+(`ticket.create`, `ticket.use`) and in recordings like any other. See
+[one-time session links](docs/administration.md#one-time-session-links).
+
+To run the client in your own page instead of an iframe, serve
+`molcajete.js`, `molcajete-worker.js`, `molcajete-player.js` and `pkg/` from
+`web/dist` on your own origin (browsers load module workers only from the
+page's origin) and pass the `ticket` to the tunnel:
 
 ```js
 import { MolcajeteSession } from "./molcajete.js";
 const session = await MolcajeteSession.create(document.getElementById("display"));
 session.set_event_handler((type, detail) => console.log(type, detail));
-session.connect(session.tunnel_url("wss://example.com/websocket-tunnel", "vnc"));
+// `ticket` from the server; it chooses the connection, so the second argument is ignored.
+const url = session.tunnel_url("wss://molcajete.example.com/websocket-tunnel", "office-pc");
+session.connect(`${url}&ticket=${encodeURIComponent(ticket)}`);
 ```
+
+A tunnel opened with a ticket needs no cookie and may come from another
+origin; without one, the tunnel takes the molcajete session cookie and only
+from the gateway's own origin.
 
 ## Documentation
 
 - [docs/administration.md](docs/administration.md): users and passwords,
   roles, groups, connections, folders and grants, single sign-on, session
   recordings, active sessions and the connection history, the audit log,
-  the JSON API.
+  API tokens and one-time session links, the JSON API.
 - [docs/deployment.md](docs/deployment.md): images, Docker Compose,
   Kubernetes, molcajeted on macOS, the configuration reference, reverse
   proxies, upgrading.

@@ -1,6 +1,6 @@
 # Administration
 
-Who can sign in, what they can open, who is connected now, what is recorded, and who changed what. Everything here is done in the gateway's web UI (*Connections*, *Users*, *Groups*, *Active sessions*, *Connection history*, *Recordings*, *Audit log*) or its JSON API, and stored in the gateway's database. The settings in `gateway.toml` that these features read are listed in the [configuration reference](deployment.md#configuration-reference).
+Who can sign in, what they can open, who is connected now, what is recorded, and who changed what. Everything here is done in the gateway's web UI (*Connections*, *Users*, *Groups*, *Active sessions*, *Connection history*, *Recordings*, *Audit log*, *API tokens*) or its JSON API, and stored in the gateway's database. The settings in `gateway.toml` that these features read are listed in the [configuration reference](deployment.md#configuration-reference).
 
 ## Users and passwords
 
@@ -335,9 +335,9 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | --- | --- |
 | Time | When it happened. |
 | Actor | The user who did it: their id and their username at the time. A failed sign-in has the username that was typed, and no id when no such user exists. Changes made from the configuration file, at first start or with `set-password` have no actor; the page shows them as *Gateway*. |
-| Source address | The browser's address as the gateway logs it: behind a [trusted proxy](deployment.md#reverse-proxy) the address the proxy reports, followed by the proxy (`203.0.113.9 (via 10.0.0.2)`), otherwise the TCP peer; `configuration file`, `first start` or `command line` for changes not made in a browser. |
+| Source address | The browser's address as the gateway logs it: behind a [trusted proxy](deployment.md#reverse-proxy) the address the proxy reports, followed by the proxy (`203.0.113.9 (via 10.0.0.2)`), otherwise the TCP peer; `configuration file`, `first start` or `command line` for changes not made in a browser. Changes made with an API token name it: `198.51.100.4 (API token "inventory sync")`. |
 | Action | What happened; see below. |
-| Target | The user, group, connection, folder, recording or session, with its id and its name at the time. |
+| Target | The user, group, connection, folder, recording, session or API token, with its id and its name at the time. |
 | Changes | Each changed field with its value before and after; lists (groups, members, grants) as what was added and removed. Details such as why a sign-in failed are here too. |
 
 **Secrets are never stored.** Passwords, private keys, passphrases and secrets show only that they were set or changed, as `[redacted]`, never their value. This covers the user's password and the connection parameters `password`, `passphrase`, `private-key`, `client-key` and their variants (`sftp-password`, `gateway-password`, `sftp-private-key`, ...). Grants, members and folders are shown by name rather than id, as they were named at the time.
@@ -360,6 +360,9 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | `recording.download`, `recording.delete` | Recordings downloaded (playing one back in the page is not recorded) or deleted. |
 | `secrets.encrypt`, `secrets.rotate` | Stored credentials encrypted at start because they were in plain text (`count`), and re-encrypted by `rotate-key` (`count`, `keyId`). No actor. |
 | `session.end` | An open session was ended, by an administrator or because its user was disabled, deleted or lost access ([Sessions that end by themselves](#sessions-that-end-by-themselves)). The target is the session (its tunnel id, named after the connection); `reason`, `user`, `connection` and `startedAt` are in the changes. |
+| `token.create`, `token.revoke` | [API tokens](#api-tokens) created (with their expiry and allowed addresses) or revoked; a token an administrator revoked for someone else carries its `owner`. |
+| `token.use` | An API token was used: the first time, from an address it was not last used from, and the first time after an hour without use. Not every request; the token's *Last used* shows the latest. |
+| `ticket.create`, `ticket.use` | A [one-time session link](#one-time-session-links) was made for a connection, and opened it. The actor is the user the session runs as; `ticket.use` has the browser's address. |
 
 The names are stable, so filters and alert rules can rely on them; `GET /api/audit/actions` lists them.
 
@@ -375,9 +378,49 @@ Each entry is also written to the gateway's log as one line with the target `aud
 
 Entries older than `[audit] retention_days` (365 by default) are deleted when the gateway starts and every hour after that; `0` keeps them forever. See the [configuration reference](deployment.md#audit).
 
+## Automation
+
+Scripts and other applications use the [JSON API](#json-api) with an API token instead of a password, and hand people one-time links to sessions instead of molcajete accounts.
+
+### API tokens
+
+Every user can create tokens for themselves under *API tokens* in the account menu: a name, how long it is valid (required; at most `[api_tokens] max_lifetime_days`, 365 days by default) and, optionally, the addresses it may be used from (IP addresses or CIDR ranges such as `10.0.0.0/8`). The token, `mlc_` followed by 64 hex digits, is shown once; the gateway keeps only its SHA-256 and its first characters, to recognise it in the list. Send it as `Authorization: Bearer mlc_…`:
+
+```sh
+TOKEN=mlc_…
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"id": "office-pc", "name": "Office PC", "protocol": "rdp", "parameters": {"hostname": "10.0.0.7"}}' \
+  https://molcajete.example.com/api/connections
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"users": ["<user id>"], "groups": []}' https://molcajete.example.com/api/connections/office-pc/access
+```
+
+- A token acts as its owner, with the owner's role and grants as they are when it is used: demoting the owner limits it, and disabling or deleting the owner stops it. Give automation its own user with the least role it needs (a connection manager to create and grant connections); an administrator's token can do everything an administrator can, including creating users.
+- It replaces the session cookie (a cookie sent with it is ignored) and is not subject to the same-origin check.
+- Revoked, expired or unknown tokens and tokens of disabled users get `401`; a request from an address outside the token's list gets `403`. The address is the one the gateway logs: behind a proxy listed in [`[server] trusted_proxies`](deployment.md#reverse-proxy) the address the proxy reports, otherwise the TCP peer. Behind a proxy that is not listed every request has the proxy's address, so set `trusted_proxies` before relying on an allowlist.
+- Some requests need a person and are refused (`403`) with a token: creating tokens (so a leaked token cannot outlive its revocation or expiry through new ones), changing the password (`PUT /api/auth/password`), and changing or deleting the token's own user (`PUT`/`DELETE /api/users/{owner}`).
+- Users see and revoke their own tokens; administrators can switch the page to everyone's tokens and revoke any. Revoking a token also cancels the unused session links it made.
+- Creation, revocation and use are in the [audit log](#actions), and so is everything done with a token: its source address names the token.
+
+### One-time session links
+
+`POST /api/connections/{id}/tickets` makes a link that opens that connection once, as the caller, without a molcajete login. The caller (with a token or a session) must be able to open the connection; `404` otherwise.
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}' \
+  https://molcajete.example.com/api/connections/office-pc/tickets
+# {"url": "https://molcajete.example.com/#/ticket/3f9c…", "ticket": "3f9c…", "expiresAt": 1795700000000}
+```
+
+- The link works once and only for `[api_tokens] ticket_ttl_seconds` (60 by default): opening the session uses it up, on whichever gateway replica the browser reaches. Reloading the page, reconnecting or opening the link again fails; ask for a new link instead.
+- The session runs as the user who made the link, with their rights when it opens, and is like any session of theirs: recorded, audited (`ticket.create`, `ticket.use`), listed under *Active sessions* where an administrator can end it, kept in the *Connection history*, and ended when the user loses access to the connection.
+- The body may set display parameters for the session, only those a browser may set for itself: `{"parameters": {"dpi": "120", "resize-method": "display-update"}}`. Credentials cannot be passed; the connection's own are used, or the session asks for them.
+- `url` uses `[server] public_url`, or the request's host when it is not set; behind a proxy that rewrites the host, set `public_url`. To run the client in your own page, use `ticket` (see [embedding](../README.md#embedding)).
+- The page a link opens has no menus that need a sign-in: no connection list and no reconnecting.
+
 ## JSON API
 
-The web UI uses a JSON API under `/api`, which scripts can use as well. Sign in with `POST /api/auth/login` and send the `molcajete_session` cookie with the following requests. Request bodies are JSON (`Content-Type: application/json`), and a request that changes something is refused when it carries an `Origin` header that does not match the gateway's host.
+The web UI uses a JSON API under `/api`, which scripts can use as well, with an [API token](#api-tokens) or a session cookie. For a session, sign in with `POST /api/auth/login` and send the `molcajete_session` cookie with the following requests. Request bodies are JSON (`Content-Type: application/json`), and a request with a cookie that changes something is refused when it carries an `Origin` header that does not match the gateway's host.
 
 ```sh
 curl -c cookies -H 'Content-Type: application/json' \
@@ -405,8 +448,13 @@ curl -b cookies -OJ 'https://molcajete.example.com/api/recordings/<id>/file?down
 | `/api/sessions` | `GET` (open sessions), `DELETE` (end all but your own; `?user=<username or id>` ends all of that user's) | administrators |
 | `/api/sessions/{id}` | `DELETE` (end the session) | administrators |
 | `/api/history` | `GET` (filters below; `?format=csv` for a CSV download) | administrators |
+| `/api/tokens` | `GET` (the caller's tokens; `?scope=all` for everyone's, administrators only) | signed-in users |
+| `/api/tokens` | `POST` (`{"name": …, "expiresAt": <Unix ms>, "allowedIps": […]}`; returns the token once) | signed-in users, not with a token |
+| `/api/tokens/{id}` | `DELETE` (revoke) | the owner, administrators |
+| `/api/connections/{id}/tickets` | `POST` (`{}` or `{"parameters": {…}}`; returns `{url, ticket, expiresAt}`) | users who can open the connection |
+| `/api/tickets/{ticket}` | `GET` (what the link opens, without using it up) | anyone with the ticket |
 
-`GET /api/audit` returns `{"entries": […], "hasMore": true|false}`, newest first. Its query parameters, all optional: `actor` (username or user id), `action` (an action, or a prefix of whole parts such as `user` or `oidc.user`), `targetType` (`user`, `group`, `connection`, `folder`, `recording`, `session`), `target` (id or name), `from` and `to` (Unix milliseconds; `to` excluded), `limit` (default 100, at most 1000) and `offset`.
+`GET /api/audit` returns `{"entries": […], "hasMore": true|false}`, newest first. Its query parameters, all optional: `actor` (username or user id), `action` (an action, or a prefix of whole parts such as `user` or `oidc.user`), `targetType` (`user`, `group`, `connection`, `folder`, `recording`, `session`, `token`), `target` (id or name), `from` and `to` (Unix milliseconds; `to` excluded), `limit` (default 100, at most 1000) and `offset`.
 
 ```sh
 curl -b cookies 'https://molcajete.example.com/api/audit?action=login.failure&limit=20'

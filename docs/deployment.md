@@ -133,9 +133,9 @@ For development, `cargo run -p molcajete-gateway -- --config gateway.toml` and `
 - **WebSocket.** `/websocket-tunnel` needs the `Upgrade` and `Connection` headers passed through, buffering off, and a long idle timeout (the example allows one hour; the client pings every few seconds, so this only ends dead tunnels).
 - **Subprotocol.** The client offers two WebSocket subprotocols (`Sec-WebSocket-Protocol: molcajete-binary-v1, guacamole`) and the gateway answers with one. Pass that header in both directions, as nginx does by default. A proxy that drops it from the request leaves the tunnel on the text protocol; one that drops it from the response makes the browser refuse the connection. With `molcajete-binary-v1` most messages are binary WebSocket frames.
 - **No compression on the tunnel.** Do not let a proxy negotiate `permessage-deflate` on `/websocket-tunnel`: the payload is already compressed images and video.
-- **Host and Origin.** Pass `Host` (or `X-Forwarded-Host`) through unchanged. The gateway refuses state-changing API requests and tunnels whose `Origin` does not match it.
+- **Host and Origin.** Pass `Host` (or `X-Forwarded-Host`) through unchanged. The gateway refuses state-changing API requests and tunnels whose `Origin` does not match it, except those authenticated by an API token or a one-time session link. Pass the `Authorization` header through for API tokens.
 - **HTTPS.** Send `X-Forwarded-Proto: https`; the gateway then marks its session cookie `Secure`. Cookies are `HttpOnly` and `SameSite=Strict`.
-- **Client addresses.** List the proxy that connects to the gateway in [`[server] trusted_proxies`](#server). The gateway takes the client's address from `X-Real-IP`, otherwise from `X-Forwarded-For`, **only when the TCP peer is one of those proxies**; from anyone else the headers are ignored, since a client could put any address there. The address goes into logs and the audit log (`203.0.113.9 (via 10.0.0.2)`) and is what [failed sign-ins are counted by](administration.md#repeated-failed-sign-ins). **Without `trusted_proxies`, every client behind the proxy has the proxy's address**: they share one limit of failed sign-ins, so a few typos in one place can make the gateway refuse everyone for a few minutes, and logs show only the proxy.
+- **Client addresses.** List the proxy that connects to the gateway in [`[server] trusted_proxies`](#server). The gateway takes the client's address from `X-Real-IP`, otherwise from `X-Forwarded-For`, **only when the TCP peer is one of those proxies**; from anyone else the headers are ignored, since a client could put any address there. The address goes into logs and the audit log (`203.0.113.9 (via 10.0.0.2)`) and is what [failed sign-ins are counted by](administration.md#repeated-failed-sign-ins) and what [API tokens' address lists](administration.md#api-tokens) are checked against. **Without `trusted_proxies`, every client behind the proxy has the proxy's address**: they share one limit of failed sign-ins, so a few typos in one place can make the gateway refuse everyone for a few minutes, and logs show only the proxy.
   - Set both headers at the edge proxy to `$remote_addr`, overwriting rather than appending, so clients cannot spoof them. Proxies in between (such as the Tailscale ingress) replace `X-Forwarded-For` but pass `X-Real-IP` through, and `X-Real-IP` wins.
   - `trusted_proxies` names the hop the gateway sees, not the edge: in Kubernetes that is the ingress controller's (or the Tailscale ingress proxy's) pod address, so list the cluster's pod range (`kubectl get pods -A -o wide` shows the addresses). From `X-Forwarded-For` the gateway takes the rightmost address that is not a trusted proxy, so list any proxies in between as well.
   - Anyone who can reach the gateway from a trusted range can claim any address; keep those ranges to the proxies and the cluster.
@@ -220,6 +220,7 @@ Two subcommands work on the database directly, without a running gateway. They o
 | `data_dir` | `.` | Holds the default SQLite database (`molcajete.db`) and the default recordings directory. Created if missing. |
 | `binary_tunnel` | `true` | Offer the `molcajete-binary-v1` WebSocket subprotocol, which carries image, video and audio data as raw bytes. `false` keeps every tunnel on the Guacamole text protocol. |
 | `trusted_proxies` | `[]` | Reverse proxies whose `X-Real-IP` and `X-Forwarded-For` name the client: addresses or CIDR ranges, such as `["10.42.0.0/16", "127.0.0.1"]`. Requests from other peers are attributed to the peer. See [Reverse proxy](#reverse-proxy). |
+| `public_url` | none | The browser-visible base URL of the gateway (`https://molcajete.example.com`), for the [one-time session links](administration.md#one-time-session-links) it hands out. Without it, links use the request's `X-Forwarded-Proto`, `X-Forwarded-Host` and `Host`, which is wrong when the application asking for links reaches the gateway at an internal address. |
 
 ### `[guacd]`
 
@@ -391,6 +392,15 @@ How long the [connection history](administration.md#connection-history) of close
 
 The history grows by one row per session, so a busy gateway may want a shorter period than the audit log's.
 
+### `[api_tokens]`
+
+[API tokens](administration.md#api-tokens) and the [one-time session links](administration.md#one-time-session-links) they make.
+
+| Key | Default | |
+| --- | --- | --- |
+| `max_lifetime_days` | `365` | The longest a new token may be valid, in days. Every token has an expiry; tokens already created keep theirs when this is lowered. |
+| `ticket_ttl_seconds` | `60` | How long a one-time session link can be opened. |
+
 ### `[[users]]`
 
 Administrators created at startup when no user with that username exists yet. Existing users and their passwords are left alone, so changing a password here later has no effect; use the web UI or `set-password`.
@@ -473,6 +483,7 @@ The gateway applies pending migrations when it starts (and when `set-password` r
 | `20261126000200_oidc` | `molcajete_user_identity` (provider `iss` and `sub` per user), `molcajete_oidc_login` (sign-ins in progress) and `molcajete_session.id_token`. |
 | `20261127000000_audit_log` | `molcajete_audit_log` (the audit log). It starts empty: changes made before the upgrade are only in old process logs. |
 | `20261127000200_connection_history` | `molcajete_connection_history` (closed sessions). It starts empty: sessions before the upgrade are only in old process logs (`tunnel closed`). |
+| `20261127000300_api_tokens` | `molcajete_api_token` (API tokens, stored as SHA-256) and `molcajete_session_ticket` (unused one-time session links). Both start empty; nothing existing changes. |
 
 - A gateway that predates `20261126000000_groups_roles_folders` cannot start on a migrated database, because the column it reads is gone. Do not run old and new gateways against one database: stop the old one first (the Kubernetes template's `Recreate` strategy does this).
 - The JSON API keeps `isAdmin` on users, derived from the role, and accepts it in user requests, so scripts that used it keep working.
@@ -489,7 +500,7 @@ Gateways from this change on keep [connection credentials](administration.md#sto
 
 ### Configuration files
 
-The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`, `[history]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour, with one exception: since `[server] trusted_proxies` was added, `X-Real-IP` and `X-Forwarded-For` are read only from the proxies it lists. A gateway behind a proxy needs it set, or every client has the proxy's address in logs, in the audit log and for [failed sign-in limits](administration.md#repeated-failed-sign-ins).
+The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`, `[history]`, `[api_tokens]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour, with one exception: since `[server] trusted_proxies` was added, `X-Real-IP` and `X-Forwarded-For` are read only from the proxies it lists. A gateway behind a proxy needs it set, or every client has the proxy's address in logs, in the audit log and for [failed sign-in limits](administration.md#repeated-failed-sign-ins).
 
 ## Mixed versions
 
