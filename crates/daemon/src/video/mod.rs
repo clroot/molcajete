@@ -25,6 +25,11 @@ mod yuv;
 #[cfg(test)]
 mod tests;
 
+/// Set on a thread to prepare video frames there as before GH-37, for
+/// comparisons in benchmarks and simulations.
+#[cfg(test)]
+pub(crate) use yuv::reference::LEGACY;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 

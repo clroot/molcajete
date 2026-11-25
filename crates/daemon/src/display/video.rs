@@ -48,6 +48,13 @@ const IDLE: Duration = Duration::from_millis(1000);
 /// Frames in which the busy area must extend beyond the video before the
 /// video is restarted over the new area.
 const REGROW_FRAMES: u32 = 8;
+/// Frames in which the busy area must not grow any further before the video
+/// is restarted over it: a window that is still opening or being resized
+/// would otherwise restart the stream every few frames.
+const SETTLE_FRAMES: u32 = 10;
+/// Frames after which the video is restarted over the busy area even if it
+/// keeps growing (meanwhile, the part outside the video goes as images).
+const MAX_OUTGROWN_FRAMES: u32 = 60;
 /// Encoder errors after which video mode is given up for the session.
 const MAX_FAILURES: u32 = 3;
 /// Nominal frame rate given to rate control (frames are sent at most this
@@ -95,12 +102,81 @@ pub(super) struct ActiveVideo {
     encoder: Mutex<Box<dyn VideoEncoder>>,
     started: Instant,
     last_change: Instant,
-    /// Last frame given to the encoder, to skip unchanged frames.
-    previous: Vec<u8>,
+    /// The frame given to the encoder (RGBA at the encoded size, the
+    /// padding repeating the last column and row). Kept up to date tile by
+    /// tile, which also tells whether anything changed.
+    frame: Vec<u8>,
     /// Consecutive frames in which the busy area extended beyond `rect`.
     outgrown: u32,
+    /// Everything the busy area covered during those frames.
+    outgrown_area: Option<Rect>,
+    /// Consecutive frames in which `outgrown_area` did not grow.
+    settled: u32,
     frames: u64,
     bytes: usize,
+}
+
+impl ActiveVideo {
+    /// Records the busy area `candidate` of this frame; returns the area
+    /// the video should be restarted over, if it should.
+    ///
+    /// The busy area has to extend beyond the video for [`REGROW_FRAMES`]
+    /// and then stop growing for [`SETTLE_FRAMES`] (or keep extending
+    /// beyond it for [`MAX_OUTGROWN_FRAMES`]). When it grew from the
+    /// video, the new area is extended by as much again on the sides where
+    /// it grew, so that a window that keeps growing needs fewer restarts.
+    fn regrow(&mut self, candidate: Option<Rect>, screen: (u32, u32)) -> Option<Rect> {
+        let Some(candidate) = candidate.filter(|c| !contains(&self.rect, c)) else {
+            self.outgrown = 0;
+            self.outgrown_area = None;
+            self.settled = 0;
+            return None;
+        };
+        self.outgrown += 1;
+        match self.outgrown_area {
+            Some(area) if contains(&area, &candidate) => self.settled += 1,
+            Some(area) => {
+                self.outgrown_area = Some(union(&area, &candidate));
+                self.settled = 0;
+            }
+            None => {
+                self.outgrown_area = Some(candidate);
+                self.settled = 0;
+            }
+        }
+        let due = (self.outgrown >= REGROW_FRAMES && self.settled >= SETTLE_FRAMES)
+            || self.outgrown >= MAX_OUTGROWN_FRAMES;
+        if !due {
+            return None;
+        }
+        let area = self.outgrown_area.expect("set above");
+        if !overlaps(&self.rect, &area) {
+            // The busy area moved elsewhere.
+            return Some(area);
+        }
+        let old = &self.rect;
+        let left = area.x.saturating_sub(old.x.saturating_sub(area.x));
+        let top = area.y.saturating_sub(old.y.saturating_sub(area.y));
+        let right = area.right() + area.right().saturating_sub(old.right());
+        let bottom = area.bottom() + area.bottom().saturating_sub(old.bottom());
+        let (left, top) = (left / TILE * TILE, top / TILE * TILE);
+        Some(Rect::new(left, top, right - left, bottom - top).clip(screen.0, screen.1))
+    }
+}
+
+/// The smallest rectangle covering both.
+fn union(a: &Rect, b: &Rect) -> Rect {
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    Rect::new(
+        x,
+        y,
+        a.right().max(b.right()) - x,
+        a.bottom().max(b.bottom()) - y,
+    )
+}
+
+fn overlaps(a: &Rect, b: &Rect) -> bool {
+    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
 }
 
 fn bitrate_kbps(codec: VideoCodec, width: u32, height: u32) -> u32 {
@@ -232,11 +308,15 @@ impl Display {
             self.stop_video(out);
             return FlushStats::default();
         }
-        let outgrown = candidate.is_some_and(|c| !contains(&active.rect, &c));
-        active.outgrown = if outgrown { active.outgrown + 1 } else { 0 };
-        if active.outgrown >= REGROW_FRAMES
-            && let Some(rect) = candidate
-        {
+        #[cfg(test)]
+        let regrow = if crate::video::LEGACY.get() {
+            legacy_regrow(active, candidate)
+        } else {
+            active.regrow(candidate, (self.width, self.height))
+        };
+        #[cfg(not(test))]
+        let regrow = active.regrow(candidate, (self.width, self.height));
+        if let Some(rect) = regrow {
             // The busy area moved or grew: start over where it is now.
             self.stop_video(out);
             return self.start_video(rect, now, out);
@@ -303,8 +383,10 @@ impl Display {
             encoder: Mutex::new(encoder),
             started: now,
             last_change: now,
-            previous: Vec::new(),
+            frame: Vec::new(),
             outgrown: 0,
+            outgrown_area: None,
+            settled: 0,
             frames: 0,
             bytes: 0,
         });
@@ -352,38 +434,31 @@ impl Display {
 
     /// Encodes the video area if it changed (always when `key` is set).
     fn video_frame(&mut self, now: Instant, key: bool, out: &mut Output) -> FlushStats {
-        let Some(video) = &self.video else {
+        let Some(mut video) = self.video.take() else {
             return FlushStats::default();
         };
-        let rect = video.rect;
-        let (cols, rows) = self.tiles_of(&rect);
-        let mut touched = false;
-        for ty in rows.clone() {
-            for tx in cols.clone() {
-                touched |= self.dirty[(ty * self.tile_cols + tx) as usize];
-            }
-        }
-        if !touched && !key {
-            return FlushStats::default();
-        }
-        let frame = self.video_pixels();
-        let video = self.video.as_mut().expect("checked above");
-        if !key && frame == video.previous {
+        #[cfg(test)]
+        let changed = if crate::video::LEGACY.get() {
+            self.legacy_changed_tiles(&mut video, key)
+        } else {
+            self.changed_tiles(&mut video)
+        };
+        #[cfg(not(test))]
+        let changed = self.changed_tiles(&mut video);
+        self.video = Some(video);
+        if changed.is_empty() && !key {
             return FlushStats::default();
         }
         // Changed tiles stay busy, which keeps the video going.
-        for ty in rows {
-            for tx in cols.clone() {
-                let i = (ty * self.tile_cols + tx) as usize;
-                if self.dirty[i] {
-                    self.motion[i] += 1.0;
-                }
-            }
+        for i in changed {
+            self.motion[i] += 1.0;
         }
-        let video = self.video.as_mut().expect("checked above");
+        let video = self.video.as_mut().expect("put back above");
+        let rect = video.rect;
         let encoder = video.encoder.get_mut().unwrap_or_else(|e| e.into_inner());
         let codec = encoder.codec();
-        let (result, encode_time) = super::metrics::timed(|| encoder.encode(&frame, key));
+        let frame = &video.frame;
+        let (result, encode_time) = super::metrics::timed(|| encoder.encode(frame, key));
         let encoded = match result {
             Ok(encoded) => encoded,
             Err(err) => {
@@ -392,7 +467,6 @@ impl Display {
                 return FlushStats::default();
             }
         };
-        video.previous = frame;
         video.last_change = now;
         if encoded.data.is_empty() {
             // The encoder buffers this frame; it comes out with a later one.
@@ -414,12 +488,101 @@ impl Display {
         }
     }
 
-    /// RGBA pixels of the video area at the encoded size; the padding
-    /// repeats the last column / row.
-    fn video_pixels(&self) -> Vec<u8> {
-        let video = self.video.as_ref().expect("video active");
+    /// Brings `video.frame` up to date with the framebuffer and returns the
+    /// tiles (indices) that changed and were touched since the last flush.
+    ///
+    /// Only touched tiles can differ, so only they are compared and copied,
+    /// a run of adjacent touched tiles one pixel row at a time; once every
+    /// tile of a run is known to differ, the rest of it is only copied. A
+    /// new video's frame is filled in full.
+    fn changed_tiles(&self, video: &mut ActiveVideo) -> Vec<usize> {
         let rect = video.rect;
-        let mut data = Vec::with_capacity((video.width * video.height * 4) as usize);
+        let (width, height) = (video.width as usize, video.height as usize);
+        let stride = width * 4;
+        let fresh = video.frame.is_empty();
+        if fresh {
+            video.frame = vec![0; stride * height];
+        }
+        let (cols, rows) = self.tiles_of(&rect);
+        let mut changed = Vec::new();
+        let mut copied = false;
+        let mut differs = Vec::with_capacity(cols.len());
+        for ty in rows {
+            let row_start = (ty * self.tile_cols) as usize;
+            let (y0, y1) = (ty * TILE, ((ty + 1) * TILE).min(rect.bottom()));
+            let mut tx = cols.start;
+            while tx < cols.end {
+                if !fresh && !self.dirty[row_start + tx as usize] {
+                    tx += 1;
+                    continue;
+                }
+                let first = tx;
+                while tx < cols.end && (fresh || self.dirty[row_start + tx as usize]) {
+                    tx += 1;
+                }
+                let (x0, x1) = (first * TILE, (tx * TILE).min(rect.right()));
+                let column = (x0 - rect.x) as usize * 4;
+                differs.clear();
+                differs.resize((tx - first) as usize, false);
+                let mut known = 0;
+                for y in y0..y1 {
+                    let src = self.segment(&self.pixels, y, x0, x1);
+                    let dst =
+                        &mut video.frame[(y - rect.y) as usize * stride + column..][..src.len()];
+                    if known < differs.len() {
+                        if dst == src {
+                            continue;
+                        }
+                        let tiles = src
+                            .chunks(TILE as usize * 4)
+                            .zip(dst.chunks(TILE as usize * 4));
+                        for (seen, (s, d)) in differs.iter_mut().zip(tiles) {
+                            if !*seen && s != d {
+                                *seen = true;
+                                known += 1;
+                            }
+                        }
+                    }
+                    dst.copy_from_slice(src);
+                }
+                copied |= known > 0;
+                let run = row_start + first as usize..row_start + tx as usize;
+                changed.extend(
+                    run.zip(&differs)
+                        .filter(|&(i, &seen)| seen && self.dirty[i])
+                        .map(|(i, _)| i),
+                );
+            }
+        }
+        if copied {
+            pad(
+                &mut video.frame,
+                stride,
+                rect.w as usize,
+                rect.h as usize,
+                height,
+            );
+        }
+        changed
+    }
+
+    /// The frame as it was prepared before GH-37 (a full copy of the area,
+    /// compared with the previous one), for the benchmarks.
+    #[cfg(test)]
+    fn legacy_changed_tiles(&self, video: &mut ActiveVideo, key: bool) -> Vec<usize> {
+        let rect = video.rect;
+        let (cols, rows) = self.tiles_of(&rect);
+        let dirty: Vec<usize> = rows
+            .flat_map(|ty| {
+                cols.clone()
+                    .map(move |tx| (ty * self.tile_cols + tx) as usize)
+            })
+            .filter(|&i| self.dirty[i])
+            .collect();
+        if dirty.is_empty() && !key {
+            return dirty;
+        }
+        let mut frame = Vec::with_capacity((video.width * video.height * 4) as usize);
         for y in 0..video.height {
             let row = self.segment(
                 &self.pixels,
@@ -427,13 +590,44 @@ impl Display {
                 rect.x,
                 rect.right(),
             );
-            data.extend_from_slice(row);
+            frame.extend_from_slice(row);
             for _ in rect.w..video.width {
-                data.extend_from_slice(&row[row.len() - 4..]);
+                frame.extend_from_slice(&row[row.len() - 4..]);
             }
         }
-        data
+        if frame == video.frame {
+            return Vec::new();
+        }
+        video.frame = frame;
+        dirty
     }
+}
+
+/// Fills the padding of a frame (rows of `stride` bytes, the picture
+/// `w` × `h` pixels in the top left, `height` rows in all) by repeating the
+/// last column and the last row.
+fn pad(frame: &mut [u8], stride: usize, w: usize, h: usize, height: usize) {
+    if stride > w * 4 {
+        for row in frame.chunks_exact_mut(stride).take(h) {
+            let (picture, padding) = row.split_at_mut(w * 4);
+            let last: [u8; 4] = picture[picture.len() - 4..].try_into().expect("4 bytes");
+            for px in padding.as_chunks_mut::<4>().0 {
+                *px = last;
+            }
+        }
+    }
+    let (picture, padding) = frame.split_at_mut(h * stride);
+    let last = &picture[picture.len() - stride..];
+    for row in padding.chunks_exact_mut(stride).take(height - h) {
+        row.copy_from_slice(last);
+    }
+}
+
+#[cfg(test)]
+fn legacy_regrow(active: &mut ActiveVideo, candidate: Option<Rect>) -> Option<Rect> {
+    let outgrown = candidate.is_some_and(|c| !contains(&active.rect, &c));
+    active.outgrown = if outgrown { active.outgrown + 1 } else { 0 };
+    candidate.filter(|_| active.outgrown >= REGROW_FRAMES)
 }
 
 #[cfg(test)]
@@ -616,5 +810,430 @@ mod tests {
         }
         assert_eq!(log.lock().unwrap().len(), before);
         assert!(display.video.is_none());
+    }
+
+    /// The video area copied out in full, with the padding: what the
+    /// encoder must be given.
+    fn expected_frame(display: &Display) -> Vec<u8> {
+        let video = display.video.as_ref().unwrap();
+        let rect = video.rect;
+        let mut data = Vec::new();
+        for y in 0..video.height {
+            let row = display.segment(
+                &display.pixels,
+                rect.y + y.min(rect.h - 1),
+                rect.x,
+                rect.right(),
+            );
+            data.extend_from_slice(row);
+            for _ in rect.w..video.width {
+                data.extend_from_slice(&row[row.len() - 4..]);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn frame_follows_touched_tiles_and_skips_unchanged_ones() {
+        let (mut display, log) = display_with_video();
+        let mut out = Output::text();
+        // The area ends at the screen edge, inside a macroblock: padded.
+        display.resize(630, 470, &mut out);
+        display.flush(&mut out);
+        let rect = Rect::new(384, 320, 246, 150);
+        display.put(rect.x, rect.y, rect.w, rect.h, &noise(1, rect.w, rect.h));
+        display.flush(&mut out);
+        display.start_video(rect, Instant::now(), &mut out);
+        display.dirty.fill(false);
+        assert_eq!(display.video.as_ref().unwrap().width, 256);
+        assert_eq!(display.video.as_ref().unwrap().height, 160);
+        assert_eq!(
+            display.video.as_ref().unwrap().frame,
+            expected_frame(&display)
+        );
+        assert_eq!(log.lock().unwrap().len(), 1);
+
+        // A small change inside one tile.
+        let tile = ((rect.y / TILE + 1) * display.tile_cols + rect.x / TILE + 1) as usize;
+        let motion = display.motion.clone();
+        display.put(rect.x + 70, rect.y + 70, 10, 10, &noise(2, 10, 10));
+        display.flush(&mut out);
+        assert_eq!(log.lock().unwrap().len(), 2);
+        assert_eq!(
+            display.video.as_ref().unwrap().frame,
+            expected_frame(&display)
+        );
+        for (i, (before, after)) in motion.iter().zip(&display.motion).enumerate() {
+            assert_eq!(after > before, i == tile, "tile {i}");
+        }
+
+        // The same pixels again: touched, but unchanged.
+        display.put(rect.x + 70, rect.y + 70, 10, 10, &noise(2, 10, 10));
+        display.flush(&mut out);
+        assert_eq!(log.lock().unwrap().len(), 2);
+
+        // Two tiles touched, only the right one changed.
+        let mut data = Vec::new();
+        for y in rect.y..rect.y + 10 {
+            data.extend_from_slice(display.segment(&display.pixels, y, rect.x, rect.x + 64));
+            data.extend_from_slice(&noise(y, 64, 1));
+        }
+        let motion = display.motion.clone();
+        display.put(rect.x, rect.y, 128, 10, &data);
+        display.flush(&mut out);
+        assert_eq!(log.lock().unwrap().len(), 3);
+        assert_eq!(
+            display.video.as_ref().unwrap().frame,
+            expected_frame(&display)
+        );
+        let right = ((rect.y / TILE) * display.tile_cols + rect.x / TILE + 1) as usize;
+        for (i, (before, after)) in motion.iter().zip(&display.motion).enumerate() {
+            assert_eq!(after > before, i == right, "tile {i}");
+        }
+
+        // The bottom right corner: the padding follows.
+        display.put(620, 460, 10, 10, &noise(3, 10, 10));
+        display.flush(&mut out);
+        assert_eq!(log.lock().unwrap().len(), 4);
+        assert_eq!(
+            display.video.as_ref().unwrap().frame,
+            expected_frame(&display)
+        );
+    }
+
+    fn active(rect: Rect) -> ActiveVideo {
+        let config = EncoderConfig {
+            codec: VideoCodec::H264,
+            width: rect.w.next_multiple_of(16),
+            height: rect.h.next_multiple_of(16),
+            fps: FPS,
+            bitrate_kbps: 1000,
+        };
+        ActiveVideo {
+            rect,
+            width: config.width,
+            height: config.height,
+            encoder: Mutex::new(Box::new(FakeEncoder {
+                log: EncodeLog::default(),
+                config,
+            })),
+            started: Instant::now(),
+            last_change: Instant::now(),
+            frame: Vec::new(),
+            outgrown: 0,
+            outgrown_area: None,
+            settled: 0,
+            frames: 0,
+            bytes: 0,
+        }
+    }
+
+    const SCREEN: (u32, u32) = (5120, 5120);
+
+    #[test]
+    fn video_is_not_restarted_while_the_busy_area_keeps_growing() {
+        let mut video = active(Rect::new(640, 640, 640, 640));
+        // One more tile row every fourth frame.
+        let candidate = |frame: u32| Rect::new(640, 640, 640, 640 + (frame / 4 + 1) * TILE);
+        for frame in 1..MAX_OUTGROWN_FRAMES {
+            assert_eq!(
+                video.regrow(Some(candidate(frame)), SCREEN),
+                None,
+                "frame {frame}"
+            );
+        }
+        // Not forever: the area so far, extended by as much again below.
+        let last = candidate(MAX_OUTGROWN_FRAMES);
+        let rect = video.regrow(Some(last), SCREEN).unwrap();
+        assert_eq!(rect, Rect::new(640, 640, 640, 2 * last.h - 640));
+    }
+
+    #[test]
+    fn video_is_restarted_once_the_busy_area_settles() {
+        let mut video = active(Rect::new(640, 640, 640, 640));
+        // A tile more on the left and below.
+        let grown = Rect::new(576, 640, 704, 704);
+        for frame in 1..=SETTLE_FRAMES {
+            // Edge tiles flicker in and out: still within the grown area.
+            let candidate = if frame % 3 == 0 {
+                Rect::new(576, 640, 640, 704)
+            } else {
+                grown
+            };
+            assert_eq!(video.regrow(Some(candidate), SCREEN), None, "frame {frame}");
+        }
+        // Extended by one more tile on those sides.
+        let restarted = video.regrow(Some(grown), SCREEN);
+        assert_eq!(restarted, Some(Rect::new(512, 640, 768, 768)));
+    }
+
+    #[test]
+    fn busy_area_back_inside_the_video_resets_the_count() {
+        let mut video = active(Rect::new(640, 640, 640, 640));
+        let grown = Rect::new(640, 640, 704, 640);
+        for _ in 0..SETTLE_FRAMES {
+            assert_eq!(video.regrow(Some(grown), SCREEN), None);
+        }
+        assert_eq!(video.regrow(None, SCREEN), None);
+        assert_eq!(
+            video.regrow(Some(Rect::new(640, 640, 64, 64)), SCREEN),
+            None
+        );
+        for _ in 0..SETTLE_FRAMES {
+            assert_eq!(video.regrow(Some(grown), SCREEN), None);
+        }
+        assert!(video.regrow(Some(grown), SCREEN).is_some());
+    }
+
+    #[test]
+    fn video_follows_a_busy_area_that_moved() {
+        let mut video = active(Rect::new(0, 0, 640, 640));
+        let elsewhere = Rect::new(1280, 1280, 640, 640);
+        let mut restarted = None;
+        for _ in 0..REGROW_FRAMES + SETTLE_FRAMES {
+            restarted = restarted.or(video.regrow(Some(elsewhere), SCREEN));
+        }
+        assert_eq!(restarted, Some(elsewhere));
+    }
+
+    /// Starts of the video stream while a busy window grows from 832×960 to
+    /// 1280×2176 over three seconds at 30 frames per second, then plays on
+    /// for two seconds; frames are flushed like `Display::flush` does
+    /// (without the time-based decay, so the run is deterministic).
+    fn starts_while_growing(legacy: bool) -> usize {
+        let (mut display, _) = display_with_video();
+        let mut out = Output::text();
+        display.resize(1600, 2400, &mut out);
+        display.dirty.fill(false);
+        let (x, y) = (64, 64);
+        // Alternating content: the same noise, shifted by one pixel.
+        let content = noise(1, 1280, 2176 + 1);
+        crate::video::LEGACY.set(legacy);
+        let mut starts = 0;
+        for frame in 0..150u32 {
+            let t = frame.min(90) as f32 / 90.0;
+            let w = (832.0 + 448.0 * t) as u32 & !1;
+            let h = (960.0 + 1216.0 * t) as u32 & !1;
+            let shift = (frame % 2) as usize * 4;
+            display.put(x, y, w, h, &content[shift..][..(w * h * 4) as usize]);
+            let mut out = Output::text();
+            display.update_video(&mut out);
+            starts += out.matches("5.video,").count();
+            // The image diff: tiles outside the video go as images.
+            for ty in 0..display.tile_rows {
+                for tx in 0..display.tile_cols {
+                    let i = (ty * display.tile_cols + tx) as usize;
+                    if display.dirty[i] && !display.tile_in_video(tx, ty) {
+                        display.motion[i] += 1.0;
+                    }
+                }
+            }
+            display.dirty.fill(false);
+        }
+        crate::video::LEGACY.set(false);
+        starts
+    }
+
+    /// Content of a playing video: gradients moving at different speeds
+    /// over a fixed texture.
+    fn movie_frame(w: u32, h: u32, index: u32) -> Vec<u8> {
+        (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let texture = ((x * 7) ^ (y * 13)) as u8 & 0x1f;
+                [
+                    ((x + 6 * index) / 4) as u8 ^ texture,
+                    ((y + 3 * index) / 5) as u8,
+                    ((x + y + 9 * index) / 3) as u8,
+                    255,
+                ]
+            })
+            .collect()
+    }
+
+    /// Passes frames on and adds up the time spent in the encoder.
+    struct Timed {
+        inner: Box<dyn VideoEncoder>,
+        spent: Arc<Mutex<Duration>>,
+    }
+
+    impl VideoEncoder for Timed {
+        fn codec(&self) -> VideoCodec {
+            self.inner.codec()
+        }
+
+        fn encode(&mut self, rgba: &[u8], force_key: bool) -> Result<EncodedFrame, VideoError> {
+            let start = Instant::now();
+            let result = self.inner.encode(rgba, force_key);
+            *self.spent.lock().unwrap() += start.elapsed();
+            result
+        }
+    }
+
+    /// Time per frame of the video phase of a flush (preparing the frame
+    /// and encoding it) with the encoders found here, before GH-37 and now:
+    ///
+    /// `cargo test --release -p molcajete-daemon display::video::tests::video_phase_speed -- --ignored --nocapture --test-threads=1`
+    ///
+    /// For each backend and area size it prints the median over the delta
+    /// frames and over the key frames of the whole phase, and of the part
+    /// spent in `VideoEncoder::encode` (RGBA to YUV conversion included).
+    #[test]
+    #[ignore = "benchmark"]
+    fn video_phase_speed() {
+        use crate::video::VideoEncoders;
+
+        let encoders = VideoEncoders::detect(None);
+        eprintln!("{}", encoders.describe());
+        let wanted = [
+            (VideoCodec::H265, "VideoToolbox"),
+            (VideoCodec::H264, "VideoToolbox"),
+            (VideoCodec::H264, "libx264"),
+        ];
+        const DELTA: usize = 30;
+        const KEYS: usize = 5;
+        let median = |mut times: Vec<Duration>| {
+            times.sort();
+            times[times.len() / 2].as_secs_f64() * 1000.0
+        };
+        for (codec, name) in wanted {
+            let Some(backend) = encoders
+                .backends_for(codec)
+                .find(|b| b.name().contains(name))
+                .cloned()
+            else {
+                eprintln!("{name} {codec:?}: not available here");
+                continue;
+            };
+            for (w, h) in [(1920, 1080), (1344, 2176)] {
+                let movie: Vec<Vec<u8>> = (0..8).map(|i| movie_frame(w, h, i)).collect();
+                let mut results = Vec::new();
+                for legacy in [true, false] {
+                    let spent = Arc::new(Mutex::new(Duration::ZERO));
+                    let mut display = Display::new(
+                        ImageFormats {
+                            jpeg: true,
+                            zstd: false,
+                        },
+                        false,
+                    );
+                    let (backend, factory_spent) = (backend.clone(), spent.clone());
+                    display.enable_video(
+                        vec![(codec, u64::MAX)],
+                        Box::new(move |config| {
+                            Ok(Box::new(Timed {
+                                inner: backend.create(config)?,
+                                spent: factory_spent.clone(),
+                            }))
+                        }),
+                    );
+                    let mut out = Output::text();
+                    display.resize(2560, 2304, &mut out);
+                    let rect = Rect::new(64, 64, w, h);
+                    display.put(rect.x, rect.y, w, h, &movie[0]);
+                    display.dirty.fill(false);
+                    crate::video::LEGACY.set(legacy);
+                    display.start_video(rect, Instant::now(), &mut out);
+                    let measure = |display: &mut Display, index: usize, key: bool| {
+                        display.put(rect.x, rect.y, w, h, &movie[index % movie.len()]);
+                        *spent.lock().unwrap() = Duration::ZERO;
+                        let mut out = Output::text();
+                        let start = Instant::now();
+                        if key {
+                            display.video_frame(Instant::now(), true, &mut out);
+                        } else {
+                            display.update_video(&mut out);
+                        }
+                        let total = start.elapsed();
+                        assert!(display.video.is_some() && !out.is_empty());
+                        display.dirty.fill(false);
+                        (total, *spent.lock().unwrap())
+                    };
+                    let delta: Vec<_> = (1..=DELTA)
+                        .map(|i| measure(&mut display, i, false))
+                        .collect();
+                    let keys: Vec<_> = (1..=KEYS).map(|i| measure(&mut display, i, true)).collect();
+                    crate::video::LEGACY.set(false);
+                    let split = |runs: Vec<(Duration, Duration)>| {
+                        let (total, encode): (Vec<_>, Vec<_>) = runs.into_iter().unzip();
+                        (median(total), median(encode))
+                    };
+                    results.push((split(delta), split(keys)));
+                }
+                let [(old_delta, old_key), (new_delta, new_key)] = results[..] else {
+                    unreachable!()
+                };
+                eprintln!(
+                    "{} {codec:?} {w}x{h}: delta frame {:.2} ms (encode {:.2}) before GH-37, {:.2} ms (encode {:.2}) now; \
+                     key frame {:.2} ms (encode {:.2}) before, {:.2} ms (encode {:.2}) now",
+                    backend.name(),
+                    old_delta.0,
+                    old_delta.1,
+                    new_delta.0,
+                    new_delta.1,
+                    old_key.0,
+                    old_key.1,
+                    new_key.0,
+                    new_key.1,
+                );
+            }
+        }
+    }
+
+    /// Time to bring the frame for the encoder up to date after the whole
+    /// area changed, and after one tile changed, before GH-37 and now:
+    ///
+    /// `cargo test --release -p molcajete-daemon display::video::tests::frame_prep_speed -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "benchmark"]
+    fn frame_prep_speed() {
+        for (w, h) in [(1920, 1080), (1344, 2176)] {
+            let movie: Vec<Vec<u8>> = (0..2).map(|i| movie_frame(w, h, i)).collect();
+            let (mut display, _) = display_with_video();
+            let mut out = Output::text();
+            display.resize(2560, 2304, &mut out);
+            let rect = Rect::new(64, 64, w, h);
+            display.put(rect.x, rect.y, w, h, &movie[0]);
+            display.start_video(rect, Instant::now(), &mut out);
+            let mut video = display.video.take().unwrap();
+            let mut time = |legacy: bool, whole: bool| {
+                let mut times: Vec<Duration> = (1..=40)
+                    .map(|i| {
+                        if whole {
+                            display.put(rect.x, rect.y, w, h, &movie[i % 2]);
+                        } else {
+                            display.put(rect.x + 100, rect.y + 100, 4, 4, &noise(i as u32, 4, 4));
+                        }
+                        let start = Instant::now();
+                        let changed = if legacy {
+                            display.legacy_changed_tiles(&mut video, false)
+                        } else {
+                            display.changed_tiles(&mut video)
+                        };
+                        let elapsed = start.elapsed();
+                        assert!(!changed.is_empty());
+                        display.dirty.fill(false);
+                        elapsed
+                    })
+                    .collect();
+                times.sort();
+                times[times.len() / 2].as_secs_f64() * 1000.0
+            };
+            let (old_whole, new_whole) = (time(true, true), time(false, true));
+            let (old_tile, new_tile) = (time(true, false), time(false, false));
+            eprintln!(
+                "frame prep {w}x{h}: whole area changed {old_whole:.3} ms before GH-37, {new_whole:.3} ms now; \
+                 one tile changed {old_tile:.3} ms before, {new_tile:.3} ms now (median of 40)"
+            );
+        }
+    }
+
+    #[test]
+    fn growing_window_restarts_the_video_rarely() {
+        let before = starts_while_growing(true);
+        let now = starts_while_growing(false);
+        eprintln!("video starts while a window grows: before GH-37 {before}, now {now}");
+        assert!(now <= 2, "{now} starts");
+        assert!(now < before, "{now} starts, {before} before GH-37");
     }
 }
