@@ -185,6 +185,18 @@ The terminal shortcuts ([architecture.md](architecture.md), section 2.10) live i
 | new | stock guacd (SSH, telnet, Kubernetes) | copy and paste shortcuts and toasts; no links; after a click clears the selection, the copy shortcut still copies the previous selection |
 | older | new molcajeted | as before; the underline and the hand pointer show, but links cannot be opened |
 
+### Roles, groups and folders
+
+Permissions are roles, user groups and connection folders ([README](../README.md#users-and-connections)). The gateway migrates the database on startup (`20261126000000_groups_roles_folders`):
+
+- `molcajete_user.is_admin` becomes `molcajete_user.role`: administrators get `admin`, everyone else `user`. The `is_admin` column is dropped, so an older gateway cannot start on the migrated database; back up the database before upgrading if you may need to go back.
+- Existing per-user grants (`molcajete_connection_permission`) are kept as they are; existing connections sit at the top level, outside any folder.
+- New tables: `molcajete_group`, `molcajete_group_member`, `molcajete_connection_group` (folders, with `parent_id`), and grants of folders to users (`molcajete_connection_group_permission`) and of connections and folders to groups (`molcajete_group_connection_permission`, `molcajete_group_connection_group_permission`). `molcajete_connection.parent_id` puts a connection in a folder.
+
+Finding a user's connections uses a recursive query (`WITH RECURSIVE`): PostgreSQL, SQLite 3.8.3+, MySQL 8.0+ or MariaDB 10.2+.
+
+The JSON API keeps `isAdmin` on users (now derived from the role) and accepts it in user requests; scripts that use it keep working. `/api/users` and `/api/groups` (lists only) are open to connection managers, who need them to grant connections.
+
 ## Observability options
 
 Everything is off by default and costs nothing unless enabled (metrics calls are no-ops without a recorder).
