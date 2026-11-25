@@ -516,6 +516,7 @@ async fn fake_guacd() -> (u16, tokio::sync::mpsc::Receiver<Vec<String>>) {
 
 #[tokio::test]
 async fn ticket_links_open_a_session_once() {
+    use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
     let (guacd_port, mut connects) = fake_guacd().await;
@@ -571,6 +572,7 @@ async fn ticket_links_open_a_session_once() {
     assert_eq!(info["name"], "Granted desk");
     assert_eq!(info["protocol"], "rdp");
     assert_eq!(info["dpi"], "120");
+    assert_eq!(info["readOnly"], false);
 
     let addr = app.serve().await;
     let open = |ticket: &str| {
@@ -593,7 +595,6 @@ async fn ticket_links_open_a_session_once() {
     assert_eq!(connect[2], "120", "{connect:?}");
     let first = socket.next().await.unwrap().unwrap();
     assert!(first.to_text().unwrap().starts_with("0.,36."), "{first:?}");
-    drop(socket);
 
     // Once only.
     match open(&ticket).await {
@@ -647,4 +648,57 @@ async fn ticket_links_open_a_session_once() {
     let used = app.audit(&admin, "ticket.use").await;
     assert_eq!(used.len(), 1);
     assert_eq!(used[0]["actorName"], "bob");
+
+    // A session like any other: administrators see it under Active
+    // sessions, and taking the grant away (here with a token) ends it and
+    // puts it in the history.
+    let (status, live) = app
+        .call(Method::GET, "/api/sessions", As::Cookie(&admin), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let live = live.as_array().unwrap();
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0]["username"], "bob");
+    assert_eq!(live[0]["connectionId"], "granted");
+    let (provisioning, _) = app.token(&admin, "provisioning", &[]).await;
+    let (status, body) = app
+        .call(
+            Method::PUT,
+            "/api/connections/granted/access",
+            As::Token(&provisioning),
+            Some(json!({ "users": [], "groups": [] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let close = async {
+        loop {
+            match socket.next().await.expect("a close frame").unwrap() {
+                Message::Close(Some(frame)) => return frame.reason.to_string(),
+                Message::Close(None) => panic!("closed without a status"),
+                _ => continue,
+            }
+        }
+    };
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), close)
+        .await
+        .expect("the tunnel closes");
+    assert_eq!(status, "771");
+    let mut entries = Vec::new();
+    for _ in 0..100 {
+        let (_, history) = app
+            .call(
+                Method::GET,
+                "/api/history?user=bob",
+                As::Cookie(&admin),
+                None,
+            )
+            .await;
+        entries = history["entries"].as_array().unwrap().clone();
+        if !entries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["endReason"], "access_revoked");
 }
