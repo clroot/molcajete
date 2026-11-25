@@ -28,6 +28,8 @@ pub struct Config {
     /// The key stored connection credentials are encrypted with.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub history: HistoryConfig,
     /// Administrators created in the database on startup when no user with
     /// that name exists yet. Existing users and passwords are left alone.
     #[serde(default)]
@@ -304,6 +306,28 @@ pub struct SecretsConfig {
     pub previous_key_files: Vec<PathBuf>,
     #[serde(default)]
     pub previous_keys: Vec<String>,
+}
+
+/// `[history]`: the connection history (closed remote desktop sessions).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryConfig {
+    /// Sessions that ended more than this many days ago are deleted; 0
+    /// keeps them.
+    #[serde(default = "default_history_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_history_retention_days(),
+        }
+    }
+}
+
+fn default_history_retention_days() -> u64 {
+    365
 }
 
 /// Session recording (connections with *Record sessions* on).
@@ -601,6 +625,9 @@ mod tests {
         assert_eq!(config.auth.throttle.username_window_secs, 900);
         let config: Config = toml::from_str("[audit]\nretention_days = 0\n").unwrap();
         assert_eq!(config.audit.retention_days, 0);
+        assert_eq!(config.history.retention_days, 365);
+        let config: Config = toml::from_str("[history]\nretention_days = 30\n").unwrap();
+        assert_eq!(config.history.retention_days, 30);
     }
 
     #[test]

@@ -783,6 +783,8 @@ async fn finish_callback(
         .ok_or_else(|| LoginError::Failed(anyhow!("the callback has no code")))?;
     let identity = oidc.finish(code, pending).await?;
     let user = sign_in(&state.db, &oidc.config, &identity, address).await?;
+    // The provider's groups may have taken connections away.
+    crate::sessions::policy::enforce(state, &user, address).await;
     Ok((user, identity.id_token))
 }
 

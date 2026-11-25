@@ -1,5 +1,5 @@
-//! The audit log: who changed what, who signed in (or failed to), and who
-//! opened a recording.
+//! The audit log: who changed what, who signed in (or failed to), who
+//! opened a recording and who ended a session.
 //!
 //! Handlers describe what happened with an [`Entry`] and pass it to
 //! [`record`] once the change has been made:
@@ -105,6 +105,10 @@ pub mod action {
     /// `rotate-key` re-encrypted stored credentials (`count`) with the
     /// current key (`keyId`).
     pub const SECRETS_ROTATE: &str = "secrets.rotate";
+    /// A live session was ended by an administrator, or because its user
+    /// was disabled, deleted or lost access to the connection (the
+    /// `reason` detail).
+    pub const SESSION_END: &str = "session.end";
 
     pub const ALL: &[&str] = &[
         LOGIN_SUCCESS,
@@ -139,6 +143,7 @@ pub mod action {
         RECORDING_DELETE,
         SECRETS_ENCRYPT,
         SECRETS_ROTATE,
+        SESSION_END,
     ];
 }
 
@@ -149,6 +154,8 @@ pub mod target {
     pub const CONNECTION: &str = "connection";
     pub const FOLDER: &str = "folder";
     pub const RECORDING: &str = "recording";
+    /// A remote desktop session; the id is its tunnel id.
+    pub const SESSION: &str = "session";
 }
 
 /// An audit log entry being described; see the module documentation.

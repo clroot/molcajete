@@ -259,6 +259,11 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// The id of the recording's index entry.
+    pub fn id(&self) -> &str {
+        &self.entry.id
+    }
+
     /// Creates the file and its index entry.
     pub async fn start(
         db: &Database,

@@ -61,6 +61,7 @@ async fn sso(extra: &str) -> Sso {
         db,
         client_reports: false,
         tunnels: Default::default(),
+        sessions: Default::default(),
         oidc: Some(oidc),
     });
     Sso {
@@ -626,6 +627,7 @@ async fn unreachable_provider_is_reported() {
         db: sso.state.db.clone(),
         client_reports: false,
         tunnels: Default::default(),
+        sessions: Default::default(),
         oidc: Some(Oidc::new(config).unwrap()),
     });
     let response = router(state)

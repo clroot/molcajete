@@ -18,6 +18,7 @@ mod proxy;
 mod recording;
 mod secrets;
 mod sensitive;
+mod sessions;
 mod throttle;
 mod tunnel;
 
@@ -31,7 +32,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, RawQuery, Request, State, Web
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use clap::Parser as _;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -88,6 +89,8 @@ pub struct AppState {
     pub client_reports: bool,
     /// Which tunnel each page session opened, for client reports.
     pub tunnels: client_report::Tunnels,
+    /// The remote desktop sessions open right now.
+    pub sessions: Arc<sessions::Registry>,
     /// Single sign-on, when `[oidc]` is configured.
     pub oidc: Option<oidc::Oidc>,
     /// Failed password sign-ins and the Argon2 verification slots.
@@ -237,6 +240,12 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/recordings/{id}/file", get(api::recording_file))
         .route("/audit", get(api::list_audit))
         .route("/audit/actions", get(api::audit_actions))
+        .route(
+            "/sessions",
+            get(sessions::api::list).delete(sessions::api::end_all),
+        )
+        .route("/sessions/{id}", delete(sessions::api::end))
+        .route("/history", get(sessions::api::history))
         .route("/settings", get(client_settings))
         .route(
             "/telemetry/client",
@@ -378,6 +387,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     audit::start_maintenance(db.clone(), config.audit.clone());
+    sessions::history::start_maintenance(db.clone(), config.history.clone());
 
     let state = Arc::new(AppState {
         throttle: throttle::LoginThrottle::new(&config.auth.throttle),
@@ -385,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         client_reports: cli.client_reports,
         tunnels: Default::default(),
+        sessions: Default::default(),
         oidc,
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -410,6 +421,9 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
+
+    /// Live sessions and the connection history (src/tests/live_sessions.rs).
+    mod live_sessions;
 
     struct TestApp {
         router: Router,
@@ -457,6 +471,7 @@ mod tests {
             db,
             client_reports: false,
             tunnels: Default::default(),
+            sessions: Default::default(),
             oidc: None,
         });
         TestApp {

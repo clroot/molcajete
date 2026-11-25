@@ -1,6 +1,6 @@
 //! Storage for users, groups, connections, folders, grants, login sessions,
-//! the index of session recordings and the audit log, in the spirit of
-//! Guacamole's JDBC authentication extensions.
+//! the index of session recordings, the connection history and the audit
+//! log, in the spirit of Guacamole's JDBC authentication extensions.
 //!
 //! One code path serves PostgreSQL, MySQL/MariaDB and SQLite through sqlx's
 //! `Any` driver. Queries are written with `?` placeholders and rewritten for
@@ -12,6 +12,7 @@ mod connections;
 mod folders;
 mod grants;
 mod groups;
+mod history;
 mod oidc;
 mod recordings;
 mod sessions;
@@ -34,6 +35,7 @@ pub use connections::{ConnectionRecord, attributes};
 pub use folders::Folder;
 pub use grants::{Access, Principal, Target};
 pub use groups::{Group, GroupUpdate};
+pub use history::{HistoryEntry, HistoryFilter};
 pub use oidc::PendingLogin;
 pub use recordings::Recording;
 pub use users::{NewUser, Role, User, UserUpdate};
@@ -241,6 +243,7 @@ pub(crate) mod tests {
             .unwrap();
         for table in [
             "molcajete_audit_log",
+            "molcajete_connection_history",
             "molcajete_oidc_login",
             "molcajete_user_identity",
             "molcajete_recording",
@@ -286,6 +289,7 @@ pub(crate) mod tests {
     /// Every table, children first.
     const TABLES: &[&str] = &[
         "molcajete_audit_log",
+        "molcajete_connection_history",
         "molcajete_recording",
         "molcajete_connection_attribute",
         "molcajete_oidc_login",
