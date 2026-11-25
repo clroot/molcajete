@@ -111,10 +111,27 @@ gateway (pod) -> host.orb.internal:4822 -> molcajeted (launchd agent, 127.0.0.1:
 `deploy/nas-nginx.conf` and `deploy/nas-nginx.upstream.inc` are written for an nginx (here on a NAS) in front of a Tailnet-only ingress. Copy both into nginx's `conf.d/` and fill in the domain, the Tailnet IP and the host name.
 
 - `/websocket-tunnel` passes the WebSocket upgrade headers, disables buffering and allows 1 hour of idleness.
+- The client offers two WebSocket subprotocols (`Sec-WebSocket-Protocol: molcajete-binary-v1, guacamole`) and the gateway answers with one. A proxy must pass that header in both directions, as nginx does by default; one that drops it from the request leaves the tunnel on the text protocol, one that drops it from the response makes the browser refuse the connection. With `molcajete-binary-v1` most messages are binary WebSocket frames, which nginx forwards like text ones. Do not let a proxy negotiate `permessage-deflate` on this path: the payload is already compressed images and video.
 - `X-Real-IP` and `X-Forwarded-For` are overwritten with `$remote_addr`, not appended to. The Tailscale ingress in between replaces `X-Forwarded-For` with its own peer address, so the gateway logs `X-Real-IP` first.
 - If nginx runs in Docker with published ports, `$remote_addr` may be the Docker bridge gateway for every client; use host networking to see real client addresses.
 - Authentication is the gateway's login page: users and their Argon2id password hashes are in the database, sessions are `HttpOnly`, `SameSite=Strict` cookies (`Secure` behind `X-Forwarded-Proto: https`). Once public, the remote desktops depend on those passwords: use long ones, and restrict client addresses at the proxy or put single sign-on in front.
 - The proxy must pass `Host` (or `X-Forwarded-Host`) through unchanged: the gateway refuses state-changing requests and tunnels whose `Origin` does not match it.
+
+### Binary tunnel and mixed versions
+
+Our client, the gateway and molcajeted carry image, video and audio data as raw bytes instead of base64 when both ends of a leg support it ([architecture.md](architecture.md), section 2.6): about 25% fewer bytes between molcajeted, gateway and browser, and less work in the browser. Each leg is negotiated per tunnel and falls back to the Guacamole text protocol, so the three components can be upgraded in any order and old and new versions work together:
+
+| Upgraded | Result |
+| --- | --- |
+| gateway only (older client and molcajeted) | text, as before |
+| gateway and web client (they ship together), older molcajeted or stock guacd | binary to the browser; the gateway decodes the daemon's base64 (`framing="transcoded"`) |
+| molcajeted only | text, as before |
+| all three | binary end to end (`framing="binary"`) |
+
+- The gateway logs `framing` in `tunnel established`; molcajeted logs `binary=true` in `connection established`.
+- `[server] binary_tunnel = false` in the gateway configuration turns the extension off for every tunnel. A single session stays on text with `?text` in its URL.
+- A browser tab opened before the upgrade keeps running the old client (text) until it is reloaded.
+- `molcajete_gateway_relayed_bytes_total{direction="to_browser"}` counts what the gateway read from the daemon; with `framing="transcoded"` the browser receives about a quarter less than that.
 
 ## Observability options
 

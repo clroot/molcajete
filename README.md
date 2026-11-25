@@ -139,7 +139,9 @@ neither do clients that don't announce `video/av1`, `video/h265` or
 
 In a session, press **Ctrl+Alt+Shift** for the menu (clipboard, scaling,
 Ctrl+Alt+Del, performance statistics, disconnect). Append `?main` to the URL
-to run the client on the main thread instead of a worker.
+to run the client on the main thread instead of a worker, and `?text` to keep
+the tunnel on the Guacamole text protocol (base64) instead of raw image, video
+and audio data.
 
 Embedding the client in another page:
 
@@ -167,7 +169,7 @@ The gateway can also collect performance reports from the browser
 
 ```sh
 cargo test --workspace                       # unit tests (protocol, gateway, guacd, client logic)
-scripts/build-web.sh                         # then: renderer pixel tests and keyboard/IME tests
+scripts/build-web.sh                         # then: renderer pixel, keyboard/IME and binary tunnel tests
 (cd tests/browser && npm install && npm test)
 (cd tests/browser && node video.test.mjs)    # video decoding (needs ffmpeg with libx264/libsvtav1)
 ```

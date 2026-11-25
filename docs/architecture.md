@@ -69,7 +69,7 @@ Going through the whole guacd source, screen updates consist almost entirely of 
 
 ```
 crates/
-  molcajete-protocol   shared protocol (platform independent): streaming parser, encoder, status codes, typed instructions, video framing
+  molcajete-protocol   shared protocol (platform independent): streaming parser, encoder, status codes, typed instructions, video framing, binary tunnel framing
   molcajete-client     wasm client: WebGL2 renderer, WebCodecs video, input, audio, clipboard, WebSocket tunnel
   molcajete-gateway    Rust web gateway: static files, connection list API, WebSocket ↔ guacd relay
   molcajete-daemon     Rust guacd (molcajeted): handshake, server-side display/encoding, video mode, VNC·SSH·RDP (+audio)
@@ -89,6 +89,8 @@ Possible combinations:
 | stock guacamole-common-js | molcajete-gateway (accepts the `GUAC_*` parameters) | stock guacd or molcajeted |
 | stock web app | Java web app | molcajeted (compatible handshake) |
 
+Between molcajete components, stream data (images, video, audio) travels as raw bytes instead of base64 (section 2.6); every combination with a stock component uses the text protocol on that leg.
+
 ### 2.1 molcajete-protocol
 
 - Incremental byte-level parser. It copes with TCP/WebSocket boundaries in the middle of an instruction or a UTF-8 sequence, and keeps its state so that each byte is looked at once. ASCII runs are skipped in bulk (blobs are mostly base64, so this is fast).
@@ -96,12 +98,13 @@ Possible combinations:
 - `ServerInstruction<'a>`: typed decoding of server → client instructions (string arguments are borrowed).
 - Limits: `Limits::STRICT` (same as guacd, for untrusted input) and `Limits::LENIENT`.
 - `video`: framing of `video` streams (section 2.5). The server's `encode_frame` and the client's `FrameReader` (reassembles frames regardless of blob boundaries) share this code.
+- `binary`: the record framing of the binary tunnel (section 2.6): `RecordWriter` (molcajeted, and the gateway when it decodes for a stock guacd), `RecordReader` (the gateway's TCP side, any split of the byte stream) and the constants the client parses a message with.
 
 ### 2.2 molcajete-gateway
 
 - Built on axum. Serves the JSON API (`/api/auth/*`, `/api/connections`, `/api/users`), `/websocket-tunnel` and the static files (`web/dist`).
 - After the WebSocket upgrade it performs the guacd handshake; on failure it closes with the status code in the close reason (like the Java web app).
-- guacd → browser: the bytes read are cut into instructions by the parser and batched into one message of up to 64 KiB, sent immediately when the next read would block.
+- guacd → browser: the bytes read are cut into instructions by the parser and batched into one message of up to 64 KiB, sent immediately when the next read would block. For a client on the binary subprotocol the messages are binary and made of records instead (section 2.6): records from molcajeted are batched as they are, without looking inside; instructions from a stock guacd are parsed as before and their `blob` data is decoded from base64 on the way.
 - browser → guacd: validated with `Limits::STRICT` and forwarded verbatim. Internal pings are answered directly.
 - Configuration: TOML (`gateway.example.toml`) for the server itself. Users, connections (each may name its own guacd), parameters, permissions and login sessions are stored in PostgreSQL, MySQL/MariaDB or SQLite through sqlx's `Any` driver, with per-dialect migrations in `crates/gateway/migrations/`, like Guacamole's JDBC authentication extensions. Passwords are Argon2id hashes; sessions are cookies whose SHA-256 is stored.
 
@@ -126,7 +129,7 @@ Possible combinations:
 | Unbounded modes (SRC/IN/OUT/RIN/RATOP) | For a single rectangle, the outside is cleared with at most 4 scissor+clear calls. Otherwise a coverage mask drives a "clear outside" pass followed by a "draw inside" pass. |
 | `copy` | Between layers the source texture is sampled directly. Within a layer (scrolling) the region is first copied into a scratch texture with `copyTexSubImage2D`. |
 | `transfer` | ROP shader: applies the 4-bit truth table with integer bit operations to un-premultiplied 8-bit values. SRC uses `blitFramebuffer` (ignores clip and composite mode, like putImageData). |
-| `img` | Decoded with WebCodecs `ImageDecoder` (no colour-space conversion) into a `VideoFrame`; without `ImageDecoder`, Blob + `createImageBitmap`. PNG (IHDR colour type, tRNS) and WebP (VP8/VP8L/VP8X) headers tell whether the image is opaque; opaque images without transform or clip are uploaded straight into the layer texture, the rest go through a reused upload texture and are blended. Uploads are first drawn into a 2D `OffscreenCanvas` (deferred to the GPU process) and that canvas is copied with `texSubImage2D`. |
+| `img` | The encoded image goes to the decoder as a `Uint8Array`: on the binary tunnel a view of the received message when the image arrived in one blob (no copy, and no pass through wasm memory), otherwise one joined array. Decoded with WebCodecs `ImageDecoder` (no colour-space conversion) into a `VideoFrame`; without `ImageDecoder`, Blob + `createImageBitmap`. PNG (IHDR colour type, tRNS) and WebP (VP8/VP8L/VP8X) headers tell whether the image is opaque; opaque images without transform or clip are uploaded straight into the layer texture, the rest go through a reused upload texture and are blended. Uploads are first drawn into a 2D `OffscreenCanvas` (deferred to the GPU process) and that canvas is copied with `texSubImage2D`. |
 | `video` | Unpacks molcajete framing (a 9-byte header per frame + H.264/H.265 Annex B or AV1 OBUs, `molcajete_protocol::video`) into a WebCodecs `VideoDecoder` (`optimizeForLatency`, hardware decoding where available). Each frame takes an image slot in the frame queue, like `img`, filled by the decoder output (`VideoFrame`), so video follows `sync` order and the other drawing instructions. Decoded frames are uploaded to the texture as they are, on the GPU. Decoder errors are reported to the server with an `ack` error and the server falls back to images. |
 | Paths (`arc`/`curve`/`line`/`clip`/`cstroke`/`lfill`) | Arcs and curves are flattened into polylines; fills (nonzero) and strokes are tessellated with lyon. Coverage is drawn into an R8 mask that a shader samples while compositing. |
 | `clip` | Scissor for axis-aligned rectangles, otherwise a per-layer R8 clip mask (intersections by multiplicative blending) |
@@ -149,7 +152,8 @@ Possible combinations:
 
 ### 2.4 molcajeted
 
-- Built on tokio, one task per connection (the original forks a process). The handshake matches the original (`args` advertises `VERSION_1_5_0`; argument names match the original VNC plugin).
+- Built on tokio, one task per connection (the original forks a process). The handshake matches the original (`args` advertises `VERSION_1_5_0`; argument names match the original VNC plugin), with one more name at the end of `args`, `molcajete-binary`, through which a molcajete gateway asks for raw stream data (section 2.6).
+- Everything sent to the client goes through one `Output` (`io.rs`): instructions are appended as text, stream data with `Output::blob`, which writes base64 `blob` instructions of at most 6048 bytes for a stock client and blob records for a molcajete gateway. The protocol code (display, video, audio, clipboard) is the same for both.
 - The server-side display (`display/`) keeps two buffers:
   - `pixels`: the actual screen as reported by the remote protocol
   - `sent`: a copy of the client's layer, built by replaying every instruction we send (fills, images, copies)
@@ -184,9 +188,68 @@ Areas with a lot of motion (video playback, animation, 3D) are expensive even as
 - **Encoders (`video/`).** ffmpeg runs as a child process with RGBA piped in. Nothing is linked, so the GPL x264/x265 pose no licensing problem. Output is read as an AVI container: with a raw elementary stream the end of a frame is only known once the next one starts, which would add a frame of delay, whereas this way each frame in yields its access unit right away. At startup `ffmpeg -encoders` is read and each candidate does a 3-frame trial encode; only working ones are kept. Priority: hardware (NVENC/QSV/VA-API/AMF; on macOS VideoToolbox), ffmpeg software (libsvtav1, libx265, libx264), built-in OpenH264 (cargo feature `openh264`, needs a C++ compiler). Colour space is BT.709 limited range, signalled in the bitstream. VideoToolbox is called directly (`video/videotoolbox.rs`) instead of through ffmpeg's `*_videotoolbox`, because ffmpeg does not wait for VideoToolbox's asynchronous output and each packet would come one frame late; after each frame `VTCompressionSessionCompleteFrames` waits for its packet, which is then converted from length-prefixed NAL units to Annex B with the parameter sets in front of key frames.
 - **Failures.** An encoder error ends video mode and falls back to images; after three failures the session stops trying. A client rejecting the `video` stream or reporting a decoder error with `ack` turns video off the same way.
 
+### 2.6 Binary tunnel (raw stream data)
+
+In the Guacamole protocol stream data is base64 inside `blob` instructions inside text WebSocket messages: 4 bytes on the wire for every 3 of an image, a video frame or an audio packet, on both legs (molcajeted → gateway → browser). In the browser each blob was copied four times: into a JavaScript string by the browser, into wasm as UTF-8, into the parser buffer, and out of the base64 decoder; the finished image was then copied back out for `ImageDecoder`. Between molcajete components the data now stays raw bytes end to end. Only the server → client direction changes; what the client sends (input, acknowledgements, clipboard and `argv` streams) is small and stays text.
+
+**Records** (`molcajete_protocol::binary`). The server → client stream becomes a sequence of records:
+
+```
+record = tag (1 byte)  length (4 bytes, unsigned, little endian)  body (length bytes)
+
+tag 0x00  instructions   body = Guacamole protocol text (UTF-8), whole instructions
+tag 0x01  blob           body = stream index (4 bytes, unsigned, little endian) + raw data
+                         same meaning as blob,<stream>,<base64 of data>;
+other     skipped by readers (room for later additions)
+```
+
+- The instruction records, concatenated, are the ordinary instruction stream without its `blob` instructions; a blob record applies at its position in that stream. `img`, `video`, `audio`, `end` and `ack` are unchanged.
+- Consecutive blob records of a stream are equivalent to one with the data joined. Writers keep a record within 64 KiB (`MAX_WRITTEN_RECORD`), so an image up to that size is one blob instead of one per 6048 bytes, and larger data is split (PCM only between whole sample frames). Readers accept bodies up to 16 MiB.
+- On TCP (molcajeted → gateway) the records follow each other in the byte stream, starting right after the `;` of `ready`. On the WebSocket every binary message holds whole records.
+
+**Negotiation.** Each leg is negotiated on its own, and each falls back to the text protocol when the peer does not know the extension:
+
+- Browser ⇄ gateway: the client offers the WebSocket subprotocols `molcajete-binary-v1, guacamole`. The gateway selects the first one it supports; an older gateway, or one with `[server] binary_tunnel = false`, selects `guacamole`. The stock guacamole-common-js client offers only `guacamole` and gets exactly the stock tunnel. Under the binary subprotocol the data from the server arrives in binary messages; the tunnel's own messages (UUID, ping replies) are still text messages, and the client handles either kind at any time.
+- Gateway ⇄ molcajeted: molcajeted lists the connection parameter `molcajete-binary` last in `args`. A gateway whose browser selected the binary subprotocol answers `1` in `connect`, and molcajeted switches to records after `ready`. In every other case the gateway sends an empty value (a connection parameter of that name in the database is ignored), as does the stock web application for a parameter it has no setting for, and molcajeted sends base64 like guacd. Stock guacd never lists the parameter and is sent nothing it does not know. (`video` mimetypes are announced the same way: something only molcajete peers act on.)
+
+| Browser | Daemon | Browser ⇄ gateway | Gateway ⇄ daemon |
+|---|---|---|---|
+| molcajete-client | molcajeted | binary (records forwarded) | records |
+| molcajete-client | stock guacd | binary (gateway decodes base64) | text |
+| stock guacamole-common-js | molcajeted | text | text |
+| stock guacamole-common-js | stock guacd | text | text |
+| stock web application (Java) | molcajeted | — | text |
+
+The gateway logs the mode of every tunnel as `framing` (`binary`, `transcoded`, `text`) in `tunnel established`, and molcajeted logs `binary` in `connection established`. Appending `?text` to the session URL keeps a client on the text protocol, for comparisons.
+
+**Why records, and not binary messages for blobs only.** Carrying each blob as its own binary WebSocket message between text messages would have been the smallest change, but a text message cannot continue across a blob: a frame with *n* images would take about 2*n* messages where the gateway sent one or two, and each message is a task in the browser. With everything in records one message still carries a whole batch (up to about 64 KiB), the gateway forwards molcajeted's records without parsing instructions at all, and the client finds each part from its 5-byte header instead of scanning. The record size is capped, rather than sending an image of any size as one record, because the client treats 15 s without a message as a dead tunnel and a message only counts once it has arrived completely: bounded messages keep arriving on a slow link. A fully binary encoding of the instructions themselves was not worth it: outside the blobs the stream is a few percent of the bytes, and keeping it as text keeps one parser and one instruction encoder for both modes.
+
+**In the client.** A binary message is an `ArrayBuffer`. The client reads each record header through a typed-array view, copies instruction text straight into the parser buffer (`Parser::feed_with`), and keeps stream data as views of the message:
+
+- images: a single-blob image is handed to `ImageDecoder` as that view; an image in several blobs is joined once into a new array. Only the first 2 KiB enter wasm, to tell from the header whether the image is opaque.
+- video: frames that lie whole within a blob (molcajeted starts each frame in a new record) go to `EncodedVideoChunk` as views; a frame larger than a record is reassembled by `FrameReader` as before.
+- audio: PCM is copied once, into wasm for Web Audio or, in worker mode, into a buffer of its own that is transferred to the page (transferring the message itself would detach the image views).
+
+The worker and main-thread modes share all of this; the text path (`String` → parser → base64 decoder) is still there for stock guacd behind an older gateway and for recordings.
+
+**Compression.** WebSocket `permessage-deflate` is not in use and must stay that way for these payloads, which are already compressed: tungstenite (0.29, under axum 0.8) does not implement the extension, so the gateway never answers the browser's offer with `Sec-WebSocket-Extensions`. A test checks this for every tunnel mode. A reverse proxy passes WebSocket frames through unchanged.
+
+**Effect on the wire.** `display::bench` runs fixed scenarios on a 5K screen through the display twice, once per output mode (`cargo test --release -p molcajete-daemon display::bench -- --ignored --nocapture --test-threads=1`, the `wire` lines). Bytes and blobs per frame, molcajeted → gateway and, forwarded unchanged, gateway → browser:
+
+| Scenario | Text | Binary | Change |
+|---|---|---|---|
+| `scroll` (document scrolls) | 44.2 kB in 6.2 blobs | 33.1 kB in 1.0 blobs | −25.1% |
+| `drag` (window dragged) | 66.9 kB in 11.4 blobs | 50.3 kB in 4.5 blobs | −24.9% |
+| `corners` (two small changes) | 23.3 kB in 4.1 blobs | 17.5 kB in 2.0 blobs | −25.0% |
+| `page` (full page of new text) | 1151.1 kB in 149.6 blobs | 861.8 kB in 16.9 blobs | −25.1% |
+| `scatter` (40 small changes) | 173.6 kB in 39.0 blobs | 130.7 kB in 33.3 blobs | −24.7% |
+
+The binary stream is 0.2–3% larger than the encoded images themselves (record headers and the instructions around them).
+
 ## 3. Verification
 
-- Unit tests: protocol (every split point, code point lengths, limits, invalid UTF-8), gateway (fake guacd handshake, error mapping, query parsing), daemon (handshake, display merging/copy ordering/blob splitting, PNG round trips), client logic (path tessellation area, keysyms, key release pairing, wheel, PCM).
+- Unit tests: protocol (every split point, code point lengths, limits, invalid UTF-8, binary records at every split point), gateway (fake guacd handshake, error mapping, query parsing, tunnels of all four client/daemon combinations through a real WebSocket), daemon (handshake with and without the binary parameter, display merging/copy ordering/blob splitting, the same frame as text and as records, PNG round trips), client logic (path tessellation area, keysyms, key release pairing, wheel, PCM).
+- Binary tunnel in the browser (`tests/browser/binary.test.mjs`): a stand-in gateway sends one frame over a real WebSocket (a PNG larger than a record, a PNG with transparency, a JPEG, PCM audio and an H.264 stream cut at arbitrary points) as records to a client offering the binary subprotocol and as base64 instructions to one that does not, in worker and main-thread mode; all four must show the same pixels.
 - Browser pixel tests (`tests/browser`): 22 scenarios checked against the canvas reference implementation.
 - End-to-end in real environments: with guacd 1.6 + x11vnc (xterm/xclock/xeyes), display, key input (Shift combinations) and mouse tracking; with guacd 1.6 + OpenSSH, colours, bold text, Hangul, scroll bars, drag selection and clipboard. The same items were checked on the all-Rust path (wasm client → molcajete-gateway → molcajeted → x11vnc), worker mode included.
 - molcajeted SSH: colours (16/256/true colour), bold, Hangul (in output and on the input command line), full-screen apps such as `top`/vi, fast scrolling, drag selection → clipboard, wheel scrollback, resizing, and error mapping (wrong password, closed port, host-key mismatch). On the stock guacd path Hangul on the input command line was garbled; molcajeted displays it correctly because its default terminal type is `xterm-256color`.
@@ -276,7 +339,8 @@ A 640×360 video (`mandelbrot`, a zooming fractal) was played on the desktop wit
 4. Gateway: authentication providers (OIDC/LDAP/DB), connection permissions, TLS to guacd, HTTP tunnel (for environments without WebSocket)
 5. Renderer: batching solid fills, a WebGPU backend (`copyExternalImageToTexture`/`importExternalTexture` to cut upload costs; only `Renderer` needs replacing), context loss recovery
 6. molcajeted encoding: frame pacing from a measured link rate and per-connection limits (the byte budget is a fixed 8 MiB/s), parallel encoding, lossy WebP (as in guacd 1.6)
-7. Video mode
+7. Binary tunnel: client → server streams (clipboard, and file upload or audio input once they exist) are still base64 text; the gateway forwards records from molcajeted without checking the instructions inside.
+8. Video mode
    - Hardware encoders (NVENC/QSV/VA-API/AMF) are wired up but not verified on real hardware. VideoToolbox is verified on Apple M4.
    - Forced key frames restart ffmpeg, which costs an extra 25–45 ms.
    - Build the client codec string exactly from the SPS/sequence header (currently a generous fixed value).
