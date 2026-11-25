@@ -126,6 +126,22 @@ impl Parser {
         self.buf.extend_from_slice(data);
     }
 
+    /// Appends `len` received bytes that `fill` writes into the given slice,
+    /// which saves a copy when the data lives outside Rust memory (a
+    /// JavaScript `ArrayBuffer`).
+    pub fn feed_with(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) {
+        self.compact();
+        let end = self.buf.len();
+        self.buf.resize(end + len, 0);
+        fill(&mut self.buf[end..]);
+    }
+
+    /// The buffered bytes that do not yet form a complete instruction, for
+    /// handing a connection over to another framing after a handshake.
+    pub fn pending(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
     /// Number of buffered bytes that do not yet form a complete instruction.
     pub fn pending_len(&self) -> usize {
         self.buf.len() - self.start
@@ -463,6 +479,19 @@ mod tests {
         assert_eq!(raw.as_str(), "4.sync,4.1234;");
         assert!(parser.next_raw().unwrap().is_none());
         assert_eq!(parser.pending_len(), "5.mouse,1.1".len());
+    }
+
+    #[test]
+    fn feed_with_appends_like_feed() {
+        let mut parser = Parser::new();
+        parser.feed(b"4.sync,4.1234;5.mou");
+        assert!(parser.next_raw().unwrap().is_some());
+        assert_eq!(parser.pending(), b"5.mou");
+        parser.feed_with(8, |out| out.copy_from_slice(b"se,1.1;7"));
+        let raw = parser.next_raw().unwrap().unwrap();
+        assert_eq!(raw.as_str(), "5.mouse,1.1;");
+        assert!(parser.next_raw().unwrap().is_none());
+        assert_eq!(parser.pending(), b"7");
     }
 
     #[test]
