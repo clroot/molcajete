@@ -66,8 +66,8 @@ export default function ActiveSessionsPage({currentUser}: {currentUser: User}) {
   const owners = new Map(sessions.status === 'ready' ? sessions.data.map(s => [s.id, s.username]) : []);
   const joinedAs = (s: LiveSession) => {
     const owner = (s.joinedTo && owners.get(s.joinedTo)) ?? 'another user';
-    if (s.joinKind === 'shadow') return `Watching ${owner}'s session`;
-    return `${s.readOnly ? 'Watching' : 'Controlling'} ${owner}'s session through a link`;
+    if (s.joinKind === 'shadow') return `Watching ${owner}`;
+    return `${s.readOnly ? 'Watching' : 'Controlling'} ${owner} (link)`;
   };
 
   const columns: TableColumn<LiveSession>[] = [
@@ -140,7 +140,7 @@ export default function ActiveSessionsPage({currentUser}: {currentUser: User}) {
       key: 'actions',
       header: 'Actions',
       align: 'end',
-      width: pixel(170),
+      width: pixel(160),
       renderCell: s => (
         <HStack hAlign="end" gap={2} vAlign="center">
           {s.joinKind === null && s.userId !== currentUser.id && (
