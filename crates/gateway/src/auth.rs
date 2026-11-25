@@ -5,6 +5,10 @@
 //! must be JSON (cross-site forms cannot send that without a CORS
 //! preflight) and, like the WebSocket tunnel, come from the gateway's own
 //! origin when the browser says where they come from.
+//!
+//! Requests with an API token (`Authorization: Bearer …`) are
+//! authenticated by [`crate::tokens`] instead; the extractors here take the
+//! token's owner from the request then.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -21,6 +25,7 @@ use sha2::{Digest as _, Sha256};
 use crate::AppState;
 use crate::api::ApiError;
 use crate::db::{DbError, Role, User};
+use crate::tokens::TokenAuth;
 
 pub const SESSION_COOKIE: &str = "molcajete_session";
 pub const MIN_PASSWORD_LENGTH: usize = 8;
@@ -122,7 +127,11 @@ impl FromRequestParts<Arc<AppState>> for ClientAddress {
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let client = crate::proxy::Client::from_request_parts(parts, state).await?;
-        Ok(Self(client.display))
+        // What is done with an API token says which one.
+        Ok(Self(match parts.extensions.get::<TokenAuth>() {
+            Some(auth) => format!("{} (API token {:?})", client.display, auth.token.name),
+            None => client.display,
+        }))
     }
 }
 
@@ -167,7 +176,17 @@ pub async fn user_from_headers(state: &AppState, headers: &HeaderMap) -> Result<
     }
 }
 
-/// The signed-in user; rejects the request with 401 otherwise.
+/// The owner of the request's API token (see [`crate::tokens`]), otherwise
+/// the user of the session cookie.
+async fn user_from_parts(state: &AppState, parts: &Parts) -> Result<User, ApiError> {
+    match parts.extensions.get::<TokenAuth>() {
+        Some(auth) => Ok(auth.user.clone()),
+        None => user_from_headers(state, &parts.headers).await,
+    }
+}
+
+/// The signed-in user (or an API token's owner); rejects the request with
+/// 401 otherwise.
 pub struct CurrentUser(pub User);
 
 impl FromRequestParts<Arc<AppState>> for CurrentUser {
@@ -177,14 +196,14 @@ impl FromRequestParts<Arc<AppState>> for CurrentUser {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        user_from_headers(state, &parts.headers).await.map(Self)
+        user_from_parts(state, parts).await.map(Self)
     }
 }
 
 /// The signed-in user if their effective role is at least `role`; 401 when
 /// signed out, 403 for users with a lesser role.
 async fn user_with_role(parts: &Parts, state: &AppState, role: Role) -> Result<User, ApiError> {
-    let user = user_from_headers(state, &parts.headers).await?;
+    let user = user_from_parts(state, parts).await?;
     if user.effective_role < role {
         return Err(ApiError::forbidden(role));
     }

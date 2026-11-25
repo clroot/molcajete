@@ -30,6 +30,8 @@ pub struct Config {
     pub secrets: SecretsConfig,
     #[serde(default)]
     pub history: HistoryConfig,
+    #[serde(default)]
+    pub api_tokens: ApiTokensConfig,
     /// Administrators created in the database on startup when no user with
     /// that name exists yet. Existing users and passwords are left alone.
     #[serde(default)]
@@ -327,6 +329,27 @@ impl Default for HistoryConfig {
 }
 
 fn default_history_retention_days() -> u64 {
+    365
+}
+
+/// `[api_tokens]`: bearer tokens for automation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiTokensConfig {
+    /// The longest a token may be valid, in days from its creation.
+    #[serde(default = "default_token_lifetime_days")]
+    pub max_lifetime_days: u64,
+}
+
+impl Default for ApiTokensConfig {
+    fn default() -> Self {
+        Self {
+            max_lifetime_days: default_token_lifetime_days(),
+        }
+    }
+}
+
+fn default_token_lifetime_days() -> u64 {
     365
 }
 
@@ -657,6 +680,7 @@ mod tests {
         assert!(config.server.trusted_proxies.is_empty());
         assert_eq!(config.auth.throttle.address_failures, 10);
         assert_eq!(config.auth.throttle.username_window_secs, 900);
+        assert_eq!(config.api_tokens.max_lifetime_days, 365);
         let config: Config = toml::from_str("[audit]\nretention_days = 0\n").unwrap();
         assert_eq!(config.audit.retention_days, 0);
         assert_eq!(config.history.retention_days, 365);

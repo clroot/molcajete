@@ -1,5 +1,6 @@
 //! The audit log: who changed what, who signed in (or failed to), who
-//! opened a recording and who ended a session.
+//! opened a recording, who ended a session, and what API tokens and
+//! one-time session links did.
 //!
 //! Handlers describe what happened with an [`Entry`] and pass it to
 //! [`record`] once the change has been made:
@@ -109,6 +110,17 @@ pub mod action {
     /// was disabled, deleted or lost access to the connection (the
     /// `reason` detail).
     pub const SESSION_END: &str = "session.end";
+    /// An API token was created (by its owner).
+    pub const TOKEN_CREATE: &str = "token.create";
+    /// An API token was revoked, by its owner or an administrator.
+    pub const TOKEN_REVOKE: &str = "token.revoke";
+    /// An API token was used: the first time, from a new address, or for
+    /// the first time after an hour without use. Not every request.
+    pub const TOKEN_USE: &str = "token.use";
+    /// A one-time session link was made for a connection.
+    pub const TICKET_CREATE: &str = "ticket.create";
+    /// A one-time session link opened its connection.
+    pub const TICKET_USE: &str = "ticket.use";
 
     pub const ALL: &[&str] = &[
         LOGIN_SUCCESS,
@@ -144,6 +156,11 @@ pub mod action {
         SECRETS_ENCRYPT,
         SECRETS_ROTATE,
         SESSION_END,
+        TOKEN_CREATE,
+        TOKEN_REVOKE,
+        TOKEN_USE,
+        TICKET_CREATE,
+        TICKET_USE,
     ];
 }
 
@@ -156,6 +173,7 @@ pub mod target {
     pub const RECORDING: &str = "recording";
     /// A remote desktop session; the id is its tunnel id.
     pub const SESSION: &str = "session";
+    pub const TOKEN: &str = "token";
 }
 
 /// An audit log entry being described; see the module documentation.

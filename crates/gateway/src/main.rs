@@ -20,6 +20,9 @@ mod secrets;
 mod sensitive;
 mod sessions;
 mod throttle;
+#[cfg(test)]
+mod token_flow_tests;
+mod tokens;
 mod tunnel;
 
 use std::net::SocketAddr;
@@ -157,12 +160,13 @@ async fn websocket_tunnel(
         .on_upgrade(move |socket| tunnel::serve(socket, state, request, connection))
 }
 
-/// Requests that change state must come from our own origin.
+/// Requests that change state must come from our own origin, unless an
+/// API token authenticates them (see `tokens`).
 async fn same_origin_guard(request: Request, next: Next) -> Response {
     let safe = matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
-    );
+    ) || request.extensions().get::<tokens::TokenAuth>().is_some();
     if safe || auth::same_origin(request.headers()) {
         next.run(request).await
     } else {
@@ -204,6 +208,8 @@ fn router(state: Arc<AppState>) -> Router {
                 .delete(api::delete_connection),
         )
         .route("/connections/{id}/parent", put(api::move_connection))
+        .route("/tokens", get(tokens::list).post(tokens::create))
+        .route("/tokens/{id}", delete(tokens::revoke))
         .route(
             "/connections/{id}/access",
             get(api::get_connection_access).put(api::set_connection_access),
@@ -258,6 +264,10 @@ fn router(state: Arc<AppState>) -> Router {
         )
         .fallback(|| async { ApiError::not_found() })
         .layer(middleware::from_fn(same_origin_guard))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            tokens::authenticate,
+        ))
         // API responses carry per-user data.
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
