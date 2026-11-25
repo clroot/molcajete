@@ -71,6 +71,12 @@ struct Sample {
     image_decode_ms_avg: Option<f64>,
     #[serde(default)]
     image_decode_ms_max: f64,
+    /// Time from applying a frame to having drawn it to the canvas. Absent
+    /// from older clients, null for a second in which no frame was drawn.
+    #[serde(default)]
+    frame_present_ms_avg: Option<f64>,
+    #[serde(default)]
+    frame_present_ms_max: f64,
     #[serde(default)]
     rtt_ms: Option<f64>,
     #[serde(default)]
@@ -131,6 +137,7 @@ pub async fn receive(
     let frame_receive = histogram!("molcajete_client_frame_receive_seconds", &labels);
     let decode = histogram!("molcajete_client_image_decode_seconds", &labels);
     let images = histogram!("molcajete_client_images_ops", &labels);
+    let present = histogram!("molcajete_client_frame_present_seconds", &labels);
 
     let n = report.samples.len() as f64;
     let mut sum = Summary::default();
@@ -144,6 +151,9 @@ pub async fn receive(
         if let Some(v) = s.image_decode_ms_avg.filter(|_| s.images_per_second > 0.0) {
             decode.record(ms(v));
             images.record(clean(s.images_per_second));
+        }
+        if let Some(v) = s.frame_present_ms_avg {
+            present.record(ms(v));
         }
         if let Some(r) = s.rtt_ms {
             rtt.record(ms(r));
@@ -171,6 +181,8 @@ pub async fn receive(
         frame_receive_ms_max = sum.receive_max,
         images_per_s = sum.images / n,
         image_decode_ms_max = sum.decode_max,
+        frame_present_ms_avg = (sum.present_n > 0).then(|| sum.present / sum.present_n as f64),
+        frame_present_ms_max = sum.present_max,
         rtt_ms_avg = (sum.rtt_n > 0).then(|| sum.rtt / sum.rtt_n as f64),
         queued_ops_max = sum.queued_max,
         send_buffered_max = sum.buffered_max,
@@ -194,6 +206,9 @@ struct Summary {
     receive_max: f64,
     images: f64,
     decode_max: f64,
+    present: f64,
+    present_n: u32,
+    present_max: f64,
     rtt: f64,
     rtt_n: u32,
     queued_max: f64,
@@ -217,11 +232,47 @@ impl Summary {
         self.receive_max = self.receive_max.max(clean(s.frame_receive_ms_max));
         self.images += clean(s.images_per_second);
         self.decode_max = self.decode_max.max(clean(s.image_decode_ms_max));
+        if let Some(v) = s.frame_present_ms_avg {
+            self.present += clean(v);
+            self.present_n += 1;
+            self.present_max = self.present_max.max(clean(s.frame_present_ms_max));
+        }
         if let Some(r) = s.rtt_ms {
             self.rtt += clean(r);
             self.rtt_n += 1;
         }
         self.queued_max = self.queued_max.max(clean(s.queued_ops));
         self.buffered_max = self.buffered_max.max(clean(s.send_buffered));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(json: &str) -> Sample {
+        serde_json::from_str(json).expect("sample parses")
+    }
+
+    #[test]
+    fn present_time_is_optional() {
+        // A client from before the field existed.
+        let old = sample(r#"{"framesPerSecond": 30, "frameLagMs": 1.5}"#);
+        assert_eq!(old.frame_present_ms_avg, None);
+        // A second in which no frame was drawn to the canvas.
+        let idle =
+            sample(r#"{"framesPerSecond": 0, "framePresentMsAvg": null, "framePresentMsMax": 0}"#);
+        assert_eq!(idle.frame_present_ms_avg, None);
+        let busy = sample(
+            r#"{"framesPerSecond": 30, "framePresentMsAvg": 8.5, "framePresentMsMax": 16.2}"#,
+        );
+        assert_eq!(busy.frame_present_ms_avg, Some(8.5));
+
+        let mut sum = Summary::default();
+        for s in [&old, &idle, &busy] {
+            sum.add(s);
+        }
+        assert_eq!((sum.present, sum.present_n), (8.5, 1));
+        assert_eq!(sum.present_max, 16.2);
     }
 }

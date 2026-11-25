@@ -146,6 +146,11 @@ pub struct Inner {
     scale_mode: ScaleMode,
     auto_resize: bool,
     pending_resize: Option<(u32, u32)>,
+    /// Draw to the canvas as soon as something changed instead of in the
+    /// next animation frame (see [`Inner::set_early_composite`]).
+    early_composite: bool,
+    /// An animation frame is requested: either to draw in, or, after an
+    /// early composite, to mark the end of the refresh interval it used.
     raf_pending: bool,
     raf_id: Option<i32>,
     raf_closure: Option<Closure<dyn FnMut(f64)>>,
@@ -290,6 +295,7 @@ impl Inner {
                 scale_mode: ScaleMode::Fit,
                 auto_resize: true,
                 pending_resize: None,
+                early_composite: false,
                 raf_pending: false,
                 raf_id: None,
                 raf_closure: None,
@@ -1530,8 +1536,33 @@ impl Inner {
             }
         }
         if self.display.needs_composite() && !self.raf_pending {
+            // With early compositing, nothing has been drawn in this refresh
+            // interval yet, so the change need not wait for the animation
+            // frame. The frame that is requested then ends the interval:
+            // until it runs, further changes wait for it, which keeps the
+            // canvas to one composite per display refresh.
+            if self.early_composite {
+                self.composite();
+            }
             self.request_frame();
         }
+    }
+
+    fn composite(&mut self) {
+        self.display.poll_cursor();
+        self.display.composite();
+    }
+
+    /// Draws to the canvas as soon as a frame is applied, when the refresh
+    /// interval is still unused, instead of in the next animation frame.
+    ///
+    /// Off by default, and only here to compare the two: Chrome hands a
+    /// canvas to its compositor at the next begin-frame however early it was
+    /// drawn, in a worker as on the main thread, so drawing early shortens
+    /// the time measured here but not the time until the frame is on screen
+    /// (`tests/browser/present-bench.mjs`).
+    pub fn set_early_composite(&mut self, enabled: bool) {
+        self.early_composite = enabled;
     }
 
     fn request_frame(&mut self) {
@@ -1541,8 +1572,15 @@ impl Inner {
                 with_inner(&weak, |inner| {
                     inner.raf_pending = false;
                     inner.raf_id = None;
-                    inner.display.poll_cursor();
-                    inner.display.composite();
+                    if !inner.early_composite {
+                        inner.composite();
+                    } else if inner.display.needs_composite() {
+                        // Changes that arrived after this interval's early
+                        // composite. Drawing them uses up the interval that
+                        // starts now.
+                        inner.composite();
+                        inner.request_frame();
+                    }
                 });
             }));
         }
@@ -1633,6 +1671,16 @@ impl Inner {
                     JsValue::from_f64(stats.decode.average_ms()),
                 ),
                 ("imageDecodeMsMax", JsValue::from_f64(stats.decode.max_ms)),
+                // No frame was drawn to the canvas in this second: no value.
+                (
+                    "framePresentMsAvg",
+                    if stats.present.count > 0 {
+                        JsValue::from_f64(stats.present.average_ms())
+                    } else {
+                        JsValue::NULL
+                    },
+                ),
+                ("framePresentMsMax", JsValue::from_f64(stats.present.max_ms)),
                 (
                     "rttMs",
                     self.rtt_ms.map_or(JsValue::NULL, JsValue::from_f64),
