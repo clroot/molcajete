@@ -46,7 +46,7 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
   them as images. Once the area calms down it is refreshed losslessly.
 
 See [docs/architecture.md](docs/architecture.md) for the analysis of Apache
-Guacamole and the design of each component (Korean).
+Guacamole and the design of each component.
 
 ## Quick start
 
@@ -129,7 +129,7 @@ Both binaries can write JSON logs (`--log-format json`). With
 `--telemetry-listen`, they also serve Prometheus metrics for every stage of
 the frame pipeline, and `--profiling` adds pprof CPU profiles for Pyroscope.
 The gateway can also collect performance reports from the browser
-(`--client-reports`). See [docs/deployment.md](docs/deployment.md) (Korean).
+(`--client-reports`). See [docs/deployment.md](docs/deployment.md).
 
 ## Tests
 

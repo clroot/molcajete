@@ -1,277 +1,279 @@
-# molcajete 분석 및 설계
+# molcajete: analysis and design
 
-이 문서는 Apache Guacamole(서버 `guacamole-server`, 클라이언트 `guacamole-client`, 2026-11 기준 main 브랜치)의 구조를 분석하고, 그 결과를 바탕으로 molcajete의 각 구성 요소를 어떻게 설계했는지 정리한다.
+This document analyses the structure of Apache Guacamole (server `guacamole-server`, client `guacamole-client`, main branch as of 2026-11) and describes how each molcajete component was designed from that analysis.
 
-## 1. Apache Guacamole 구조
+## 1. Apache Guacamole
 
 ```
-브라우저 ── HTTP/WebSocket ──▶ 웹 애플리케이션(Java) ── TCP 4822 ──▶ guacd(C) ──▶ VNC/RDP/SSH/Telnet/K8s
- guacamole-common-js          guacamole + guacamole-common         libguac + 프로토콜 플러그인
+browser ── HTTP/WebSocket ──▶ web application (Java) ── TCP 4822 ──▶ guacd (C) ──▶ VNC/RDP/SSH/Telnet/K8s
+ guacamole-common-js          guacamole + guacamole-common         libguac + protocol plugins
 ```
 
-| 구성 요소 | 언어 | 역할 |
+| Component | Language | Role |
 |---|---|---|
-| guacd | C | 연결마다 프로세스를 fork하고 프로토콜 플러그인(`libmolcajete-client-vnc/rdp/ssh/...`)을 적재한다. 원격 프로토콜을 Guacamole 프로토콜로 번역한다. |
-| libguac | C | 프로토콜 직렬화, 소켓, 사용자/스트림 관리, 서버 쪽 디스플레이(변경 추적, PNG/JPEG/WebP 인코딩, 프레임 동기화), 녹화 |
-| guacamole-common | Java | guacd 연결(`ConfiguredGuacamoleSocket`의 핸드셰이크)과 HTTP/WebSocket 터널 |
-| guacamole (웹앱) | Java + AngularJS | 인증, 연결 관리, REST API, UI |
-| guacamole-common-js | JavaScript | 브라우저 클라이언트: 파서, 터널, 디스플레이, 키보드/마우스/터치, 오디오, 스트림 |
+| guacd | C | Forks a process per connection and loads a protocol plugin (`libguac-client-vnc/rdp/ssh/...`), which translates the remote protocol into the Guacamole protocol. |
+| libguac | C | Protocol serialization, sockets, user/stream management, the server-side display (change tracking, PNG/JPEG/WebP encoding, frame synchronization), recording |
+| guacamole-common | Java | The guacd connection (handshake in `ConfiguredGuacamoleSocket`) and the HTTP/WebSocket tunnels |
+| guacamole (web app) | Java + AngularJS | Authentication, connection management, REST API, UI |
+| guacamole-common-js | JavaScript | Browser client: parser, tunnel, display, keyboard/mouse/touch, audio, streams |
 
-### 1.1 Guacamole 프로토콜
+### 1.1 The Guacamole protocol
 
-- 형식: `LENGTH.VALUE` 원소를 `,`로 잇고 `;`로 끝낸다. 예: `4.size,1.0,4.1024,3.768;`
-- `LENGTH`는 바이트가 아니라 **유니코드 코드포인트 수**다. 세 구현(libguac, Java, JS) 모두 같다.
-- 한계값: 명령 8192, 원소 수 128, 길이 숫자 5자리(libguac `parser-constants.h`, Java `GuacamoleParser`). blob 한 개의 원시 데이터는 최대 6048바이트다.
-- 버전: `VERSION_1_0_0`, `1_1_0`(timezone·임의 순서 핸드셰이크), `1_3_0`(`required`), `1_5_0`(`name`·`msg`). guacd 1.6도 `VERSION_1_5_0`을 쓴다.
+- Format: `LENGTH.VALUE` elements joined by `,` and terminated by `;`. Example: `4.size,1.0,4.1024,3.768;`
+- `LENGTH` counts **Unicode code points**, not bytes, in all three implementations (libguac, Java, JS).
+- Limits: 8192 per instruction, 128 elements, 5 digits of length (libguac `parser-constants.h`, Java `GuacamoleParser`). One blob carries at most 6048 bytes of raw data.
+- Versions: `VERSION_1_0_0`, `1_1_0` (timezone, handshake in any order), `1_3_0` (`required`), `1_5_0` (`name`, `msg`). guacd 1.6 also uses `VERSION_1_5_0`.
 
-핸드셰이크(웹앱 ↔ guacd):
+Handshake (web app ↔ guacd):
 
 ```
-select,vnc → args,VERSION_1_5_0,hostname,port,... → size/audio/video/image/timezone/name → connect,VERSION_1_5_0,값... → ready,$연결ID
+select,vnc → args,VERSION_1_5_0,hostname,port,... → size/audio/video/image/timezone/name → connect,VERSION_1_5_0,values... → ready,$connectionID
 ```
 
-주요 명령 분류:
+Main instruction groups:
 
-| 분류 | 명령 |
+| Group | Instructions |
 |---|---|
-| 그리기 | `size` `move` `shade` `distort` `dispose` `copy` `transfer` `rect` `arc` `curve` `start` `line` `close` `clip` `cfill` `cstroke` `lfill` `lstroke` `push` `pop` `reset` `identity` `transform` `set` `cursor` |
-| 이미지 | `img`(스트림) + `blob` + `end`, 구형 `png`/`jpeg`(인라인 base64) |
-| 스트림/객체 | `ack` `audio` `video` `clipboard` `file` `pipe` `argv` `body` `filesystem` `get` `put` `undefine` |
-| 제어 | `sync`(프레임 끝 + 흐름 제어) `mouse` `key` `size` `touch` `nop` `error` `disconnect` `name` `required` `msg` `log` |
+| Drawing | `size` `move` `shade` `distort` `dispose` `copy` `transfer` `rect` `arc` `curve` `start` `line` `close` `clip` `cfill` `cstroke` `lfill` `lstroke` `push` `pop` `reset` `identity` `transform` `set` `cursor` |
+| Images | `img` (stream) + `blob` + `end`, legacy `png`/`jpeg` (inline base64) |
+| Streams/objects | `ack` `audio` `video` `clipboard` `file` `pipe` `argv` `body` `filesystem` `get` `put` `undefine` |
+| Control | `sync` (end of frame + flow control) `mouse` `key` `size` `touch` `nop` `error` `disconnect` `name` `required` `msg` `log` |
 
-`sync`는 프레임 경계다. 클라이언트는 그 프레임을 다 그린 뒤 같은 타임스탬프로 `sync`를 돌려보낸다. guacd는 이 응답이 늦어지는 정도(처리 지연)를 보고 프레임 속도를 낮춘다.
+`sync` marks a frame boundary. Once the client has drawn the frame it sends `sync` back with the same timestamp; guacd lowers the frame rate as these replies are delayed (processing lag).
 
-### 1.2 WebSocket 터널 규약 (`GuacamoleWebSocketTunnelEndpoint`)
+### 1.2 WebSocket tunnel contract (`GuacamoleWebSocketTunnelEndpoint`)
 
-- 서브프로토콜 `guacamole`, 텍스트 메시지만 쓴다. 한 메시지에는 완전한 명령만 담긴다.
-- 첫 메시지는 `0.,36.<터널 UUID>;`(opcode가 빈 문자열인 내부 명령)이다.
-- 클라이언트는 500ms마다 `0.,4.ping,<ts>;`를 보내고 서버가 그대로 돌려준다. 이 메시지는 guacd에 전달되지 않는다.
-- 종료할 때 WebSocket close reason에 Guacamole 상태 코드(10진수)를 싣는다.
+- Subprotocol `guacamole`, text messages only. Each message holds complete instructions only.
+- The first message is `0.,36.<tunnel UUID>;` (an internal instruction with an empty opcode).
+- The client sends `0.,4.ping,<ts>;` every 500 ms and the server echoes it; it never reaches guacd.
+- On termination the WebSocket close reason carries the Guacamole status code (decimal).
 
-### 1.3 기존 JS 클라이언트의 렌더링 방식과 한계
+### 1.3 Rendering in the stock JS client, and its limits
 
-`Guacamole.Display`/`Guacamole.Layer` 분석 결과:
+From an analysis of `Guacamole.Display` / `Guacamole.Layer`:
 
-- 레이어마다 `<canvas>`(2D 컨텍스트)를 만들고 `div`로 감싼다. 레이어 트리는 CSS `transform`/`opacity`/`z-index`로 합성한다.
-- 캔버스 크기는 64px 단위로 올림한다(`CANVAS_SIZE_FACTOR`). 버퍼(음수 인덱스)는 그리는 범위에 맞춰 자동으로 커진다.
-- 채널 마스크는 `globalCompositeOperation`에 대응한다(0x1 destination-in … 0xE source-over, 0xF lighter). `copy`/`source-in`/`source-out`/`destination-in`/`destination-atop`은 canvas 규격상 **그린 도형 바깥까지 지우는(unbounded)** 연산이다. guacd 1.6 터미널은 이 성질에 의존한다. 선택 영역을 `rect`+`cfill(SRC)`로 그리면서 이전 선택을 지운다.
-- `transfer`(ROP)는 `getImageData`/`putImageData`로 CPU에서 픽셀을 하나씩 계산한다. GPU 캔버스라면 매번 GPU→CPU 읽기가 일어나 파이프라인이 멈춘다.
-- 이미지 디코딩은 `createImageBitmap`을 쓰지만 결과는 다시 2D 캔버스 `drawImage`로 그린다.
-- 프레임은 `sync`를 받았을 때 그 안의 모든 작업이 준비되면 한꺼번에 실행된다(원자적 프레임).
+- Each layer is a `<canvas>` (2D context) wrapped in a `div`; the layer tree is composited by CSS `transform`/`opacity`/`z-index`.
+- Canvas sizes are rounded up to multiples of 64 px (`CANVAS_SIZE_FACTOR`). Buffers (negative indices) grow automatically to fit what is drawn.
+- Channel masks map onto `globalCompositeOperation` (0x1 destination-in … 0xE source-over, 0xF lighter). `copy`/`source-in`/`source-out`/`destination-in`/`destination-atop` are, by the canvas specification, **unbounded**: they also clear outside the drawn shape. The guacd 1.6 terminal relies on this, drawing the selection with `rect`+`cfill(SRC)` and thereby erasing the previous selection.
+- `transfer` (ROP) computes pixels one by one on the CPU via `getImageData`/`putImageData`. On a GPU canvas every call reads back from the GPU and stalls the pipeline.
+- Images are decoded with `createImageBitmap`, but the result is drawn again into a 2D canvas with `drawImage`.
+- When `sync` arrives, all operations of the frame run together once they are ready (atomic frames).
 
-알려진 버그: 같은 크기의 커서가 다시 설정되면 이전 커서 위에 덧그려진다(`setCursor`가 지우지 않고 `copy`한다).
+Known bug: setting a cursor of the same size draws it over the previous one (`setCursor` copies instead of clearing).
 
-### 1.4 guacd가 실제로 쓰는 명령
+### 1.4 What guacd actually sends
 
-guacd 소스 전체를 조사한 결과, 화면 갱신은 거의 `img`(PNG/JPEG/WebP) + `copy` + `rect`/`cfill` + `size`/`move`/`shade`/`dispose` + `cursor` + `sync`로 이뤄진다. 경로 명령(`arc`/`curve`/`clip`/`cstroke` 등)은 프로토콜에는 있지만 guacd 플러그인에서는 쓰이지 않는다. 합성 모드는 OVER, SRC(커서·터미널 선택), ROUT(투명 레이어 지우기), RATOP(투명 색으로 버퍼 비우기)가 쓰인다.
+Going through the whole guacd source, screen updates consist almost entirely of `img` (PNG/JPEG/WebP) + `copy` + `rect`/`cfill` + `size`/`move`/`shade`/`dispose` + `cursor` + `sync`. Path instructions (`arc`/`curve`/`clip`/`cstroke`, ...) exist in the protocol but no guacd plugin uses them. The composite modes in use are OVER, SRC (cursor, terminal selection), ROUT (clearing transparent layers) and RATOP (emptying buffers with a transparent colour).
 
-## 2. molcajete 구성
+## 2. molcajete
 
 ```
 crates/
-  molcajete-protocol   공용 프로토콜(플랫폼 독립): 스트리밍 파서, 인코더, 상태 코드, 타입 명령, 영상 프레이밍
-  molcajete-client     wasm 클라이언트: WebGL2 렌더러, WebCodecs 영상 재생, 입력, 오디오, 클립보드, WebSocket 터널
-  molcajete-gateway    Rust 웹 게이트웨이: 정적 파일, 연결 목록 API, WebSocket ↔ guacd 중계
-  guacd           Rust guacd(molcajeted): 핸드셰이크, 서버 쪽 디스플레이/인코딩, 영상 모드, VNC·SSH·RDP(+오디오)
-web/              UI 셸(연결 목록, 세션 화면, Ctrl+Alt+Shift 메뉴)
-tests/browser/    헤드리스 Chromium 픽셀 테스트
-docker/           테스트 대상(guacd 1.6, X11+VNC, OpenSSH, xrdp+XFCE — 127.0.0.1:3390)
+  molcajete-protocol   shared protocol (platform independent): streaming parser, encoder, status codes, typed instructions, video framing
+  molcajete-client     wasm client: WebGL2 renderer, WebCodecs video, input, audio, clipboard, WebSocket tunnel
+  molcajete-gateway    Rust web gateway: static files, connection list API, WebSocket ↔ guacd relay
+  molcajete-daemon     Rust guacd (molcajeted): handshake, server-side display/encoding, video mode, VNC·SSH·RDP (+audio)
+  molcajete-telemetry  logging, Prometheus metrics and CPU profiling for the gateway and molcajeted
+web/              UI shell (connection list, session view, Ctrl+Alt+Shift menu)
+tests/browser/    headless Chromium pixel tests
+docker/           test targets (guacd 1.6, X11+VNC, OpenSSH, xrdp+XFCE on 127.0.0.1:3390)
+deploy/           container deployment (Compose, Kubernetes, reverse proxy, Grafana), see deployment.md
 ```
 
-조합할 수 있는 형태:
+Possible combinations:
 
-| 브라우저 | 게이트웨이 | 데몬 |
+| Browser | Gateway | Daemon |
 |---|---|---|
-| molcajete-client(wasm) | molcajete-gateway | 기존 guacd 또는 molcajeted |
-| 기존 guacamole-common-js | molcajete-gateway (`GUAC_*` 파라미터 호환) | 기존 guacd 또는 molcajeted |
-| 기존 웹앱 | Java 웹앱 | molcajeted (핸드셰이크 호환) |
+| molcajete-client (wasm) | molcajete-gateway | stock guacd or molcajeted |
+| stock guacamole-common-js | molcajete-gateway (accepts the `GUAC_*` parameters) | stock guacd or molcajeted |
+| stock web app | Java web app | molcajeted (compatible handshake) |
 
 ### 2.1 molcajete-protocol
 
-- 바이트 단위 증분 파서. TCP/WebSocket이 명령이나 UTF-8 시퀀스 중간에서 끊겨도 처리하고, 상태를 유지하므로 각 바이트를 한 번만 본다. ASCII 구간은 한꺼번에 건너뛴다(base64 blob이 대부분이라 빠르다).
-- `RawInstruction`: 파서 버퍼를 빌려 쓰는 무복사 뷰. 게이트웨이는 이 뷰로 명령 경계만 확인하고 그대로 전달한다.
-- `ServerInstruction<'a>`: 서버 → 클라이언트 명령을 타입으로 디코드한다(문자열 인자는 빌림).
-- 한계값: `Limits::STRICT`(guacd와 동일, 신뢰할 수 없는 입력용)와 `Limits::LENIENT`.
-- `video`: `video` 스트림의 프레이밍(2.5절). 서버의 `encode_frame`과 클라이언트의 `FrameReader`(blob 경계와 무관하게 프레임 복원)가 같은 코드를 쓴다.
+- Incremental byte-level parser. It copes with TCP/WebSocket boundaries in the middle of an instruction or a UTF-8 sequence, and keeps its state so that each byte is looked at once. ASCII runs are skipped in bulk (blobs are mostly base64, so this is fast).
+- `RawInstruction`: a zero-copy view borrowing the parser buffer. The gateway only uses it to find instruction boundaries and forwards the bytes unchanged.
+- `ServerInstruction<'a>`: typed decoding of server → client instructions (string arguments are borrowed).
+- Limits: `Limits::STRICT` (same as guacd, for untrusted input) and `Limits::LENIENT`.
+- `video`: framing of `video` streams (section 2.5). The server's `encode_frame` and the client's `FrameReader` (reassembles frames regardless of blob boundaries) share this code.
 
 ### 2.2 molcajete-gateway
 
-- axum 기반. `/api/connections`, `/websocket-tunnel`, 정적 파일(`web/`)을 제공한다.
-- WebSocket을 업그레이드한 뒤 guacd 핸드셰이크를 수행한다. 실패하면 close reason에 상태 코드를 실어 종료한다(Java 웹앱과 같은 방식).
-- guacd → 브라우저: 읽은 바이트를 파서로 명령 단위로 자르고, 64KiB까지 모아 한 메시지로 보낸다. 다음 읽기에서 대기할 것 같으면 즉시 보낸다.
-- 브라우저 → guacd: `Limits::STRICT`로 검증한 뒤 원문 그대로 전달한다. 내부 ping에는 직접 응답한다.
-- 설정: TOML(`gateway.example.toml`). 연결마다 guacd 주소를 따로 지정할 수 있다. `[[users]]`를 설정하면 HTTP Basic 인증을 켠다.
+- Built on axum. Serves `/api/connections`, `/websocket-tunnel` and the static files (`web/`).
+- After the WebSocket upgrade it performs the guacd handshake; on failure it closes with the status code in the close reason (like the Java web app).
+- guacd → browser: the bytes read are cut into instructions by the parser and batched into one message of up to 64 KiB, sent immediately when the next read would block.
+- browser → guacd: validated with `Limits::STRICT` and forwarded verbatim. Internal pings are answered directly.
+- Configuration: TOML (`gateway.example.toml`). Each connection may name its own guacd. `[[users]]` turns on HTTP Basic authentication.
 
-### 2.3 molcajete-client: GPU 렌더러 설계
+### 2.3 molcajete-client: GPU renderer design
 
-**스레드 구조.** 기본 구성에서는 클라이언트 전체(WebSocket 터널, 파서, 이미지 디코딩, WebGL2 렌더링, 합성)가 Web Worker 안에서 돈다. 화면 캔버스는 `transferControlToOffscreen()`으로 워커에 넘긴 `OffscreenCanvas`다. 메인 스레드에 남는 일은 다음 셋뿐이다.
+**Threads.** By default the whole client (WebSocket tunnel, parser, image decoding, WebGL2 rendering, compositing) runs inside a Web Worker. The visible canvas is an `OffscreenCanvas` handed to the worker with `transferControlToOffscreen()`. Only three things stay on the main thread:
 
-- 포인터/휠/키보드/IME 이벤트를 받아 워커로 넘기기
-- 워커가 보낸 `layout`(캔버스 CSS 크기)과 `cursor`(RGBA → CSS 커서) 이벤트를 DOM에 반영하기
-- UI 이벤트 처리
+- receiving pointer/wheel/keyboard/IME events and forwarding them to the worker
+- applying the worker's `layout` (canvas CSS size) and `cursor` (RGBA → CSS cursor) events to the DOM
+- handling UI events
 
-이 역할은 `web/molcajete.js`(`MolcajeteSession`)와 `web/molcajete-worker.js`가 나눠 맡는다. OffscreenCanvas가 없는 브라우저에서는 같은 wasm 클라이언트를 메인 스레드에서 돌린다(`?main`으로 강제할 수 있다). 이렇게 나눈 이유는 3.1절의 측정 결과다.
+`web/molcajete.js` (`MolcajeteSession`) and `web/molcajete-worker.js` split these roles. Browsers without OffscreenCanvas run the same wasm client on the main thread (`?main` forces this). The reason for the split is the measurement in section 3.1.
 
-**레이어 = 텍스처.** 레이어와 버퍼는 각각 RGBA8 텍스처(premultiplied alpha)에 FBO를 하나씩 붙인 것이다. 할당 크기는 원본처럼 64px 단위로 올리고, 크기를 바꿀 때는 `blitFramebuffer`로 기존 내용을 옮긴다. 텍스처는 위쪽 행부터 저장한다. 그래서 FBO 안에서는 `gl_FragCoord.xy`가 곧 레이어 픽셀 좌표이고, Y축은 최종 캔버스 합성 때 한 번만 뒤집는다.
+**Layers are textures.** Each layer and buffer is an RGBA8 texture (premultiplied alpha) with its own FBO. Allocations are rounded up to 64 px like the original, and resizing moves the old contents with `blitFramebuffer`. Textures are stored top row first, so inside an FBO `gl_FragCoord.xy` is the layer pixel coordinate, and the Y axis is flipped only once, when compositing into the canvas.
 
-**명령 → GPU 연산 대응**
+**Instructions → GPU operations**
 
-| 명령 | 구현 |
+| Instruction | Implementation |
 |---|---|
-| `rect`+`cfill` | 겹치지 않는 사각형은 정점 색이 있는 쿼드를 한 번의 draw로 그린다(빠른 경로). |
-| 채널 마스크 | `blendFunc`(premultiplied Porter-Duff) 11종 |
-| unbounded 모드(SRC/IN/OUT/RIN/RATOP) | 사각형 하나면 바깥 영역을 scissor+clear 최대 4번으로 지운다. 그 밖에는 커버리지 마스크로 "바깥 지우기" 패스와 "안쪽 그리기" 패스를 나눠 그린다. |
-| `copy` | 다른 레이어면 텍스처를 직접 샘플링한다. 같은 레이어(스크롤)면 `copyTexSubImage2D`로 스크래치에 복사한 뒤 그린다. |
-| `transfer` | ROP 셰이더. un-premultiply한 8비트 값에 4비트 진리표를 정수 비트 연산으로 적용한다. SRC는 `blitFramebuffer`(putImageData처럼 클립·합성 모드를 무시) |
-| `img` | WebCodecs `ImageDecoder`(색공간 변환 없음)로 디코딩해 `VideoFrame`을 받는다. `ImageDecoder`가 없으면 Blob + `createImageBitmap`으로 대신한다. PNG(IHDR 색상 타입, tRNS)와 WebP(VP8/VP8L/VP8X) 헤더로 불투명 여부를 판별해, 불투명하고 변환·클립이 없으면 레이어 텍스처에 바로 올린다. 아니면 재사용하는 업로드 텍스처를 거쳐 블렌딩한다. 업로드는 2D `OffscreenCanvas`에 먼저 그린 뒤(GPU 프로세스에서 지연 처리) 그 캔버스를 `texSubImage2D`로 복사한다. |
-| `video` | molcajete 프레이밍(프레임마다 9바이트 헤더 + H.264/H.265 Annex B 또는 AV1 OBU, `molcajete_protocol::video`)을 풀어 WebCodecs `VideoDecoder`(`optimizeForLatency`, 가능하면 하드웨어 디코딩)에 넣는다. 프레임마다 `img`와 같은 이미지 슬롯을 프레임 큐에 넣고 디코더 출력(`VideoFrame`)으로 채우므로, 영상도 `sync` 순서와 다른 그리기 명령에 맞춰 나온다. 디코딩 결과는 GPU에 있는 프레임 그대로 텍스처로 올린다. 디코더 오류는 `ack` 오류로 서버에 알리고, 서버는 이미지로 돌아간다. |
-| 경로(`arc`/`curve`/`line`/`clip`/`cstroke`/`lfill`) | 호와 곡선은 폴리라인으로 펴고, 채우기(nonzero)와 선은 lyon으로 삼각분할한다. 커버리지를 R8 마스크에 그린 뒤 마스크를 샘플링하는 셰이더로 합성한다. |
-| `clip` | 축 정렬 사각형이면 scissor, 그 밖에는 레이어별 R8 클립 마스크(교집합은 곱셈 블렌딩) |
-| `lfill`/`lstroke` | 패턴 셰이더(논리 크기 기준 `mod` 반복) |
-| `push`/`pop`/`reset`/`transform` | 레이어별 그리기 상태 스택(CTM, 클립, 합성 모드, miter limit) |
-| `move`/`shade`/`distort`/`dispose` | 레이어 트리 속성. 합성 단계에서 반영한다. |
-| `cursor` | 커서 텍스처로 복사한 뒤 PBO + fence로 **비동기** 읽기를 걸어 GPU 파이프라인을 멈추지 않는다. 픽셀이 실제로 바뀐 경우에만 CSS 커서(data URL)를 갱신하므로 로컬 포인터 지연이 없다. 원본 레이어가 바뀌지 않았으면 읽기 자체를 건너뛴다. 서버 `mouse` 위치는 소프트웨어 커서로 그린다. |
+| `rect`+`cfill` | Non-overlapping rectangles are drawn as quads with vertex colours in a single draw call (fast path). |
+| Channel masks | 11 `blendFunc` setups (premultiplied Porter–Duff) |
+| Unbounded modes (SRC/IN/OUT/RIN/RATOP) | For a single rectangle, the outside is cleared with at most 4 scissor+clear calls. Otherwise a coverage mask drives a "clear outside" pass followed by a "draw inside" pass. |
+| `copy` | Between layers the source texture is sampled directly. Within a layer (scrolling) the region is first copied into a scratch texture with `copyTexSubImage2D`. |
+| `transfer` | ROP shader: applies the 4-bit truth table with integer bit operations to un-premultiplied 8-bit values. SRC uses `blitFramebuffer` (ignores clip and composite mode, like putImageData). |
+| `img` | Decoded with WebCodecs `ImageDecoder` (no colour-space conversion) into a `VideoFrame`; without `ImageDecoder`, Blob + `createImageBitmap`. PNG (IHDR colour type, tRNS) and WebP (VP8/VP8L/VP8X) headers tell whether the image is opaque; opaque images without transform or clip are uploaded straight into the layer texture, the rest go through a reused upload texture and are blended. Uploads are first drawn into a 2D `OffscreenCanvas` (deferred to the GPU process) and that canvas is copied with `texSubImage2D`. |
+| `video` | Unpacks molcajete framing (a 9-byte header per frame + H.264/H.265 Annex B or AV1 OBUs, `molcajete_protocol::video`) into a WebCodecs `VideoDecoder` (`optimizeForLatency`, hardware decoding where available). Each frame takes an image slot in the frame queue, like `img`, filled by the decoder output (`VideoFrame`), so video follows `sync` order and the other drawing instructions. Decoded frames are uploaded to the texture as they are, on the GPU. Decoder errors are reported to the server with an `ack` error and the server falls back to images. |
+| Paths (`arc`/`curve`/`line`/`clip`/`cstroke`/`lfill`) | Arcs and curves are flattened into polylines; fills (nonzero) and strokes are tessellated with lyon. Coverage is drawn into an R8 mask that a shader samples while compositing. |
+| `clip` | Scissor for axis-aligned rectangles, otherwise a per-layer R8 clip mask (intersections by multiplicative blending) |
+| `lfill`/`lstroke` | Pattern shader (repeats with `mod` over the logical size) |
+| `push`/`pop`/`reset`/`transform` | Per-layer drawing state stack (CTM, clip, composite mode, miter limit) |
+| `move`/`shade`/`distort`/`dispose` | Layer tree properties, applied when compositing |
+| `cursor` | Copied into a cursor texture and read back **asynchronously** with a PBO + fence, so the GPU pipeline never stalls. The CSS cursor (data URL) is updated only when the pixels actually changed, so the local pointer has no lag; when the source layer did not change, the readback is skipped entirely. The server's `mouse` position is drawn as a software cursor. |
 
-**프레임.** 명령은 `Op` 큐에 쌓이고, `sync`까지의 한 프레임이 통째로 준비되면(이미지 디코딩 완료) 그 프레임을 한 번에 실행한다. 프레임 실행이 끝나면 `sync`를 돌려보내고, 다음 `requestAnimationFrame`에서 한 번만 합성한다. 중간 상태의 프레임은 화면에 나오지 않는다.
+**Frames.** Instructions are queued as `Op`s, and once a whole frame up to `sync` is ready (images decoded) it runs at once. When the frame has run, `sync` is sent back and the next `requestAnimationFrame` composites once. Intermediate states never reach the screen.
 
-**합성.** 레이어 트리를 순회해 각 레이어를 변환 행렬(`translate` → 중심 기준 `distort`)·불투명도·부모 클립(scissor)과 함께 그린다. 반투명 레이어에 자식이 있으면 CSS `opacity`처럼 서브트리를 오프스크린에 먼저 그린 뒤 그룹 불투명도로 섞는다. 캔버스는 `desynchronized: true`(저지연)로 만들고, 확대·축소 배율이 정수가 아닐 때만 선형 필터를 쓴다.
+**Compositing.** The layer tree is walked and each layer drawn with its transform (`translate`, then `distort` about its centre), opacity and the parent's clip (scissor). A translucent layer with children is first rendered as a subtree offscreen and blended with the group opacity, like CSS `opacity`. The canvas is created with `desynchronized: true` (low latency), and linear filtering is used only for non-integer scale factors.
 
-**입력.**
-- 키보드: `KeyboardEvent.key`/`code`/`location`으로 keysym을 결정한다(원본 테이블 이식). 누를 때의 keysym을 물리 키(`code`)별로 기억했다가 뗄 때 같은 keysym을 보낸다. 그래서 Shift를 먼저 떼도 `A`가 남지 않는다.
-- IME(한국어 등): 조합 중에는 브라우저에 맡기고, `compositionend` 결과를 유니코드 keysym(`0x01000000 | 코드포인트`) 누름/뗌으로 보낸다.
-- 마우스: Pointer Events와 포인터 캡처를 쓴다. 휠 delta는 53px 단위로 누적한다(원본과 같다).
+**Input.**
+- Keyboard: the keysym is derived from `KeyboardEvent.key`/`code`/`location` (ported tables). The keysym sent on press is remembered per physical key (`code`) and sent again on release, so releasing Shift first does not leave an `A` pressed.
+- IME (Korean etc.): composition is left to the browser, and the `compositionend` result is sent as Unicode keysyms (`0x01000000 | code point`) pressed and released.
+- Mouse: Pointer Events with pointer capture. Wheel deltas accumulate in 53 px steps (same as the original).
 
-**기타.** 클립보드(양방향, UTF-8, 3KiB 단위 blob), `required` 요청(자격 증명 입력 → `argv` 스트림), 5초마다 `nop`, 1초마다 터널 ping(RTT 측정), 15초 무응답이면 끊김 처리, 컨테이너 크기가 바뀌면 원격 해상도 변경 요청(`size`), 성능 통계 이벤트를 지원한다. raw PCM 오디오(`audio/L8`, `audio/L16`)는 Web Audio로 재생한다. Web Audio는 워커에서 쓸 수 없으므로, 워커 모드에서는 워커가 PCM을 페이지로 넘기고(`audio-start`/`audio-data`/`audio-end` 이벤트, ArrayBuffer는 복사 없이 전송) 페이지의 `PcmPlayer`가 50~300ms 지연 범위 안에서 이어 붙여 재생한다. 오디오 컨텍스트는 첫 포인터/키 입력 때 재개한다(자동 재생 정책). 연결 중에는 클라이언트가 스스로를 붙잡아 두므로, JS 쪽 핸들이 GC되어도(wasm-bindgen FinalizationRegistry) 세션이 끊기지 않는다.
+**Other.** Clipboard (both directions, UTF-8, 3 KiB blobs), `required` requests (credential prompt → `argv` streams), `nop` every 5 s, a tunnel ping every second (RTT), disconnect after 15 s of silence, remote resize requests (`size`) when the container resizes, and performance statistics events. Raw PCM audio (`audio/L8`, `audio/L16`) is played with Web Audio. Web Audio is not available in workers, so in worker mode the worker hands PCM to the page (`audio-start`/`audio-data`/`audio-end` events, ArrayBuffers transferred without copying) and the page's `PcmPlayer` schedules it with 50–300 ms of latency. The audio context resumes on the first pointer or key input (autoplay policy). While connected, the client keeps itself alive, so the session survives the JS handle being garbage-collected (wasm-bindgen FinalizationRegistry).
 
 ### 2.4 molcajeted
 
-- tokio 기반. 연결마다 태스크를 띄운다(원본은 프로세스 fork). 핸드셰이크는 원본과 같다(`args`에 `VERSION_1_5_0` 광고, 인자 이름은 원본 VNC 플러그인과 동일).
-- 서버 쪽 디스플레이(`display/`)는 두 개의 버퍼를 둔다.
-  - `pixels`: 원격 프로토콜이 알려 준 실제 화면
-  - `sent`: 클라이언트 레이어의 사본. 우리가 보낸 명령(채우기, 이미지, copy)을 그대로 재생해 만든다.
-- 플러시 때는 이번 프레임에 손댄 64×64 타일만 두 버퍼를 비교한다.
-  1. **스크롤 감지**: 행 해시로 세로 이동을 찾아 `copy`로 보낸다.
-  2. **임의 방향 이동 감지**(창 드래그 등): 바뀐 64×64 셀의 해시를 만들고, 클라이언트 사본 위에서 64×64 창을 한 픽셀씩 밀며 2차원 롤링 해시(홀수 곱수 두 개, 빠져나가는 행·열을 뺌)로 같은 블록을 찾는다. 같은 오프셋으로 움직인 셀은 큰 사각형으로 합쳐 `copy` 하나로 보내고, 이동 방향의 앞쪽부터 보낸다. guacd 1.6은 곱수 62로 뺄셈 없이 슬라이딩하는데, 이 방식은 블록의 왼쪽 위 절반이 해시에 반영되지 않아 거짓 일치가 많아서 쓰지 않았다.
-  3. **나머지 차이**: 바뀐 행 밴드와 그 안의 바뀐 열 구간으로 잘라 인코딩한다. 서버가 바뀌지 않은 픽셀을 다시 보내도 비용이 들지 않는다.
-  4. **인코딩**: 단색은 `rect`+`cfill`, 256색 이하는 팔레트 PNG(1/2/4/8비트), 그 밖에는 RGB PNG(Balanced 압축 + Adaptive 필터)로 보낸다. 자주 바뀌고 색이 많은 큰 영역은 클라이언트가 지원하면 JPEG로 보내고, 잠잠해지면 그 타일을 PNG로 다시 보낸다(무손실 보정).
-- 보낸 명령을 사본에 재생하므로 최적화가 틀려도 스스로 바로잡힌다. 잘못된 `copy` 추측은 다음 비교에서 차이로 드러나 픽셀로 다시 전송된다. VNC CopyRect도 사본에 같은 `copy`를 적용하기만 하면 되어, 원본 영역을 먼저 플러시할 필요가 없다. 이 성질은 명령을 재생하는 클라이언트 시뮬레이터와 무작위 퍼즈 테스트(시드 1,000개)로 검증했다.
-- 프레임 페이싱: `sync`마다 보낸 시각을 기록하고, 응답까지 걸린 시간을 지수평활해 클라이언트 처리 지연으로 쓴다. 다음 프레임은 `max(33ms, 지연)` 뒤에 보낸다(최대 500ms, guacd와 같은 개념). 그 사이에도 원격 갱신은 계속 받아 사본과의 차이로 쌓아 두므로, 빠르게 지나간 중간 상태는 보내지 않는다. 조용하던 화면의 첫 변경은 바로 보내므로 입력 반응성은 그대로다.
-- 큰 프레임(인코딩 결과 32KiB 초과) 뒤에는 최소 66ms(약 15fps)를 기다린다. 쉼 없이 쏟아지는 출력에서 대역폭을 묶어 두는 장치로, 세 프로토콜(VNC/SSH/RDP)이 모두 이 공용 페이싱(`Display::next_frame_at`)을 따른다.
-- 흐름 제어: 응답이 오지 않은 프레임이 2개를 넘으면 원격 서버에 갱신 요청을 보내지 않는다(응답이 오면 재개하고, 5초가 지나도 강제로 재개한다).
-- VNC: RFB 3.3/3.7/3.8, None/VNC 인증, Raw/CopyRect/Hextile/ZRLE, Cursor/DesktopSize/ExtendedDesktopSize/LastRect pseudo-encoding, 클립보드 양방향, 원격 해상도 변경.
-- SSH(`ssh/`): russh로 연결(비밀번호, 개인키+패스프레이즈, keyboard-interactive, 값이 없으면 `required`로 묻기, `host-key` 고정)하고, alacritty_terminal로 xterm 호환 화면을 유지한다(256색/트루컬러, 대체 화면, 스크롤백, bracketed paste, SGR 마우스). 셀은 ab_glyph로 서버에서 그리며, 이전 프레임과 다른 행 구간만 디스플레이에 넣는다. 그다음은 공용 디스플레이가 스크롤 감지와 인코딩을 맡는다. 폰트는 DejaVu Sans Mono를 내장하고, 한글·한자·가나는 내장 NanumGothicCoding으로 대체한다. `font-path`와 시스템 폰트도 폴백으로 쓴다. 두 칸 폭 문자, 박스 그리기 문자, 드래그·더블클릭 선택 → 클라이언트 클립보드, Ctrl+Shift+V/우클릭 붙여넣기, 휠 스크롤백, 리사이즈를 지원한다. 인자 이름은 guacd SSH 플러그인과 같다.
-- RDP(`rdp/`): IronRDP(connector/session/graphics/cliprdr/displaycontrol)와 rustls를 쓴다. 보안은 TLS와 NLA(CredSSP/NTLM)를 지원하고, 인증서는 `ignore-cert`가 없으면 검증한다. 비트맵 갱신은 바뀐 사각형 단위로 디스플레이에 넣고, 포인터 비트맵은 커서로 보낸다. 키보드는 수정자, 기능 키, 단축키 조합은 스캔코드로, 그 밖의 문자(한글 포함)는 유니코드 이벤트로 보낸다. 마우스, 텍스트 클립보드(양방향, UTF-16), display-update 리사이즈를 지원한다. IronRDP가 RC4 표준 RDP 보안을 지원하지 않아 `security=rdp`는 거부한다.
-- RDP 오디오(`rdp/audio.rs`): RDPSND 정적 채널과 `AUDIO_PLAYBACK_DVC` 동적 채널을 등록하고, 서버가 제시한 포맷 중 디코딩할 수 있는 것(PCM 8/16비트, G.711, IMA/MS ADPCM)만 고른다(16비트, 44.1k, 48k, 스테레오 순). 받은 소리는 Guacamole `audio/L16;rate=R,channels=C`(클라이언트가 L8만 받으면 8비트로 줄임) 스트림으로 프레임 페이싱과 무관하게 바로 보낸다. 클라이언트가 오디오를 받지 않거나 `disable-audio`면 채널을 만들지 않아, 원격 세션이 소리를 내지 않는다. 클라이언트가 스트림을 거부(`ack` 오류)하면 그 세션의 오디오를 멈춘다.
+- Built on tokio, one task per connection (the original forks a process). The handshake matches the original (`args` advertises `VERSION_1_5_0`; argument names match the original VNC plugin).
+- The server-side display (`display/`) keeps two buffers:
+  - `pixels`: the actual screen as reported by the remote protocol
+  - `sent`: a copy of the client's layer, built by replaying every instruction we send (fills, images, copies)
+- At flush time only the 64×64 tiles touched in this frame are compared between the two:
+  1. **Scroll detection**: row hashes find vertical moves, sent as `copy`.
+  2. **Move detection in any direction** (dragged windows, ...): hashes of the changed 64×64 cells are looked up while a 64×64 window slides one pixel at a time over the client copy, using a 2D rolling hash (two odd multipliers, subtracting the rows and columns that leave the window). Cells that moved by the same offset are merged into large rectangles and sent as single `copy` instructions, front of the movement first. guacd 1.6 slides with multiplier 62 and no subtraction, which leaves the upper-left half of the block out of the hash and produces many false matches, so that approach was not used.
+  3. **Remaining differences**: cut into changed row bands and changed column runs within them, then encoded. Unchanged pixels re-sent by the server cost nothing.
+  4. **Encoding**: solid colours as `rect`+`cfill`, up to 256 colours as palette PNG (1/2/4/8 bit), everything else as RGB PNG (Balanced compression + Adaptive filter). Large, colourful areas that change often are sent as JPEG when the client supports it, and those tiles are re-sent as PNG once they calm down (lossless refinement).
+- Because the instructions we send are replayed on the copy, wrong guesses correct themselves: a bad `copy` shows up as a difference in the next comparison and is re-sent as pixels. VNC CopyRect only needs the same `copy` applied to the copy, with no need to flush the source area first. This property is checked by a client simulator that replays the instructions and by randomized fuzz tests (1,000 seeds).
+- Frame pacing: the send time of every `sync` is recorded, and the exponentially smoothed time until its reply is used as the client's processing lag. The next frame goes out after `max(33 ms, lag)` (at most 500 ms, the same idea as guacd). Remote updates keep arriving meanwhile and accumulate as differences from the copy, so short-lived intermediate states are never sent. The first change after a quiet period is sent immediately, so input stays responsive.
+- After a large frame (more than 32 KiB encoded), at least 66 ms (about 15 fps) pass before the next. This bounds bandwidth under continuous floods of output; all three protocols (VNC/SSH/RDP) share this pacing (`Display::next_frame_at`).
+- Flow control: with more than 2 frames unacknowledged, no update requests are sent to the remote server (they resume when replies arrive, or forcibly after 5 s).
+- VNC: RFB 3.3/3.7/3.8, None/VNC authentication, Raw/CopyRect/Hextile/ZRLE, Cursor/DesktopSize/ExtendedDesktopSize/LastRect pseudo-encodings, clipboard in both directions, remote resize.
+- SSH (`ssh/`): connects with russh (password, private key + passphrase, keyboard-interactive, asking with `required` when a value is missing, `host-key` pinning) and keeps an xterm-compatible screen with alacritty_terminal (256 colours/true colour, alternate screen, scrollback, bracketed paste, SGR mouse). Cells are rendered on the server with ab_glyph, and only the row spans that differ from the previous frame go into the display; scroll detection and encoding are then up to the shared display. DejaVu Sans Mono is bundled, with the bundled NanumGothicCoding as fallback for Hangul, Han and Kana; `font-path` and system fonts are further fallbacks. Supports double-width characters, box-drawing characters, drag/double-click selection → client clipboard, Ctrl+Shift+V/right-click paste, wheel scrollback and resizing. Argument names match the guacd SSH plugin.
+- RDP (`rdp/`): IronRDP (connector/session/graphics/cliprdr/displaycontrol) with rustls. Security: TLS and NLA (CredSSP/NTLM); certificates are verified unless `ignore-cert` is set. Bitmap updates go into the display per changed rectangle, pointer bitmaps become the cursor. Modifiers, function keys and shortcuts are sent as scancodes, other characters (including Hangul) as Unicode events. Mouse, text clipboard (both directions, UTF-16) and display-update resizing are supported. IronRDP does not implement RC4 standard RDP security, so `security=rdp` is refused.
+- RDP audio (`rdp/audio.rs`): registers the RDPSND static channel and the `AUDIO_PLAYBACK_DVC` dynamic channel, and picks among the server's formats only those it can decode (PCM 8/16-bit, G.711, IMA/MS ADPCM), preferring 16-bit, 44.1k, 48k, stereo. Sound is sent right away, independent of frame pacing, as a Guacamole `audio/L16;rate=R,channels=C` stream (reduced to 8-bit if the client only accepts L8). When the client takes no audio or `disable-audio` is set, the channels are not created, so the remote session plays no sound. If the client rejects the stream (`ack` error), audio stops for that session.
 
-### 2.5 영상 모드 (molcajeted → WebCodecs)
+### 2.5 Video mode (molcajeted → WebCodecs)
 
-움직임이 많은 영역(동영상 재생, 애니메이션, 3D)은 JPEG로 보내도 비싸다. molcajeted는 이런 영역을 찾아 별도 레이어에 압축 영상 스트림으로 보낸다. Guacamole 프로토콜의 `video` 명령(스트림, 레이어, mimetype)을 그대로 쓰고, 스트림 내용은 이 프로젝트가 정한 프레이밍(`molcajete_protocol::video`)이다. 원본 JS 클라이언트는 `video/h264` 같은 우리 mimetype을 광고하지 않으므로, 원본 클라이언트와는 지금처럼 이미지로만 통신한다.
+Areas with a lot of motion (video playback, animation, 3D) are expensive even as JPEG. molcajeted finds such areas and sends them as a compressed video stream into a separate layer. It uses the Guacamole protocol's `video` instruction (stream, layer, mimetype) unchanged; the stream content uses this project's framing (`molcajete_protocol::video`). The stock JS client does not advertise our mimetypes such as `video/h264`, so with it everything stays images, as before.
 
-- **협상.** 클라이언트는 `VideoDecoder.isConfigSupported`로 확인한 코덱만 핸드셰이크 `video`로 광고한다(`video/av1`, `video/h265`, `video/h264`). 서버는 운영자 선호 순서(`--video av1,h265,h264`, `none`이면 끔)에서 클라이언트가 디코딩할 수 있고 서버가 인코딩할 수 있는 코덱을 고른다. 무손실 강제(`force-lossless`) 세션과 SSH에서는 쓰지 않는다.
-- **영역 찾기.** 64×64 타일마다 "이미지로 보내야 했던 프레임 수"를 세고 1초마다 반으로 줄인다. 이 점수가 8 이상인 타일을 바쁜 타일로 본다. 30fps면 약 0.3초, 15fps면 약 0.6초 만에 넘고, 초당 6회 미만의 갱신으로는 넘지 않는다. 스크롤이나 창 이동은 `copy`로 처리된 뒤에 남은 차이만 세므로 영상으로 오인하지 않는다. 바쁜 타일의 경계 상자가 다음 조건을 모두 만족하면 영상 모드로 들어간다.
-  - 6타일 이상
-  - 바쁜 타일이 상자의 절반 이상
-  - 색이 256가지를 넘음. 텍스트나 UI는 무손실 인코딩이 더 낫다.
-- **영상 레이어.** 레이어 1을 영역 크기(16의 배수로 올림)로 만들어 영역 위에 놓고(`size`, `move`), 그 레이어로 `video` 스트림을 연다. 매 프레임 영역이 바뀌었으면 인코더에 넣고, 결과를 9바이트 헤더(길이, 타임스탬프, 키 프레임 플래그)와 함께 6048바이트 이하 blob으로 보낸다. 첫 프레임은 코덱 설정(SPS/PPS, VPS, AV1 시퀀스 헤더)을 담은 키 프레임이다. 영상 영역의 타일은 일반 이미지 비교에서 빠진다.
-- **기본 레이어 사본은 그대로 둔다.** 영상이 도는 동안 `sent`(클라이언트 기본 레이어의 사본)의 영상 영역은 건드리지 않으므로, 사본은 영상 레이어 아래 기본 레이어에 실제로 남아 있는 내용과 계속 같다. 영역이 1초 동안 바뀌지 않으면 `end`와 `dispose`로 레이어를 치우고, 같은 프레임에서 영역 전체를 사본과 비교해 무손실로 갱신한다. 그래서 손실 압축된 화면이 남지 않고, 레이어가 사라지는 순간 옛 내용이 비치지도 않는다. 바쁜 영역이 8프레임 동안 영상 영역 밖으로 벗어나면(창 이동·확대) 새 영역으로 다시 시작한다. 변경이 없어도 이 정리가 일어나도록 세션마다 유휴 타이머(`Display::idle_deadline`)가 있다. 같은 타이머가 잠잠해진 JPEG 영역의 무손실 보정도 맡는다. 예전에는 다음 변경이 와야 보정됐다.
-- **코덱과 비트레이트.** 목표 비트레이트는 영역 크기 × 30fps × 0.1bpp(H.264 기준)이고, H.265는 0.7배, AV1은 0.6배다(300kbps~16Mbps). 소프트웨어 AV1(SVT-AV1)은 720p 한 프레임에 약 25ms가 걸려서, 약 0.94MP(1280×736)보다 큰 영역은 다음 순위 코덱(H.265, 그다음 H.264)으로 보낸다. 하드웨어 인코더는 크기 제한이 없다.
-- **인코더(`video/`).** ffmpeg를 자식 프로세스로 띄워 RGBA를 파이프로 넣는다. 링크하지 않으므로 GPL인 x264/x265도 라이선스 문제가 없다. 출력은 AVI 컨테이너로 받는다. 원시 엘리멘터리 스트림은 다음 프레임이 시작돼야 앞 프레임의 끝을 알 수 있어 한 프레임씩 늦어지기 때문이다. 이렇게 해서 프레임 하나를 넣으면 그 프레임의 접근 단위 하나가 바로 나온다. 시작할 때 `ffmpeg -encoders`를 읽고 후보마다 3프레임 시험 인코딩을 해서 쓸 수 있는 것만 남긴다. 우선순위는 하드웨어(NVENC/QSV/VA-API/AMF), ffmpeg 소프트웨어(libsvtav1, libx265, libx264), 내장 OpenH264(cargo feature `openh264`, C++ 컴파일러 필요) 순이다. 색공간은 BT.709 limited이고, 비트스트림에 표시한다.
-- **실패 처리.** 인코더 오류는 영상 모드를 끝내고 이미지로 돌아가며, 세 번 실패하면 그 세션에서는 다시 시도하지 않는다. 클라이언트가 `video` 스트림을 거부하거나 디코더 오류를 `ack`로 알려도 같은 방식으로 영상을 끈다.
+- **Negotiation.** The client advertises in the handshake `video` only the codecs that `VideoDecoder.isConfigSupported` accepts (`video/av1`, `video/h265`, `video/h264`). The server picks, in the operator's order of preference (`--video av1,h265,h264`, `none` to disable), a codec the client can decode and the server can encode. Not used for sessions with `force-lossless` or for SSH.
+- **Finding the area.** For every 64×64 tile, the number of frames in which it had to be sent as an image is counted and halved every second. Tiles scoring 8 or more are busy: at 30 fps this takes about 0.3 s, at 15 fps about 0.6 s, and fewer than 6 updates per second never get there. Scrolling and window moves are handled by `copy` first and only the remaining differences count, so they are not mistaken for video. Video mode starts when the bounding box of the busy tiles meets all of:
+  - 6 tiles or more
+  - busy tiles cover at least half the box
+  - more than 256 colours (text and UI are better served by lossless encodings)
+- **Video layer.** Layer 1 is sized to the area (rounded up to multiples of 16) and placed over it (`size`, `move`), and a `video` stream is opened on it. Every frame in which the area changed is fed to the encoder, and the result goes out with a 9-byte header (length, timestamp, key frame flag) in blobs of at most 6048 bytes. The first frame is a key frame carrying the codec configuration (SPS/PPS, VPS, AV1 sequence header). Tiles inside the video area are left out of the normal image diff.
+- **The default layer's copy is left alone.** While the video plays, the video area of `sent` (the copy of the client's default layer) is not touched, so the copy keeps matching what the default layer really holds beneath the video layer. When the area has not changed for 1 s, the layer is removed with `end` and `dispose`, and in the same frame the whole area is compared with the copy and updated losslessly. No lossy content stays on screen, and no stale content shows through when the layer disappears. When the busy area extends beyond the video area for 8 frames (window moved or resized), the video restarts over the new area. An idle timer per session (`Display::idle_deadline`) makes this clean-up happen even without changes; the same timer drives the lossless refinement of JPEG areas that calmed down, which previously waited for the next change.
+- **Codecs and bitrate.** The target bitrate is area × 30 fps × 0.1 bpp for H.264, 0.7× that for H.265 and 0.6× for AV1 (300 kbps to 16 Mbps). Software AV1 (SVT-AV1) takes about 25 ms per 720p frame, so areas larger than about 0.94 MP (1280×736) use the next codec in line (H.265, then H.264). Hardware encoders have no size limit.
+- **Encoders (`video/`).** ffmpeg runs as a child process with RGBA piped in. Nothing is linked, so the GPL x264/x265 pose no licensing problem. Output is read as an AVI container: with a raw elementary stream the end of a frame is only known once the next one starts, which would add a frame of delay, whereas this way each frame in yields its access unit right away. At startup `ffmpeg -encoders` is read and each candidate does a 3-frame trial encode; only working ones are kept. Priority: hardware (NVENC/QSV/VA-API/AMF), ffmpeg software (libsvtav1, libx265, libx264), built-in OpenH264 (cargo feature `openh264`, needs a C++ compiler). Colour space is BT.709 limited range, signalled in the bitstream.
+- **Failures.** An encoder error ends video mode and falls back to images; after three failures the session stops trying. A client rejecting the `video` stream or reporting a decoder error with `ack` turns video off the same way.
 
-## 3. 검증
+## 3. Verification
 
-- 단위 테스트: 프로토콜(분할 지점 전수, 코드포인트 길이, 한계값, 잘못된 UTF-8), 게이트웨이(가짜 guacd 핸드셰이크, 오류 매핑, 쿼리 파싱), guacd(핸드셰이크, 디스플레이 병합/copy 순서/blob 분할, PNG 왕복), 클라이언트 로직(경로 삼각분할 면적, keysym, 키 해제 짝, 휠, PCM)
-- 브라우저 픽셀 테스트(`tests/browser`): 22개 시나리오에서 canvas 기준 구현과 같은 결과가 나오는지 확인한다.
-- 실제 환경 E2E: guacd 1.6 + x11vnc(xterm/xclock/xeyes)에서 화면 표시, 키 입력(Shift 조합), 마우스 추적을 확인했다. guacd 1.6 + OpenSSH에서는 색상, 굵은 글씨, 한글, 스크롤바, 드래그 선택, 클립보드를 확인했다. 전부 Rust인 경로(wasm 클라이언트 → molcajete-gateway → molcajeted → x11vnc)에서도 같은 항목을 확인했다(워커 모드 포함).
-- molcajeted SSH: 색상(16/256/트루컬러), 굵은 글씨, 한글(출력과 입력 명령줄 모두), `top`/vi 같은 전체 화면 앱, 빠른 스크롤, 드래그 선택 → 클립보드, 휠 스크롤백, 리사이즈, 오류 매핑(잘못된 비밀번호, 닫힌 포트, host-key 불일치)을 확인했다. 기존 guacd 경로는 입력 명령줄의 한글이 깨졌지만, molcajeted는 터미널 타입 기본값이 `xterm-256color`라 제대로 표시된다.
-- molcajeted RDP: xrdp+XFCE에서 기존 guacd와 같은 시나리오를 돌려 화면이 같은지 확인했다. 시나리오는 터미널 열기, Shift 조합 특수문자, Ctrl+C, 휠 스크롤, 양방향 클립보드(한글 포함), display-update 리사이즈, 로그아웃 시 정상 종료다.
-- 영상: `tests/browser/video.test.mjs`는 ffmpeg로 만든 실제 H.264/AV1 비트스트림을 molcajeted와 같은 방식으로 프레이밍해 `video` 스트림으로 넣고, 합성된 캔버스 픽셀과 `dispose` 뒤 기본 레이어 복귀를 확인한다. Linux Chromium은 H.265 디코더가 없어서, Windows Chrome 158(헤드리스, 하드웨어 디코딩)에서 같은 페이지를 열어 H.264/H.265/AV1 세 코덱 모두 정상 디코딩됨을 확인했다. 이 브라우저는 H.265를 하드웨어로만 디코딩한다(`prefer-software`는 지원 안 함).
-- 오디오: xrdp 세션에서 440Hz 사인파를 재생하면 molcajeted가 `audio/L16;rate=44100,channels=2`로 보내고(약 177KB/s, 기존 guacd와 같은 수준), 브라우저가 Web Audio에 예약한 샘플도 440.0Hz다(워커 모드, 메인 스레드 모드 모두).
-- 정착 테스트: xterm을 몇 초 동안 계속 스크롤시킨 뒤 부하를 멈추고, 클라이언트 캔버스와 X 서버 화면(`xwd`)을 픽셀 단위로 비교했다. molcajeted 경로는 5회 실행에서 차이가 0이었다(1회는 캔버스와 X 화면 캡처 사이에 xclock 초침이 움직인 것뿐). 기존 guacd 1.6 경로는 원본 JS 클라이언트로 봐도 우리 클라이언트로 봐도, 닫힌 창 자리에 수백~수천 픽셀의 잔상이 남는 경우가 있었다. 클라이언트 문제가 아니라 guacd 쪽 동작이다.
+- Unit tests: protocol (every split point, code point lengths, limits, invalid UTF-8), gateway (fake guacd handshake, error mapping, query parsing), daemon (handshake, display merging/copy ordering/blob splitting, PNG round trips), client logic (path tessellation area, keysyms, key release pairing, wheel, PCM).
+- Browser pixel tests (`tests/browser`): 22 scenarios checked against the canvas reference implementation.
+- End-to-end in real environments: with guacd 1.6 + x11vnc (xterm/xclock/xeyes), display, key input (Shift combinations) and mouse tracking; with guacd 1.6 + OpenSSH, colours, bold text, Hangul, scroll bars, drag selection and clipboard. The same items were checked on the all-Rust path (wasm client → molcajete-gateway → molcajeted → x11vnc), worker mode included.
+- molcajeted SSH: colours (16/256/true colour), bold, Hangul (in output and on the input command line), full-screen apps such as `top`/vi, fast scrolling, drag selection → clipboard, wheel scrollback, resizing, and error mapping (wrong password, closed port, host-key mismatch). On the stock guacd path Hangul on the input command line was garbled; molcajeted displays it correctly because its default terminal type is `xterm-256color`.
+- molcajeted RDP: on xrdp+XFCE, the same scenarios as with stock guacd produce the same screen: opening a terminal, Shift-combined special characters, Ctrl+C, wheel scrolling, clipboard in both directions (including Hangul), display-update resizing, and a clean exit on logout.
+- Video: `tests/browser/video.test.mjs` takes real H.264/AV1 bitstreams made with ffmpeg, frames them the way molcajeted does, feeds them as a `video` stream, and checks the composited canvas pixels and the return to the default layer after `dispose`. Linux Chromium has no H.265 decoder, so the same page was opened in Windows Chrome 158 (headless, hardware decoding), which decoded all three codecs (H.264/H.265/AV1). That browser decodes H.265 in hardware only (`prefer-software` is not supported).
+- Audio: a 440 Hz sine played in an xrdp session is sent by molcajeted as `audio/L16;rate=44100,channels=2` (about 177 KB/s, on par with stock guacd), and the samples the browser schedules in Web Audio are at 440.0 Hz too (worker and main-thread modes).
+- Settling test: after scrolling an xterm continuously for a few seconds and stopping the load, the client canvas was compared pixel by pixel with the X server screen (`xwd`). The molcajeted path showed zero differences in 5 runs (in one, the xclock second hand moved between the canvas and X captures). The stock guacd 1.6 path, viewed with either the stock JS client or ours, sometimes left hundreds to thousands of stale pixels where a window had closed. This is guacd's behaviour, not the client's.
 
-### 3.1 원본 클라이언트와 비교 (`tests/browser/replay-bench.mjs`)
+### 3.1 Comparison with the stock client (`tests/browser/replay-bench.mjs`)
 
-라이브 세션 비교는 믿기 어렵다. guacd가 클라이언트의 `sync` 응답 속도에 맞춰 프레임 수를 바꾸기 때문에 두 클라이언트가 받는 입력 자체가 달라진다. 그래서 실제 세션(xterm이 계속 스크롤되는 x11vnc 데스크톱)의 프로토콜 스트림을 시간 정보와 함께 12초 녹화하고, 두 클라이언트에 **같은 명령을 같은 시점에** 재생했다. 재생이 끝난 뒤 두 클라이언트의 화면은 커서 15픽셀을 빼고 같았다. 지표는 CDP `Performance.getMetrics`의 메인 스레드 작업 시간(12초 동안의 합)이다. 페이지는 `localhost`(보안 컨텍스트)에서 띄워야 WebCodecs가 켜진다.
+Live session comparisons are unreliable: guacd adapts the number of frames to how fast the client answers `sync`, so the two clients do not even receive the same input. Instead, 12 seconds of the protocol stream of a real session (an x11vnc desktop with an xterm scrolling continuously) were recorded with timing, and replayed into both clients with **the same instructions at the same moments**. After the replay the two clients' screens matched except for 15 cursor pixels. The metric is main-thread task time from CDP `Performance.getMetrics` (summed over the 12 s). The page must be served from `localhost` (a secure context) for WebCodecs to be enabled.
 
-실제 GPU(Chromium ANGLE → D3D12, Intel Graphics, WSL2), 3회:
+Real GPU (Chromium ANGLE → D3D12, Intel Graphics, WSL2), 3 runs:
 
-| 녹화 | guacamole-common-js | wasm, 메인 스레드 WebGL | **wasm, Worker + OffscreenCanvas** |
+| Recording | guacamole-common-js | wasm, main-thread WebGL | **wasm, Worker + OffscreenCanvas** |
 |---|---|---|---|
-| guacd 1.6 (7.7MiB) | 418 ~ 1,007ms | 4,529 ~ 4,921ms | **111 ~ 152ms** |
-| molcajeted (33MiB) | 806 ~ 862ms | 4,206 ~ 4,713ms | **179 ~ 183ms** (1회 762ms) |
+| guacd 1.6 (7.7 MiB) | 418 – 1,007 ms | 4,529 – 4,921 ms | **111 – 152 ms** |
+| molcajeted (33 MiB) | 806 – 862 ms | 4,206 – 4,713 ms | **179 – 183 ms** (one run 762 ms) |
 
-SwiftShader(소프트웨어 GPU, 잡음이 적음), 2회:
+SwiftShader (software GPU, less noise), 2 runs:
 
-| 녹화 | guacamole-common-js | wasm, 메인 스레드 WebGL | **wasm, Worker** |
+| Recording | guacamole-common-js | wasm, main-thread WebGL | **wasm, Worker** |
 |---|---|---|---|
-| guacd 1.6 | 436 ~ 438ms | 639 ~ 660ms | **162 ~ 167ms** |
-| molcajeted | 313 ~ 318ms | 531 ~ 541ms | **195 ~ 215ms** |
+| guacd 1.6 | 436 – 438 ms | 639 – 660 ms | **162 – 167 ms** |
+| molcajeted | 313 – 318 ms | 531 – 541 ms | **195 – 215 ms** |
 
-워커 모드 수치에는 재생 하네스가 녹화 데이터를 `postMessage`로 워커에 넘기는 비용도 들어 있다. 실제 세션에서는 WebSocket이 워커 안에 있으므로 메인 스레드 몫이 더 작다.
+The worker figures include the cost of the replay harness passing the recording to the worker with `postMessage`. In a real session the WebSocket lives inside the worker, so the main thread's share is even smaller.
 
-측정하면서 알게 된 점:
-1. wasm 쪽 처리(파싱, base64, 디스패치)는 전체에서 작은 비중이다.
-2. 이미지마다 `new Blob()` + `createImageBitmap()`을 쓰면 Blob 생성만 초당 80ms가 든다. 원본도 같은 이유로 WebCodecs `ImageDecoder`를 쓴다.
-3. Chromium에서 CPU 메모리에 있는 디코딩 결과(`VideoFrame`/`ImageBitmap`)를 WebGL 텍스처로 올리는 작업은 **메인 스레드에서 동기로** 일어난다. 실제 GPU에서는 동기화 대기 때문에 메인 스레드 WebGL 구성이 원본(2D 캔버스 `drawImage`는 GPU 프로세스로 미뤄짐)보다 오히려 느렸다.
-4. 같은 작업을 워커로 옮기면 메인 스레드 비용이 원본의 1/3~1/6로 줄어든다. 페이지의 입력·UI 반응성이 원격 화면의 갱신량과 무관해진다. 이것이 DOM 캔버스에 묶인 원본 구조로는 얻기 어려운 이점이다.
+What the measurements showed:
+1. The wasm side (parsing, base64, dispatch) is a small part of the total.
+2. `new Blob()` + `createImageBitmap()` per image costs 80 ms per second for Blob creation alone. This is also why the original uses WebCodecs `ImageDecoder`.
+3. In Chromium, uploading decoded results held in CPU memory (`VideoFrame`/`ImageBitmap`) into WebGL textures happens **synchronously on the main thread**. On a real GPU, waiting on that synchronization made the main-thread WebGL setup slower than the original (whose 2D canvas `drawImage` is deferred to the GPU process).
+4. Moving the same work into a worker cuts main-thread cost to 1/3 – 1/6 of the original, and makes the page's input and UI responsiveness independent of how much the remote screen changes. That is hard to achieve with the original's design, which is tied to DOM canvases.
 
-`tests/browser/bench.mjs`는 같은 비교를 라이브 세션으로 하는 스크립트이고, 위 이유로 참고용이다.
+`tests/browser/bench.mjs` makes the same comparison on a live session and, for the reasons above, is for reference only.
 
-### 3.2 molcajeted 대역폭
+### 3.2 molcajeted bandwidth
 
-xterm이 계속 스크롤되는 x11vnc 데스크톱을 같은 시간대에 두 데몬으로 번갈아 12초씩 녹화해 비교했다(`tests/browser/record.mjs`).
+An x11vnc desktop with an xterm scrolling continuously was recorded for 12 s at a time, alternating between the two daemons in the same period (`tests/browser/record.mjs`).
 
-| 단계 | guacd 1.6 | molcajeted |
+| Stage | guacd 1.6 | molcajeted |
 |---|---|---|
-| 최초 구현(변경 사각형 병합 + PNG Fast) | 7.7MiB | 33.0MiB |
-| 사본 비교 + 스크롤 감지 | 2.3MiB | 9.7MiB |
-| + PNG Balanced/Adaptive + 프레임 페이싱 | 3.0 / 4.7MiB | **4.3 / 4.2MiB** |
+| First implementation (merged change rectangles + PNG Fast) | 7.7 MiB | 33.0 MiB |
+| Mirror comparison + scroll detection | 2.3 MiB | 9.7 MiB |
+| + PNG Balanced/Adaptive + frame pacing | 3.0 / 4.7 MiB | **4.3 / 4.2 MiB** |
 
-창 드래그 부하(xdotool로 xterm을 계속 이동, 10초씩 번갈아 2회): guacd 1.6은 0.73 / 1.04MiB, molcajeted는 **0.40 / 0.41MiB**였다. molcajeted가 프레임은 더 많이 보내면서(142 대 88~132) 대역폭은 절반 이하였다.
+Window dragging (xterm moved continuously with xdotool, 10 s each, alternating, 2 runs): guacd 1.6 sent 0.73 / 1.04 MiB, molcajeted **0.40 / 0.41 MiB**, at less than half the bandwidth while sending more frames (142 vs 88–132).
 
-SSH와 RDP는 터미널에서 출력을 계속 쏟아내는 명령(`while :; do ls -la /usr/bin /etc; done`)을 실제 브라우저 클라이언트로 8초씩 번갈아 실행해, 클라이언트가 받은 바이트와 프레임 수를 비교했다.
+For SSH and RDP, a command flooding the terminal (`while :; do ls -la /usr/bin /etc; done`) ran for 8 s at a time, alternating, with the real browser client, comparing the bytes and frames the client received.
 
-| 연결 | guacd 1.6 | molcajeted |
+| Connection | guacd 1.6 | molcajeted |
 |---|---|---|
-| SSH | 7.2 / 7.3MiB, 13.5fps | **5.5 / 5.6MiB, 14fps** |
-| RDP(xrdp) | 8.3 / 8.5MiB, 15.5fps | 8.1 / 9.4MiB, 13~14fps |
+| SSH | 7.2 / 7.3 MiB, 13.5 fps | **5.5 / 5.6 MiB, 14 fps** |
+| RDP (xrdp) | 8.3 / 8.5 MiB, 15.5 fps | 8.1 / 9.4 MiB, 13–14 fps |
 
-SSH에서 molcajeted는 처음에 자체 60fps 상한을 써서 9.1MiB(24fps)를 보냈다. 공용 페이싱(30fps 상한 + 클라이언트 지연 보정)과 "큰 프레임(32KiB 초과) 뒤에는 66ms 쉬기" 규칙을 넣은 뒤, 같은 프레임 수에서 guacd보다 약 24% 적게 보낸다. RDP는 IronRDP가 ScrBlt 같은 그리기 명령을 넘겨주지 않아 서버 쪽 `copy` 힌트가 없지만, 공용 디스플레이의 비교와 이동 감지로 guacd와 비슷한 수준이다.
+Over SSH, molcajeted first used its own 60 fps cap and sent 9.1 MiB (24 fps). With the shared pacing (30 fps cap + client lag compensation) and the "wait 66 ms after a large frame (over 32 KiB)" rule it sends about 24% less than guacd at the same frame rate. RDP gets no server-side `copy` hints, because IronRDP does not pass drawing orders such as ScrBlt through, but the shared display's comparison and move detection keep it on par with guacd.
 
-부하 강도가 측정 시점마다 달라 같은 행끼리만 비교해야 한다. 최종적으로 guacd 1.6과 같은 수준이 되었고, 프레임당 바이트는 molcajeted가 조금 적다(13.4KB 대 15KB). guacd 1.6은 같은 부하에 WebP를 많이 쓰는데, molcajeted는 무손실 PNG로 이 수준을 낸다. 같은 데이터에서 WebP 무손실(image-webp)은 PNG Balanced보다 18% 컸다.
+Load intensity varied between measurements, so only rows can be compared with each other. In the end molcajeted is on par with guacd 1.6 and sends slightly fewer bytes per frame (13.4 KB vs 15 KB). guacd 1.6 uses WebP heavily under the same load, while molcajeted gets there with lossless PNG. On the same data, lossless WebP (image-webp) was 18% larger than PNG Balanced.
 
-정확도는 그대로다. 최적화 후 정착 테스트 3회 모두 실제 X 화면과 픽셀 차이가 0이었다.
+Accuracy is unchanged: all 3 settling tests after these optimizations showed zero pixel differences from the real X screen.
 
-### 3.3 영상 모드 대역폭
+### 3.3 Video mode bandwidth
 
-데스크톱에서 ffplay로 640×360 영상(`mandelbrot`, 확대되는 프랙탈)을 재생하며 클라이언트가 10초 동안 받은 양을 쟀다. 재생이 끝나고 4.5초 뒤에는 캔버스를 실제 화면과 비교했다(시계 구석은 가림).
+A 640×360 video (`mandelbrot`, a zooming fractal) was played on the desktop with ffplay, measuring what the client received over 10 s. 4.5 s after playback ended, the canvas was compared with the real screen (clock corner masked).
 
-| 경로 | 이미지만 | H.264 (x264) | H.265 (x265) | AV1 (SVT-AV1) | guacd 1.6 |
+| Path | Images only | H.264 (x264) | H.265 (x265) | AV1 (SVT-AV1) | guacd 1.6 |
 |---|---|---|---|---|---|
-| VNC, Linux Chromium | 6.36MiB, 13.6fps | 1.01MiB, 15.9fps | (디코더 없음) | **0.59MiB**, 18.1fps | 4.43MiB, 12.4fps |
-| RDP(xrdp), Linux Chromium | 7.64MiB, 16.6fps | 1.19MiB, 25.0fps | (디코더 없음) | **0.53MiB**, 20.2fps | 12.36MiB, 24.9fps |
-| VNC, Windows Chrome(HW 디코딩) | 6.76MiB, 14.5fps | 0.79MiB, 12.7fps | 0.65MiB, 12.0fps | **0.44MiB**, 10.5fps | |
+| VNC, Linux Chromium | 6.36 MiB, 13.6 fps | 1.01 MiB, 15.9 fps | (no decoder) | **0.59 MiB**, 18.1 fps | 4.43 MiB, 12.4 fps |
+| RDP (xrdp), Linux Chromium | 7.64 MiB, 16.6 fps | 1.19 MiB, 25.0 fps | (no decoder) | **0.53 MiB**, 20.2 fps | 12.36 MiB, 24.9 fps |
+| VNC, Windows Chrome (HW decoding) | 6.76 MiB, 14.5 fps | 0.79 MiB, 12.7 fps | 0.65 MiB, 12.0 fps | **0.44 MiB**, 10.5 fps | |
 
-- 영상 모드는 이미지만 쓸 때보다 H.264로 약 1/6~1/9, AV1로 약 1/11~1/15를 보낸다. 기존 guacd와 비교하면 VNC에서 1/7, RDP에서 1/23이다. 영역 비트레이트는 704×448 기준 H.264 946kbps, H.265 662kbps, AV1 567kbps였다.
-- 1280×720 영상(전체 화면 크기 영역)은 AV1 실시간 한도를 넘어서 H.264로 보냈다. 이미지만 쓰면 15.15MiB, 영상 모드는 2.63MiB였다.
-- 재생이 끝난 뒤의 정착 비교에서 VNC는 픽셀 차이가 0이었다(이미지 모드도 0). RDP도 영상 영역 안의 차이는 x11grab이 그린 마우스 포인터뿐이었다. 영상 영역 밖의 차이는 xrdp 색 변환 탓이고, 기존 guacd에서도 같게 나온다.
-- 영상이 아닌 움직임은 이미지로 남는다. `testsrc2`(단색 막대 위 작은 움직임)는 영역이 듬성듬성해 영상 모드로 들어가지 않았다(4.4MiB, 이미지 모드와 같음). 텍스트를 쏟아내는 터미널도 색 조건 때문에 무손실 그대로다.
-- Windows Chrome 행은 헤드리스 창 렌더링 때문인지 fps가 낮게 나와서, 같은 행 안에서만 비교해야 한다.
+- Video mode sends about 1/6 – 1/9 of the images-only volume with H.264 and about 1/11 – 1/15 with AV1. Compared with stock guacd that is 1/7 over VNC and 1/23 over RDP. For a 704×448 area the bitrates were 946 kbps (H.264), 662 kbps (H.265) and 567 kbps (AV1).
+- A 1280×720 video (an area the size of the full screen) exceeds the real-time limit of AV1 and was sent as H.264: 15.15 MiB images only, 2.63 MiB in video mode.
+- In the settling comparison after playback, VNC showed zero pixel differences (images-only mode too). For RDP the only difference inside the video area was the mouse pointer drawn by x11grab; the differences outside it come from xrdp's colour conversion and appear with stock guacd as well.
+- Motion that is not video stays images. `testsrc2` (small movements over solid bars) is too sparse to enter video mode (4.4 MiB, same as images-only), and a terminal flooding text stays lossless because of the colour condition.
+- The Windows Chrome row shows low frame rates, probably due to headless window rendering, so compare only within that row.
 
-## 4. 남은 작업(로드맵)
+## 4. Remaining work (roadmap)
 
-1. molcajeted 프로토콜 보강
-   - SSH: SFTP, 세션 녹화, 에이전트 포워딩, 이탤릭/컬러 이모지
-   - RDP: 드라이브 리디렉션, RemoteApp, EGFX/H.264 수신(서버가 보낸 H.264를 그대로 중계), AAC/Opus 오디오, Kerberos
-   - Telnet·Kubernetes 추가
-   - NLA는 아직 실서버(Windows)로 검증하지 못했다
-2. 연결 공유(`select,$ID`로 참여), 읽기 전용 관찰자, 세션 녹화(guacenc 호환)와 녹화 재생(클라이언트에 `feed` API가 이미 있음)
-3. 파일 전송(`file`/`pipe`/`filesystem` 객체), 오디오 입력(마이크), 터치/멀티터치, 화상 키보드
-4. 게이트웨이: 인증 공급자(OIDC/LDAP/DB), 연결 권한, TLS로 guacd 연결, HTTP 터널(웹소켓을 못 쓰는 환경)
-5. 렌더러: 단색 채우기 배치 묶기, WebGPU 백엔드(`copyExternalImageToTexture`/`importExternalTexture`로 업로드 비용 감소, `Renderer` 한 곳만 교체하면 된다), 컨텍스트 손실 복구
-6. molcajeted 인코딩: 대역폭에 따른 프레임 페이싱, 인코딩 병렬화, 손실 이미지 WebP(guacd 1.6처럼)
-7. 영상 모드 보강
-   - 하드웨어 인코더(NVENC/QSV/VA-API/AMF)는 인자만 있고 실제 하드웨어에서 검증하지 못했다.
-   - 강제 키 프레임은 ffmpeg 재시작으로 처리해 25~45ms가 더 든다.
-   - 클라이언트 코덱 문자열을 SPS/시퀀스 헤더에서 정확히 만든다(지금은 넉넉한 고정값).
-   - 영상 영역 여러 개 동시 지원, 대역폭에 맞춘 비트레이트 조절.
+1. molcajeted protocols
+   - SSH: SFTP, session recording, agent forwarding, italics/colour emoji
+   - RDP: drive redirection, RemoteApp, receiving EGFX/H.264 (relaying the server's H.264 as is), AAC/Opus audio, Kerberos
+   - Telnet and Kubernetes
+   - NLA has not been verified against a real (Windows) server yet
+2. Connection sharing (joining with `select,$ID`), read-only observers, session recording (guacenc compatible) and playback (the client already has a `feed` API)
+3. File transfer (`file`/`pipe`/`filesystem` objects), audio input (microphone), touch/multi-touch, on-screen keyboard
+4. Gateway: authentication providers (OIDC/LDAP/DB), connection permissions, TLS to guacd, HTTP tunnel (for environments without WebSocket)
+5. Renderer: batching solid fills, a WebGPU backend (`copyExternalImageToTexture`/`importExternalTexture` to cut upload costs; only `Renderer` needs replacing), context loss recovery
+6. molcajeted encoding: bandwidth-aware frame pacing, parallel encoding, lossy WebP (as in guacd 1.6)
+7. Video mode
+   - Hardware encoders (NVENC/QSV/VA-API/AMF) are wired up but not verified on real hardware.
+   - Forced key frames restart ffmpeg, which costs an extra 25–45 ms.
+   - Build the client codec string exactly from the SPS/sequence header (currently a generous fixed value).
+   - Several video areas at once, bitrate adapted to bandwidth.
