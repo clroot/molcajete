@@ -325,6 +325,32 @@ Both pages and their API are for administrators only.
 
 Sessions that ended more than `[history] retention_days` ago (365 by default) are deleted when the gateway starts and every hour after that; `0` keeps them forever. The history is kept apart from the audit log's retention because it grows with every session rather than with administration. See the [configuration reference](deployment.md#history).
 
+## Sharing a session
+
+Users can let others into a session they have open, and administrators can watch any open session. Both work with molcajeted and with stock guacd, for every protocol.
+
+### Share links
+
+In the session menu (Ctrl+Alt+Shift), *Sharing* creates a link to the session: choose whether people with the link *Can watch* or *Can watch and control*, and when the link expires (at most `[sharing] max_link_minutes`, 24 hours by default). The link (`…/#/join/<token>`) is copied to the clipboard; send it to whoever should join.
+
+- **Who can open it.** Anyone who can sign in to the gateway, whatever their role. The link is the permission, to that one session: the person needs no grant of the connection, and does not get one. Someone who is not signed in is asked to sign in first.
+- **What they get.** The same screen as the owner, at the owner's size (their window only scales it). With a watch-only link their mouse and keys are dropped by the daemon; with a control link their mouse, keys and clipboard reach the remote desktop together with the owner's. They hear no sound and get nothing from the remote clipboard.
+- **How long it works.** A link stops working when it expires, when the owner revokes it in the menu, and when the owner's session ends. Revoking a link also disconnects everyone who joined through it (their page says **Access removed**); the owner leaving disconnects everyone who joined (**The session has ended**). Expiry only stops new joins. The token is stored only as a hash and shown once, so a link can be copied again only from the page that created it.
+- **Sessions opened by a [one-time session link](#one-time-session-links)** cannot be shared from the page: it has no signed-in user to manage the links.
+- **Who is connected.** The menu lists everyone connected to the session and how, and the owner's screen shows a notice while anyone else is connected, naming any administrator who is watching. The owner also gets a message when someone joins or leaves.
+
+Links live in the gateway's memory with their session: a restarted gateway has none. With more than one gateway replica, a link works only on the replica that serves the session (as for [ending sessions](#active-sessions)), so sharing needs the replicas behind sticky sessions or a single replica.
+
+### Watching a session (shadowing)
+
+*Watch* on a row of *Active sessions* opens the session for the administrator, watch-only: they see the screen and cannot type or click. The owner sees **…(administrator) is watching** on their screen for as long as they watch. Watching does not count against the session and ends when the owner's session ends.
+
+### Joined sessions elsewhere
+
+Everyone who joined has a row of their own in *Active sessions*, saying whose session they watch or control and how; *End* on it disconnects only them, while ending the owner's session disconnects everyone. Joined sessions are not stored in the connection history; the [audit log](#actions) records each join (`session.join`, `session.shadow`) and each link created and revoked (`session.share`, `session.unshare`). A joined session's user who is disabled or deleted is disconnected like any other; an administrator who is no longer one stops watching.
+
+`[sharing] links = false` turns share links off (the menu section disappears and existing tokens are refused), `[sharing] shadowing = false` turns watching off. See the [configuration reference](deployment.md#sharing).
+
 ## Audit log
 
 The gateway keeps a record of every administrative change and every sign-in in its database (`molcajete_audit_log`): who did it, from which address, what they did, to what, and which fields changed. It answers questions such as "who changed the password of connection X last week" or "who made user Y an administrator". Administrators read it under *Audit log*.
@@ -359,6 +385,9 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | `folder.create`, `folder.rename`, `folder.move`, `folder.delete` | Folders. |
 | `recording.download`, `recording.delete` | Recordings downloaded (playing one back in the page is not recorded) or deleted. |
 | `secrets.encrypt`, `secrets.rotate` | Stored credentials encrypted at start because they were in plain text (`count`), and re-encrypted by `rotate-key` (`count`, `keyId`). No actor. |
+| `session.share`, `session.unshare` | A user created a share link of their session (`linkId`, `readOnly`, `expiresAt`) or revoked one (`linkId`). The target is the session. |
+| `session.join` | A user joined a session through a share link (`linkId`, `readOnly`, `owner`, `connection`). The target is the session joined. |
+| `session.shadow` | An administrator started watching a session (`owner`, `connection`). The target is the session watched. |
 | `session.end` | An open session was ended, by an administrator or because its user was disabled, deleted or lost access ([Sessions that end by themselves](#sessions-that-end-by-themselves)). The target is the session (its tunnel id, named after the connection); `reason`, `user`, `connection` and `startedAt` are in the changes. |
 | `token.create`, `token.revoke` | [API tokens](#api-tokens) created (with their expiry and allowed addresses) or revoked; a token an administrator revoked for someone else carries its `owner`. |
 | `token.use` | An API token was used: the first time, from an address it was not last used from, and the first time after an hour without use. Not every request; the token's *Last used* shows the latest. |
@@ -453,6 +482,9 @@ curl -b cookies -OJ 'https://molcajete.example.com/api/recordings/<id>/file?down
 | `/api/tokens/{id}` | `DELETE` (revoke) | the owner, administrators |
 | `/api/connections/{id}/tickets` | `POST` (`{}` or `{"parameters": {…}}`; returns `{url, ticket, expiresAt}`) | users who can open the connection |
 | `/api/tickets/{ticket}` | `GET` (what the link opens, without using it up) | anyone with the ticket |
+| `/api/my-sessions/{page}` | `GET` (who joined your session and its links) | the session's user |
+| `/api/my-sessions/{page}/links`, `/api/my-sessions/{page}/links/{id}` | `POST` (`{"readOnly": true, "expiresInMinutes": 60}`), `DELETE` (revoke) | the session's user |
+| `/api/join/{token}` | `GET` (what a share link opens) | signed-in users |
 
 `GET /api/audit` returns `{"entries": […], "hasMore": true|false}`, newest first. Its query parameters, all optional: `actor` (username or user id), `action` (an action, or a prefix of whole parts such as `user` or `oidc.user`), `targetType` (`user`, `group`, `connection`, `folder`, `recording`, `session`, `token`), `target` (id or name), `from` and `to` (Unix milliseconds; `to` excluded), `limit` (default 100, at most 1000) and `offset`.
 
@@ -463,7 +495,9 @@ curl -b cookies -OJ 'https://molcajete.example.com/api/audit?target=office-pc&fo
 
 A connection read from `/api/connections/{id}` leaves its [credentials](#stored-credentials) out of `parameters` and names the stored ones in `storedSecrets`. Sending a connection back without a credential keeps the stored value, so a script can read, change and write a connection without knowing its password; a new value in `parameters` replaces it, and `"clearSecrets": ["password"]` removes it.
 
-`GET /api/sessions` returns the open sessions, oldest first, each with `id` (the tunnel id), `userId`, `username`, `connectionId`, `connectionName`, `protocol`, `peer`, `startedAt` (Unix milliseconds), `bytesToBrowser`, `bytesToGuacd`, `rttMs` (or `null`), `recordingId` (or `null`) and `guacdId` (the daemon's id of the connection). `DELETE /api/sessions` returns `{"ended": n}`.
+`GET /api/sessions` returns the open sessions, oldest first, each with `id` (the tunnel id), `userId`, `username`, `connectionId`, `connectionName`, `protocol`, `peer`, `startedAt` (Unix milliseconds), `bytesToBrowser`, `bytesToGuacd`, `rttMs` (or `null`), `recordingId` (or `null`), `guacdId` (the daemon's id of the connection), and for a session that [joined another](#sharing-a-session) `joinedTo` (that session's id), `joinKind` (`link` or `shadow`) and `readOnly`. `DELETE /api/sessions` returns `{"ended": n}`.
+
+`{page}` in `/api/my-sessions` is the id the page gave its tunnel (`page=` in the tunnel URL). A tunnel joins a session with `join=<token>` (a share link) or `shadow=<session id>` (administrators) in place of `connection=`. Creating a link returns its `token` once; the link opens at `<gateway>/#/join/<token>`.
 
 `GET /api/history` returns `{"entries": […], "hasMore": true|false}`, most recently started first. Its query parameters, all optional: `user` (username or user id), `connection` (id or name), `from` and `to` (start time in Unix milliseconds; `to` excluded), `limit` (default 100, at most 1000) and `offset`. An entry has `id`, `userId`, `username`, `connectionId`, `connectionName`, `protocol`, `peerAddress`, `startedAt`, `endedAt`, `endStatus` (Guacamole status; 0 when it closed normally), `endReason` and `endedBy` (`null` unless someone else ended it), `bytesToBrowser`, `bytesToGuacd` and `recordingId`.
 

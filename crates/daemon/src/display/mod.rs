@@ -25,6 +25,7 @@ mod source;
 mod video;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +34,7 @@ use molcajete_protocol::{apply_time, zimage};
 use rayon::prelude::*;
 
 use crate::io::Output;
+use crate::share::{Frame, Setup, Shared};
 
 use encode::Region;
 use metrics::{DisplayMetrics, ImageKind, Phase, timed};
@@ -120,7 +122,7 @@ impl Rect {
     }
 
     /// Clips to a `width`×`height` surface.
-    fn clip(&self, width: u32, height: u32) -> Rect {
+    pub(crate) fn clip(&self, width: u32, height: u32) -> Rect {
         let x = self.x.min(width);
         let y = self.y.min(height);
         Rect::new(
@@ -264,6 +266,9 @@ pub struct Display {
     /// The video stream currently covering a busy area.
     video: Option<video::ActiveVideo>,
     metrics: DisplayMetrics,
+    /// The connection others may join, when this is its display
+    /// ([`crate::share`]).
+    share: Option<Arc<Shared>>,
 }
 
 impl Drop for Display {
@@ -636,13 +641,47 @@ impl Display {
             video_support: None,
             video: None,
             metrics: DisplayMetrics::disabled(),
+            share: None,
         }
     }
 
     /// Labels this display's metrics with the remote desktop protocol.
+    ///
+    /// The display of a session is created with this, so it is also where
+    /// it learns the connection it shows, which other users may join
+    /// ([`crate::share::current`]).
     pub fn with_protocol(mut self, protocol: &'static str) -> Self {
         self.metrics = DisplayMetrics::new(protocol);
+        self.share = crate::share::current();
         self
+    }
+
+    /// Hands the framebuffer to the users who joined this connection, if
+    /// there are any: the tiles touched since the last frame, and all of it
+    /// when one of them still waits for its first frame.
+    fn share_frame(&self) {
+        let Some(share) = &self.share else {
+            return;
+        };
+        if !share.has_viewers() {
+            return;
+        }
+        let setup = Setup {
+            pacing: self.clock.pacing(),
+            lossless: self.lossless,
+            video: self.video_support.is_some(),
+        };
+        let regions = self.dirty_regions();
+        share.publish(
+            setup,
+            Frame {
+                width: self.width,
+                height: self.height,
+                pixels: &self.pixels,
+            },
+            &regions,
+            self.last_cursor.as_ref(),
+        );
     }
 
     /// Chooses how fast frames may follow each other. The default is
@@ -863,6 +902,8 @@ impl Display {
     pub fn flush(&mut self, out: &mut Output) -> FlushStats {
         let started = Instant::now();
         let mut stats = FlushStats::default();
+        // Before video mode takes tiles out of the comparison.
+        self.share_frame();
         self.decay();
         self.last_flush = started;
         // Busy areas may be covered by a video stream instead of images.
@@ -1817,6 +1858,9 @@ impl Display {
             return;
         }
         self.last_cursor = Some((hotspot_x, hotspot_y, width, height, pixels.to_vec()));
+        if let Some(share) = &self.share {
+            share.set_cursor(self.last_cursor.as_ref());
+        }
         let region = Region {
             width,
             height,
@@ -1869,6 +1913,15 @@ impl Display {
     /// that wait says nothing about the client or the network. Counting it
     /// would slow the frame rate down by our own CPU time.
     pub fn ack(&mut self, timestamp: i64, received: impl Into<SyncReply>) {
+        // A user who joined wakes the session this way to get its first
+        // frame without waiting for the screen to change.
+        if self
+            .share
+            .as_ref()
+            .is_some_and(|share| share.wants_snapshot())
+        {
+            self.share_frame();
+        }
         let received = received.into();
         if let Some(elapsed) = self.clock.acked(timestamp, received) {
             self.metrics
@@ -2142,4 +2195,4 @@ fn copy_rect_over(buf: &mut [u8], width: u32, src: &Rect, dx: u32, dy: u32) {
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -7,10 +7,10 @@ use super::*;
 
 /// A minimal Guacamole client for layer 0: replays emitted instructions so
 /// tests can check that what the client shows equals the framebuffer.
-struct Client {
+pub(crate) struct Client {
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    pub(crate) pixels: Vec<u8>,
     rect: Option<Rect>,
     streams: HashMap<i32, (String, i32, i32, i32, Vec<u8>)>,
     /// The client's own decoder of zstd images.
@@ -19,7 +19,7 @@ struct Client {
 }
 
 impl Client {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             width: 0,
             height: 0,
@@ -35,7 +35,7 @@ impl Client {
         ((y * self.width + x) * 4) as usize
     }
 
-    fn apply(&mut self, text: &str) {
+    pub(crate) fn apply(&mut self, text: &str) {
         let int = |s: &str| s.parse::<i64>().expect("integer argument");
         for ins in parse_all(text).expect("valid protocol") {
             let a = |i: usize| int(ins.arg(i));

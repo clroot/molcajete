@@ -78,6 +78,10 @@ struct Inbound {
 pub struct Input {
     pub instruction: Instruction,
     pub received: Instant,
+    /// Passed on from a user who joined the connection (see
+    /// [`crate::share`]): what it owes in return (stream acknowledgements)
+    /// went to that user already and is not sent to this client.
+    pub from_viewer: bool,
 }
 
 impl Deref for Input {
@@ -107,6 +111,13 @@ impl InputDecoder {
     /// Decodes one instruction. Acknowledgements owed to the client are
     /// appended to `out`.
     pub fn decode(&mut self, ins: &Input, out: &mut Output) -> Option<ClientEvent> {
+        let mut elsewhere;
+        let out = if ins.from_viewer {
+            elsewhere = Output::text();
+            &mut elsewhere
+        } else {
+            out
+        };
         let int = |i: usize| ins.arg(i).trim().parse::<i64>().ok();
         match ins.opcode.as_str() {
             "mouse" => Some(ClientEvent::Mouse {
@@ -225,13 +236,20 @@ impl InputDecoder {
 
 /// Reads client instructions in a background task. The channel closes when
 /// the client disconnects.
+///
+/// In a connection others may join, the channel also carries the input of
+/// the joined users who may control it ([`crate::share`]).
 pub fn spawn_reader(mut reader: GuacReader) -> (mpsc::Receiver<Input>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<Input>(512);
+    if let Some(shared) = crate::share::current() {
+        shared.set_input(tx.clone());
+    }
     let task = tokio::spawn(async move {
         while let Ok(Some(instruction)) = reader.next().await {
             let input = Input {
                 instruction,
                 received: Instant::now(),
+                from_viewer: false,
             };
             if tx.send(input).await.is_err() {
                 break;
@@ -364,6 +382,7 @@ mod tests {
         Input {
             instruction: parse_all(text).unwrap().remove(0),
             received: Instant::now(),
+            from_viewer: false,
         }
     }
 

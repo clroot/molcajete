@@ -45,6 +45,13 @@ port = 4822
 # max_lifetime_days = 365
 # ticket_ttl_seconds = 60
 
+# Sharing a live session through links, and administrators watching
+# sessions (docs/administration.md, "Sharing a session").
+# [sharing]
+# links = true                                  # users may create share links
+# shadowing = true                              # administrators may watch any session
+# max_link_minutes = 1440                       # the longest a link may last
+
 # Created as an administrator on startup if the username does not exist
 # yet; afterwards, manage users (and passwords) in the web UI. Without any
 # user, an "admin" account with a random password is created and logged.

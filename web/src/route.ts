@@ -13,11 +13,17 @@ export type Route =
   | {name: 'tokens'}
   | {name: 'ticket'; ticket: string}
   | {name: 'session'; connectionId: string}
+  | {name: 'join'; token: string}
+  | {name: 'watch'; sessionId: string}
   | {name: 'playback'; recordingId: string};
 
 export function parseRoute(hash: string): Route {
   const session = hash.match(/^#\/connect\/(.+)$/);
   if (session) return {name: 'session', connectionId: decodeURIComponent(session[1])};
+  const join = hash.match(/^#\/join\/(.+)$/);
+  if (join) return {name: 'join', token: decodeURIComponent(join[1])};
+  const watch = hash.match(/^#\/watch\/(.+)$/);
+  if (watch) return {name: 'watch', sessionId: decodeURIComponent(watch[1])};
   const playback = hash.match(/^#\/recordings\/(.+)$/);
   if (playback) return {name: 'playback', recordingId: decodeURIComponent(playback[1])};
   const ticket = hash.match(/^#\/ticket\/(.+)$/);
@@ -43,6 +49,7 @@ export const href = {
   tokens: '#/tokens',
   playback: (recordingId: string) => `#/recordings/${encodeURIComponent(recordingId)}`,
   session: (connectionId: string) => `#/connect/${encodeURIComponent(connectionId)}`,
+  watch: (sessionId: string) => `#/watch/${encodeURIComponent(sessionId)}`,
 };
 
 export function navigate(to: string) {

@@ -8,16 +8,20 @@
 //! ([`Database::connection_for_user`]), and ends those that would not open
 //! now. Live sessions are few, so checking them all is simpler and safer
 //! than working out who a change affects.
+//!
+//! A session that joined another needs no grant of the connection: a share
+//! link is the grant, and ends with its session. Its user must still exist
+//! and be enabled, and an administrator watching must still be one.
 
 use std::collections::HashMap;
 
 use tracing::{info, warn};
 
-use super::{EndReason, Ending, LiveSession};
+use super::{EndReason, Ending, JoinVia, LiveSession};
 use crate::AppState;
 use crate::audit::{self, Entry, action, target};
 use crate::auth::ClientAddress;
-use crate::db::{Database, DbError, User};
+use crate::db::{Database, DbError, Role, User};
 
 /// Ends the live sessions whose user may no longer open them, recording
 /// each in the audit log as done by `by`. Returns how many were ended.
@@ -97,6 +101,12 @@ async fn revoked(db: &Database, live: Vec<LiveSession>) -> Vec<(LiveSession, End
                 continue;
             }
         };
+        if let Some(joined) = session.joined {
+            if joined.via == JoinVia::Shadow && user.effective_role < Role::Admin {
+                revoked.push((session, EndReason::AccessRevoked));
+            }
+            continue;
+        }
         match db.connection_for_user(&session.connection_id, user).await {
             Ok(_) => {}
             Err(DbError::NotFound) => revoked.push((session, EndReason::AccessRevoked)),

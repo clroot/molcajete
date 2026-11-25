@@ -58,6 +58,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajeted_connections_active` | gauge | protocol | Open connections |
 | `molcajeted_connections_total` | counter | protocol, result | Connections by how they ended: `ok`, `error`, `handshake_failed`, `unsupported` (protocol `unknown` for the last two when the handshake did not get that far) |
 | `molcajeted_session_duration_seconds` | histogram | protocol | Session length |
+| `molcajeted_joined_users_active` | gauge | protocol | Users who joined a connection (share links, administrators watching); each also counts in the frame and image metrics, since it gets frames of its own |
 | `molcajeted_remote_received_bytes_total` | counter | protocol | Bytes read from the remote server's socket (`rdp`: TLS records, handshake included; `vnc`) |
 | `molcajeted_remote_frames_total` | counter | protocol | `rdp` only: frames the server marked the end of with Frame Marker surface commands (graphics pipeline frames are counted by `molcajeted_rdp_gfx_frames_total`). Zero for a server that sends classic bitmap updates; molcajeted then cannot keep its updates whole |
 | `molcajeted_remote_decode_seconds` | histogram | protocol | `rdp` only: decoding one PDU from the server (IronRDP, bitmap decompression and the graphics pipeline's codecs included) and copying its graphics updates into the display |
@@ -90,7 +91,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | --- | --- | --- | --- |
 | `molcajete_gateway_handshake_seconds` | histogram | connection, protocol | Handshake with molcajeted or guacd, including its connection to the remote server |
 | `molcajete_gateway_handshake_failures_total` | counter | connection, protocol | Failed handshakes |
-| `molcajete_gateway_tunnels_rejected_total` | counter | reason | Tunnels refused before a handshake: `unknown_connection` (no such connection, or the user may not open it) |
+| `molcajete_gateway_tunnels_rejected_total` | counter | reason | Tunnels refused before a handshake: `unknown_connection` (no such connection, or the user may not open it), `join` (an unknown, expired or revoked share link, or watching refused) |
 | `molcajete_gateway_recording_failures_total` | counter | connection, protocol | Sessions refused because their recording could not be started |
 | `molcajete_gateway_tunnels_active` | gauge | connection, protocol | Open tunnels |
 | `molcajete_gateway_tunnels_total` | counter | connection, protocol, status | Closed tunnels by Guacamole status code |
@@ -98,7 +99,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajete_gateway_relayed_bytes_total` | counter | connection, protocol, direction | Bytes relayed: `to_browser` (as read from the daemon), `to_guacd` |
 | `molcajete_gateway_logins_throttled_total` | counter | reason | Password sign-ins refused before the password was checked: `address` or `username` (too many failures, `429`), `busy` (no free password check within `verification_wait_secs`, `503`). See [Repeated failed sign-ins](administration.md#repeated-failed-sign-ins) |
 | `molcajete_gateway_audit_write_failures_total` | counter | | Audit log entries that could not be stored in the database (the change itself went through and the `audit` log line was written) |
-| `molcajete_gateway_sessions_ended_total` | counter | reason | Sessions ended by the gateway: `admin` (an administrator ended them), `user_disabled`, `user_deleted`, `access_revoked` |
+| `molcajete_gateway_sessions_ended_total` | counter | reason | Sessions ended by the gateway: `admin` (an administrator ended them), `user_disabled`, `user_deleted`, `access_revoked`, and for sessions that joined another `owner_left`, `link_revoked` |
 | `molcajete_gateway_history_write_failures_total` | counter | | Closed sessions that could not be stored in the connection history |
 
 ### Browser reports

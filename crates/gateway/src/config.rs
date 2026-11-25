@@ -32,6 +32,8 @@ pub struct Config {
     pub history: HistoryConfig,
     #[serde(default)]
     pub api_tokens: ApiTokensConfig,
+    #[serde(default)]
+    pub sharing: SharingConfig,
     /// Administrators created in the database on startup when no user with
     /// that name exists yet. Existing users and passwords are left alone.
     #[serde(default)]
@@ -360,6 +362,40 @@ fn default_token_lifetime_days() -> u64 {
 
 fn default_ticket_ttl_seconds() -> u64 {
     60
+}
+
+/// `[sharing]`: share links to live sessions, and administrators watching
+/// them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharingConfig {
+    /// Users may share their sessions through links.
+    #[serde(default = "yes")]
+    pub links: bool,
+    /// Administrators may watch any live session.
+    #[serde(default = "yes")]
+    pub shadowing: bool,
+    /// The longest a share link may last, in minutes.
+    #[serde(default = "default_max_link_minutes")]
+    pub max_link_minutes: u64,
+}
+
+impl Default for SharingConfig {
+    fn default() -> Self {
+        Self {
+            links: true,
+            shadowing: true,
+            max_link_minutes: default_max_link_minutes(),
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_max_link_minutes() -> u64 {
+    24 * 60
 }
 
 /// Session recording (connections with *Record sessions* on).
@@ -704,6 +740,13 @@ mod tests {
         assert_eq!(config.history.retention_days, 365);
         let config: Config = toml::from_str("[history]\nretention_days = 30\n").unwrap();
         assert_eq!(config.history.retention_days, 30);
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.sharing.links && config.sharing.shadowing);
+        assert_eq!(config.sharing.max_link_minutes, 1440);
+        let config: Config =
+            toml::from_str("[sharing]\nlinks = false\nmax_link_minutes = 60\n").unwrap();
+        assert!(!config.sharing.links && config.sharing.shadowing);
+        assert_eq!(config.sharing.max_link_minutes, 60);
     }
 
     #[test]

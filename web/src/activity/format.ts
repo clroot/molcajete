@@ -8,6 +8,8 @@ const REASONS: Record<EndReason, string> = {
   user_disabled: 'User disabled',
   user_deleted: 'User deleted',
   access_revoked: 'Access removed',
+  owner_left: 'Shared session ended',
+  link_revoked: 'Share link revoked',
 };
 
 /** Guacamole statuses a session commonly closes with. */
