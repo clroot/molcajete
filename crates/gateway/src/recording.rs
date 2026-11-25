@@ -72,6 +72,8 @@ pub struct Encoder {
     clock_offset: i64,
     /// Cuts the instruction records of the binary framing into instructions.
     records: molcajete_protocol::Parser,
+    /// Streams of files and directory listings, which are left out.
+    file_streams: std::collections::HashSet<i32>,
 }
 
 impl Encoder {
@@ -87,15 +89,23 @@ impl Encoder {
             last_time: 0,
             clock_offset: 0,
             records: molcajete_protocol::Parser::with_limits(molcajete_protocol::Limits::LENIENT),
+            file_streams: std::collections::HashSet::new(),
         }
     }
 
     /// An instruction from the daemon. The tunnel's own instructions (empty
-    /// opcode) are not part of the session.
+    /// opcode) are not part of the session, and neither is file transfer:
+    /// filesystems, listings and the files themselves (guacd does not
+    /// record them either, as they go to one user rather than the session).
     /// `now_ms` is when it reached the gateway (Unix milliseconds).
     pub fn server_instruction(&mut self, raw: &RawInstruction<'_>, now_ms: i64) {
+        let stream = |index: usize| raw.arg(index).parse::<i32>().ok();
         match raw.opcode() {
-            "" => {}
+            "" | "filesystem" | "undefine" | "get-error" => {}
+            "body" => self.file_streams.extend(stream(1)),
+            "file" => self.file_streams.extend(stream(0)),
+            "blob" if stream(0).is_some_and(|s| self.file_streams.contains(&s)) => {}
+            "end" if stream(0).is_some_and(|s| self.file_streams.remove(&s)) => {}
             "sync" => self.sync(raw, now_ms),
             _ => {
                 self.end_blob();
@@ -145,6 +155,9 @@ impl Encoder {
     /// consecutive data of a stream is cut into blobs of
     /// [`MAX_BLOB_BYTES`], whatever the records it came in.
     pub fn blob(&mut self, stream: i32, mut data: &[u8]) {
+        if self.file_streams.contains(&stream) {
+            return;
+        }
         if stream != self.partial_stream {
             self.end_blob();
         }
@@ -645,6 +658,35 @@ mod tests {
         encoder.blob(1, &data[7000..]);
         text.extend(encoder.finish());
         assert_eq!(String::from_utf8(text).unwrap(), expected);
+    }
+
+    #[test]
+    fn leaves_file_transfers_out() {
+        let mut encoder = Encoder::new(true, false);
+        raw_all(
+            "10.filesystem,1.0,4.SFTP;4.body,1.0,4.1000,24.application/octet-stream,2./a;\
+             3.img,1.3,2.14,1.0,9.image/png,1.0,1.0;4.blob,1.3,4.AAAA;",
+            |raw| encoder.server_instruction(raw, 0),
+        );
+        encoder.server_record(
+            Record::Blob {
+                stream: 1000,
+                data: b"secret",
+            },
+            0,
+        );
+        raw_all("4.blob,4.1000,4.AAAA;3.end,4.1000;3.end,1.3;", |raw| {
+            encoder.server_instruction(raw, 0)
+        });
+        let text = String::from_utf8(encoder.finish()).unwrap();
+        let instructions = molcajete_protocol::parse_all(&text).unwrap();
+        let opcodes: Vec<_> = instructions.iter().map(|i| i.opcode.as_str()).collect();
+        assert_eq!(opcodes, ["img", "blob", "end"], "{text}");
+        // The stream index may be used again for anything else.
+        raw_all("4.blob,4.1000,4.AAAA;", |raw| {
+            encoder.server_instruction(raw, 0)
+        });
+        assert!(!encoder.take().is_empty());
     }
 
     #[test]
