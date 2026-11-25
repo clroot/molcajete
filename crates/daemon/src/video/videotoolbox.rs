@@ -21,7 +21,7 @@ use std::ptr;
 use std::sync::{Mutex, PoisonError};
 
 use super::bitstream;
-use super::yuv::{self, ChromaLayout};
+use super::yuv;
 use super::{EncodedFrame, EncoderConfig, VideoCodec, VideoEncoder, VideoError, check_frame};
 
 type OSStatus = i32;
@@ -273,7 +273,8 @@ pub(crate) struct VideoToolboxEncoder {
     /// Written by the output callback; boxed so its address stays fixed.
     output: Box<Mutex<Output>>,
     config: EncoderConfig,
-    /// NV12 conversion buffer.
+    /// NV12 conversion buffer of the pre-GH-37 path (benchmarks only).
+    #[cfg(test)]
     yuv: Vec<u8>,
     frames: i64,
     /// Set after a failure: the next frame must be a key frame.
@@ -301,6 +302,7 @@ impl VideoToolboxEncoder {
             session,
             output,
             config: config.clone(),
+            #[cfg(test)]
             yuv: Vec::new(),
             frames: 0,
             restart: false,
@@ -386,9 +388,9 @@ impl VideoToolboxEncoder {
         }
     }
 
-    /// Copies the NV12 frame in `self.yuv` into a pixel buffer from the
-    /// session's pool (whose row stride may exceed the width).
-    fn pixel_buffer(&self) -> Result<CVPixelBufferRef, VideoError> {
+    /// Converts the RGBA frame straight into the planes of a pixel buffer
+    /// from the session's pool (whose row stride may exceed the width).
+    fn pixel_buffer(&mut self, rgba: &[u8]) -> Result<CVPixelBufferRef, VideoError> {
         let (width, height) = (self.config.width as usize, self.config.height as usize);
         unsafe {
             let pool = VTCompressionSessionGetPixelBufferPool(self.session);
@@ -406,23 +408,63 @@ impl VideoToolboxEncoder {
                 CVPixelBufferRelease(buffer);
                 return Err(err);
             }
-            let (luma, chroma) = self.yuv.split_at(width * height);
-            for (plane, data, rows) in [(0, luma, height), (1, chroma, height / 2)] {
-                let base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane);
-                let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane);
-                for (row, line) in data.chunks_exact(width).take(rows).enumerate() {
-                    ptr::copy_nonoverlapping(line.as_ptr(), base.add(row * stride), width);
-                }
+            // Each plane as a slice: `rows` rows of `stride` bytes (the
+            // last one only as long as the picture is wide).
+            let plane = |index: usize, rows: usize| {
+                let base = CVPixelBufferGetBaseAddressOfPlane(buffer, index);
+                let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, index);
+                (!base.is_null() && stride >= width).then(|| yuv::Plane {
+                    data: std::slice::from_raw_parts_mut(base, (rows - 1) * stride + width),
+                    stride,
+                })
+            };
+            let (Some(y), Some(uv)) = (plane(0, height), plane(1, height / 2)) else {
+                CVPixelBufferUnlockBaseAddress(buffer, 0);
+                CVPixelBufferRelease(buffer);
+                return Err(VideoError::Encoder(
+                    "VideoToolbox pixel buffer is not NV12 of the session's size".into(),
+                ));
+            };
+            #[cfg(test)]
+            if yuv::reference::LEGACY.get() {
+                self.fill_legacy(rgba, y, uv);
+                CVPixelBufferUnlockBaseAddress(buffer, 0);
+                return Ok(buffer);
             }
+            yuv::convert(
+                rgba,
+                width * 4,
+                width,
+                height,
+                yuv::Planes::SemiPlanar { y, uv },
+            );
             CVPixelBufferUnlockBaseAddress(buffer, 0);
             Ok(buffer)
         }
     }
 
-    fn encode_frame(&mut self, rgba: &[u8], force_key: bool) -> Result<Vec<u8>, VideoError> {
+    /// How the pixel buffer was filled before GH-37: converted into
+    /// `self.yuv` first and copied row by row (for the benchmarks).
+    #[cfg(test)]
+    fn fill_legacy(&mut self, rgba: &[u8], y: yuv::Plane<'_>, uv: yuv::Plane<'_>) {
         let (width, height) = (self.config.width as usize, self.config.height as usize);
-        yuv::rgba_to_yuv420(rgba, width, height, ChromaLayout::SemiPlanar, &mut self.yuv);
-        let buffer = self.pixel_buffer()?;
+        yuv::reference::rgba_to_yuv420(
+            rgba,
+            width,
+            height,
+            yuv::ChromaLayout::SemiPlanar,
+            &mut self.yuv,
+        );
+        let (luma, chroma) = self.yuv.split_at(width * height);
+        for (plane, data) in [(y, luma), (uv, chroma)] {
+            for (row, line) in data.chunks_exact(width).enumerate() {
+                plane.data[row * plane.stride..][..width].copy_from_slice(line);
+            }
+        }
+    }
+
+    fn encode_frame(&mut self, rgba: &[u8], force_key: bool) -> Result<Vec<u8>, VideoError> {
+        let buffer = self.pixel_buffer(rgba)?;
         let fps = self.config.fps as i32;
         let pts = CMTime {
             value: self.frames,
@@ -720,4 +762,110 @@ pub(crate) fn probe(codec: VideoCodec) -> Result<(), VideoError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn encoder(width: u32, height: u32) -> VideoToolboxEncoder {
+        let config = EncoderConfig {
+            codec: VideoCodec::H264,
+            width,
+            height,
+            fps: 30,
+            bitrate_kbps: 2000,
+        };
+        VideoToolboxEncoder::new(&config).expect("VideoToolbox H.264")
+    }
+
+    fn picture(width: u32, height: u32, seed: u32) -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|i| {
+                let (x, y) = (i % width, i / width);
+                let noise = (i ^ seed).wrapping_mul(2_654_435_761) >> 24;
+                [(x + seed) as u8, (y * 3) as u8, noise as u8, 255]
+            })
+            .collect()
+    }
+
+    /// The planes of a pixel buffer (Y, then UV), without the row padding.
+    fn planes(encoder: &mut VideoToolboxEncoder, rgba: &[u8], legacy: bool) -> Vec<u8> {
+        let (width, height) = (
+            encoder.config.width as usize,
+            encoder.config.height as usize,
+        );
+        yuv::reference::LEGACY.set(legacy);
+        let buffer = encoder.pixel_buffer(rgba);
+        yuv::reference::LEGACY.set(false);
+        let buffer = buffer.unwrap();
+        let mut out = Vec::new();
+        unsafe {
+            assert_eq!(CVPixelBufferLockBaseAddress(buffer, 0), 0);
+            for (plane, rows) in [(0, height), (1, height / 2)] {
+                let base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane);
+                let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane);
+                for row in 0..rows {
+                    out.extend_from_slice(std::slice::from_raw_parts(
+                        base.add(row * stride),
+                        width,
+                    ));
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, 0);
+            CVPixelBufferRelease(buffer);
+        }
+        out
+    }
+
+    #[test]
+    fn pixel_buffer_holds_the_same_nv12_as_before() {
+        // Not a multiple of the pool's row alignment.
+        let (width, height) = (202, 130);
+        let mut encoder = encoder(width, height);
+        let rgba = picture(width, height, 5);
+        let mut expected = Vec::new();
+        yuv::reference::rgba_to_yuv420(
+            &rgba,
+            width as usize,
+            height as usize,
+            yuv::ChromaLayout::SemiPlanar,
+            &mut expected,
+        );
+        assert_eq!(planes(&mut encoder, &rgba, true), expected);
+        assert_eq!(planes(&mut encoder, &rgba, false), expected);
+    }
+
+    /// Time to fill a pixel buffer from RGBA, before GH-37 and now:
+    /// `cargo test --release -p molcajete-daemon videotoolbox -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "benchmark"]
+    fn pixel_buffer_speed() {
+        for (width, height) in [(1920, 1088), (1344, 2176)] {
+            let mut encoder = encoder(width, height);
+            let rgba = picture(width, height, 1);
+            let mut time = |legacy: bool| {
+                let mut times: Vec<Duration> = (0..30)
+                    .map(|_| {
+                        yuv::reference::LEGACY.set(legacy);
+                        let start = Instant::now();
+                        let buffer = encoder.pixel_buffer(std::hint::black_box(&rgba));
+                        let elapsed = start.elapsed();
+                        yuv::reference::LEGACY.set(false);
+                        unsafe { CVPixelBufferRelease(buffer.unwrap()) };
+                        elapsed
+                    })
+                    .collect();
+                times.sort();
+                times[times.len() / 2].as_secs_f64() * 1000.0
+            };
+            let before = time(true);
+            let after = time(false);
+            eprintln!(
+                "VideoToolbox pixel buffer {width}x{height}: before GH-37 {before:.3} ms, now {after:.3} ms (median of 30)"
+            );
+        }
+    }
 }
