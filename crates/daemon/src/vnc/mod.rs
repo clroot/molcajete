@@ -8,7 +8,7 @@ use molcajete_protocol::Status;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::display::{Display, ImageFormats};
+use crate::display::{Display, ImageFormats, Pacing};
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
 use crate::send_error;
@@ -111,7 +111,8 @@ pub async fn run(
         ImageFormats::from_mimetypes(&info.image),
         params.bool("force-lossless"),
     )
-    .with_protocol("vnc");
+    .with_protocol("vnc")
+    .with_pacing(Pacing::DESKTOP);
     session::enable_video(&mut display, &info);
     session::send_name(writer.buffer(), &server.name);
     display.resize(server.width as u32, server.height as u32, writer.buffer());
@@ -232,6 +233,11 @@ pub async fn run(
                     }
                     Some(ClientEvent::Sync { timestamp, received }) => {
                         display.ack(timestamp, received);
+                        // A delivered frame may let the pending one go
+                        // earlier than the timer was set for.
+                        if frame_pending {
+                            frame_timer.as_mut().reset(display.next_frame_at().into());
+                        }
                         if want_update && display.unacked_frames() <= MAX_UNACKED_FRAMES {
                             want_update = false;
                             request_update(&mut rfb_writer, &display).await?;

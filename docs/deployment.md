@@ -262,7 +262,7 @@ histogram_quantile(0.99, sum by (le) (rate(molcajeted_socket_write_seconds_bucke
 | --- | --- | --- |
 | High `frame_flush` p95 | Server CPU | Narrow down with `flush_phase`, then look at the molcajeted CPU flamegraph for that time range |
 | High `phase="pixels"` and `image_encode{format="png"}` | PNG encoding | Compare bytes per pixel with encoding time and tune the compression level or the JPEG conditions |
-| `video_encode` above the frame interval (33 ms) | Video encoder | Compare codecs, and check whether a hardware encoder is available |
+| `video_encode` above the frame interval (16 ms at best for RDP and VNC) | Video encoder | Compare codecs, and check whether a hardware encoder is available |
 | High `client_ack` but low `client_frame_lag` | Network or proxy | Check `client_rtt`, proxy buffering and `socket_write` waits |
 | High `client_frame_lag` and `client_queued_ops` | Browser decoding or GPU | Compare `mode=main` with `worker`, and profile with the browser's DevTools Performance panel |
 | Long `socket_write` waits | Gateway or beyond | Look at the gateway flamegraph and the rate of `relayed_bytes` |

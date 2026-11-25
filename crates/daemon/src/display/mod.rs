@@ -19,9 +19,10 @@
 
 pub mod encode;
 mod metrics;
+mod pacing;
 mod video;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -29,6 +30,8 @@ use molcajete_protocol::InstructionBuilder;
 
 use encode::Region;
 use metrics::{DisplayMetrics, ImageKind, Phase, timed};
+use pacing::FrameClock;
+pub use pacing::Pacing;
 
 /// Largest raw chunk carried by one `blob` (same as libguac).
 const BLOB_MAX_BYTES: usize = 6048;
@@ -61,16 +64,6 @@ const HASH_B: u64 = 0x9e37_79b9_7f4a_7c15;
 const HOT: f32 = 3.0;
 /// Heat below which lossy areas are re-sent losslessly.
 const COOL: f32 = 0.25;
-
-/// Shortest interval between frames while content keeps changing (~30 fps).
-const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
-/// Frames carrying more encoded data than this count as heavy...
-const LARGE_FRAME_BYTES: usize = 32 * 1024;
-/// ...and are followed by a longer pause (~15 fps, similar to guacd under
-/// floods of output), which bounds the bandwidth of continuous heavy updates.
-const LARGE_FRAME_INTERVAL: Duration = Duration::from_millis(66);
-/// Upper bound for waiting on a slow client (same as guacd).
-const MAX_LAG_COMPENSATION: Duration = Duration::from_millis(500);
 
 const MODE_OVER: u8 = 0xE;
 const MODE_SRC: u8 = 0xC;
@@ -185,14 +178,10 @@ pub struct Display {
     lossless: bool,
     next_stream: i32,
     last_sync: Option<i64>,
-    /// Frames sent and not yet acknowledged: (timestamp, sent at).
-    pending_syncs: VecDeque<(i64, Instant)>,
-    /// Smoothed time the client needs to acknowledge a frame.
-    lag: Duration,
-    last_frame: Option<Instant>,
-    /// Encoded image bytes of the frame being built and of the last frame.
+    /// Frames sent, their acknowledgements, and when the next may go out.
+    clock: FrameClock,
+    /// Encoded image bytes of the frame being built.
     frame_bytes: usize,
-    last_frame_bytes: usize,
     /// Last cursor sent (hotspot, size, pixels), to drop redundant updates.
     last_cursor: Option<(u32, u32, u32, u32, Vec<u8>)>,
     /// Video encoding, when the client and the server both support it.
@@ -563,11 +552,8 @@ impl Display {
             lossless,
             next_stream: 0,
             last_sync: None,
-            pending_syncs: VecDeque::new(),
-            lag: Duration::ZERO,
-            last_frame: None,
+            clock: FrameClock::new(Pacing::TERMINAL),
             frame_bytes: 0,
-            last_frame_bytes: 0,
             last_cursor: None,
             video_support: None,
             video: None,
@@ -578,6 +564,13 @@ impl Display {
     /// Labels this display's metrics with the remote desktop protocol.
     pub fn with_protocol(mut self, protocol: &'static str) -> Self {
         self.metrics = DisplayMetrics::new(protocol);
+        self
+    }
+
+    /// Chooses how fast frames may follow each other. The default is
+    /// [`Pacing::TERMINAL`], the more careful of the two.
+    pub fn with_pacing(mut self, pacing: Pacing) -> Self {
+        self.clock.set_pacing(pacing);
         self
     }
 
@@ -1552,11 +1545,9 @@ impl Display {
         }
         let now = Instant::now();
         self.last_sync = Some(ts);
-        self.pending_syncs.push_back((ts, now));
-        self.last_frame = Some(now);
-        self.last_frame_bytes = std::mem::take(&mut self.frame_bytes);
-        self.metrics
-            .frame(self.last_frame_bytes, self.pending_syncs.len());
+        let bytes = std::mem::take(&mut self.frame_bytes);
+        self.clock.frame_sent(ts, now, bytes);
+        self.metrics.frame(bytes, self.clock.unacked());
         *out += &InstructionBuilder::new("sync").arg(ts).arg(1).finish();
     }
 
@@ -1567,28 +1558,19 @@ impl Display {
     /// that wait says nothing about the client or the network. Counting it
     /// would slow the frame rate down by our own CPU time.
     pub fn ack(&mut self, timestamp: i64, received: Instant) {
-        while let Some(&(ts, sent_at)) = self.pending_syncs.front() {
-            if ts > timestamp {
-                break;
-            }
-            self.pending_syncs.pop_front();
-            if ts == timestamp {
-                let elapsed = received.saturating_duration_since(sent_at);
-                self.metrics.acked(elapsed, received.elapsed());
-                let sample = elapsed.min(MAX_LAG_COMPENSATION);
-                self.lag = (self.lag * 3 + sample) / 4;
-            }
+        if let Some(elapsed) = self.clock.acked(timestamp, received) {
+            self.metrics.acked(elapsed, received.elapsed());
         }
     }
 
     /// Frames sent but not yet acknowledged by the client.
     pub fn unacked_frames(&self) -> u32 {
-        self.pending_syncs.len() as u32
+        self.clock.unacked() as u32
     }
 
     /// Smoothed time between sending a frame and the client acknowledging it.
     pub fn processing_lag(&self) -> Duration {
-        self.lag
+        self.clock.lag()
     }
 
     /// When a frame should be flushed even if nothing changes: to end an
@@ -1617,15 +1599,19 @@ impl Display {
     /// accumulated into that frame, which saves bandwidth on busy screens
     /// (intermediate states are never sent) and lets slow clients catch up.
     /// After a quiet period this is in the past, so input stays responsive.
+    ///
+    /// An acknowledgement can move this earlier (see [`Pacing`]), so a
+    /// session waiting for it asks again after every [`Display::ack`].
     pub fn next_frame_at(&self) -> Instant {
-        let mut interval = self.lag.clamp(MIN_FRAME_INTERVAL, MAX_LAG_COMPENSATION);
-        if self.last_frame_bytes > LARGE_FRAME_BYTES {
-            interval = interval.max(LARGE_FRAME_INTERVAL);
-        }
-        match self.last_frame {
-            Some(last) => last + interval,
-            None => Instant::now(),
-        }
+        // Rate control spends the video's bitrate per frame: more frames
+        // than it was told to expect would be more bits per second.
+        let slowest = match self.video {
+            Some(_) => Duration::from_secs(1) / video::FPS,
+            None => Duration::ZERO,
+        };
+        self.clock
+            .next_frame_at(slowest)
+            .unwrap_or_else(Instant::now)
     }
 }
 
