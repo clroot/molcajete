@@ -10,12 +10,12 @@ use std::time::Instant;
 
 use base64::Engine;
 use molcajete_protocol::video::VideoCodec;
-use molcajete_protocol::{Instruction, InstructionBuilder, Status};
+use molcajete_protocol::{Instruction, InstructionBuilder, Status, apply_time};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::display::Display;
+use crate::display::{Display, SyncReply};
 use crate::handshake::ClientInfo;
 use crate::io::{GuacReader, Output};
 use crate::video::VideoEncoders;
@@ -47,12 +47,14 @@ pub enum ClientEvent {
         name: String,
         value: String,
     },
-    /// The client finished drawing the frame with this timestamp. `received`
-    /// is when that reached us, which can be well before the session loop
-    /// gets to it (while it builds the next frame, for example).
+    /// The client finished drawing the frame with this timestamp.
+    /// `received` says when that reached us, which can be well before the
+    /// session loop gets to it (while it builds the next frame, for
+    /// example), and how long the client took to apply the frame if it
+    /// reports that.
     Sync {
         timestamp: i64,
-        received: Instant,
+        received: SyncReply,
     },
     /// The client acknowledged (or rejected) data of an outbound stream.
     Ack {
@@ -116,7 +118,10 @@ impl InputDecoder {
             }
             "sync" => int(0).map(|timestamp| ClientEvent::Sync {
                 timestamp,
-                received: ins.received,
+                received: SyncReply {
+                    at: ins.received,
+                    apply: apply_time::parse_reply(ins.arg(2)),
+                },
             }),
             "ack" => Some(ClientEvent::Ack {
                 stream: int(0)? as i32,
@@ -284,6 +289,7 @@ pub fn enable_video(display: &mut Display, info: &ClientInfo) {
 mod tests {
     use super::*;
     use molcajete_protocol::parse_all;
+    use std::time::Duration;
 
     fn ins(text: &str) -> Input {
         Input {
@@ -311,12 +317,32 @@ mod tests {
                 pressed: true
             })
         );
-        let sync = ins("4.sync,3.123;");
+        // Stock clients: the timestamp, perhaps a frame count.
+        for text in ["4.sync,3.123;", "4.sync,3.123,1.1;"] {
+            let sync = ins(text);
+            assert_eq!(
+                d.decode(&sync, &mut out),
+                Some(ClientEvent::Sync {
+                    timestamp: 123,
+                    received: sync.received.into(),
+                }),
+                "{text}"
+            );
+        }
+        // A molcajete client adds the time it took to apply the frame.
+        let sync = ins(&apply_time::sync_reply(
+            123,
+            1,
+            Duration::from_micros(17_500),
+        ));
         assert_eq!(
             d.decode(&sync, &mut out),
             Some(ClientEvent::Sync {
                 timestamp: 123,
-                received: sync.received
+                received: SyncReply {
+                    at: sync.received,
+                    apply: Some(Duration::from_micros(17_500)),
+                },
             })
         );
         assert_eq!(d.decode(&ins("4.size,1.0,3.768;"), &mut out), None);

@@ -193,6 +193,9 @@ pub enum Op {
         timestamp: i64,
         frames: u32,
         received_at: f64,
+        /// The server asked how long the frame takes to apply
+        /// (`molcajete_protocol::apply_time`).
+        apply_time: bool,
     },
 }
 
@@ -207,7 +210,12 @@ pub enum DisplayEvent {
     FrameComplete {
         timestamp: i64,
         frames: u32,
+        /// From its `sync` arriving to being applied.
         lag_ms: f64,
+        /// If the server asked for it: how long applying the frame kept
+        /// the client busy. Like `lag_ms`, but without waiting behind the
+        /// frames before it.
+        apply_ms: Option<f64>,
     },
     /// New cursor image (un-premultiplied RGBA, top row first).
     Cursor {
@@ -429,6 +437,9 @@ pub struct Display {
     events: Vec<DisplayEvent>,
     stats: RenderStats,
     unpresented: Unpresented,
+    /// When the last frame was applied (`performance.now()`, 0 before the
+    /// first).
+    last_applied: f64,
     /// When the first instruction of the frame being received arrived.
     frame_started: Option<f64>,
     /// Source of layer generations (unique across layers and re-creations).
@@ -473,6 +484,7 @@ impl Display {
             events: Vec::new(),
             stats: RenderStats::default(),
             unpresented: Unpresented::default(),
+            last_applied: 0.0,
             frame_started: None,
             generation_counter: 0,
             last_cursor: None,
@@ -581,18 +593,26 @@ impl Display {
                         timestamp,
                         frames,
                         received_at,
+                        apply_time,
                     } => {
                         self.queued_syncs -= 1;
                         self.frames.pop_oldest();
                         self.stats.frames_applied += 1;
                         self.needs_composite = true;
-                        let lag_ms = crate::scope::performance_now() - received_at;
+                        let now = crate::scope::performance_now();
+                        let lag_ms = now - received_at;
+                        // The time this frame kept the client busy: from
+                        // when it was complete or, if later, the frame
+                        // before it was applied.
+                        let apply_ms = (now - received_at.max(self.last_applied)).max(0.0);
+                        self.last_applied = now;
                         self.stats.lag.add(lag_ms);
                         self.unpresented.add(received_at + lag_ms);
                         self.events.push(DisplayEvent::FrameComplete {
                             timestamp,
                             frames,
                             lag_ms,
+                            apply_ms: apply_time.then_some(apply_ms),
                         });
                         break;
                     }

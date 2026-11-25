@@ -323,9 +323,12 @@ pub enum ServerInstruction<'a> {
     /// Parameters the server needs before it can continue (e.g. credentials).
     Required,
     /// End of a frame. `frames` is the number of logical frames combined.
+    /// `apply_time`: the server asks for the time the frame took to apply
+    /// (molcajete extension, [`crate::apply_time`]).
     Sync {
         timestamp: i64,
         frames: u32,
+        apply_time: bool,
     },
     /// Any opcode this decoder does not know about.
     Unknown {
@@ -648,6 +651,7 @@ impl<'a> ServerInstruction<'a> {
                 } else {
                     0
                 },
+                apply_time: crate::apply_time::is_request(d.s(2)),
             },
             other => S::Unknown { opcode: other },
         })
@@ -685,14 +689,16 @@ mod tests {
             ServerInstruction::decode(&&a).unwrap(),
             ServerInstruction::Sync {
                 timestamp: 1_700_000_000_000,
-                frames: 0
+                frames: 0,
+                apply_time: false,
             }
         );
         assert_eq!(
             ServerInstruction::decode(&&b).unwrap(),
             ServerInstruction::Sync {
                 timestamp: 42,
-                frames: 3
+                frames: 3,
+                apply_time: false,
             }
         );
     }
