@@ -49,7 +49,7 @@ remote server -> molcajeted: receive and decode / diff / scroll and move detecti
               -> gateway relay -> WebSocket -> browser: receive and parse / decode / apply / draw -> sync ack
 ```
 
-Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duration_seconds` use buckets up to 8 hours, `_bytes` up to 16 MiB, `_fps` up to 144, and `_ops` and `_frames` small counts up to 1024. Both processes also export `molcajete_build_info{service, version}` (always 1), to tell which version produced a series.
+Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duration_seconds` use buckets up to 8 hours, `_bytes` up to 16 MiB, `_fps` up to 144, and `_ops`, `_frames` and `_images` small counts up to 1024. Both processes also export `molcajete_build_info{service, version}` (always 1), to tell which version produced a series.
 
 ### molcajeted
 

@@ -39,7 +39,8 @@ const DURATION_BUCKETS: &[f64] = &[
 const FPS_BUCKETS: &[f64] = &[
     1.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 45.0, 60.0, 90.0, 120.0, 144.0,
 ];
-/// Buckets for queue lengths and other small counts (`*_ops`, `*_frames`).
+/// Buckets for queue lengths and other small counts (`*_ops`, `*_frames`,
+/// `*_images`).
 const COUNT_BUCKETS: &[f64] = &[
     0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 1024.0,
 ];
@@ -148,8 +149,10 @@ pub async fn start(args: &TelemetryArgs, service: &'static str) -> anyhow::Resul
     Ok(true)
 }
 
-fn install_recorder() -> anyhow::Result<PrometheusHandle> {
-    let handle = PrometheusBuilder::new()
+/// The exporter with each histogram family's buckets, picked by name suffix;
+/// anything else is a latency.
+fn builder() -> anyhow::Result<PrometheusBuilder> {
+    Ok(PrometheusBuilder::new()
         .set_buckets(LATENCY_BUCKETS)?
         .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".into()),
@@ -159,7 +162,11 @@ fn install_recorder() -> anyhow::Result<PrometheusHandle> {
         .set_buckets_for_metric(Matcher::Suffix("_fps".into()), FPS_BUCKETS)?
         .set_buckets_for_metric(Matcher::Suffix("_ops".into()), COUNT_BUCKETS)?
         .set_buckets_for_metric(Matcher::Suffix("_frames".into()), COUNT_BUCKETS)?
-        .install_recorder()?;
+        .set_buckets_for_metric(Matcher::Suffix("_images".into()), COUNT_BUCKETS)?)
+}
+
+fn install_recorder() -> anyhow::Result<PrometheusHandle> {
+    let handle = builder()?.install_recorder()?;
     // Histograms are kept in rolling buckets; drain them regularly so memory
     // stays bounded even when nothing scrapes /metrics.
     let upkeep = handle.clone();
@@ -287,5 +294,64 @@ pub async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Renders one observation of 3 for each histogram through the exporter.
+    fn render(names: &[&'static str]) -> String {
+        let recorder = builder().unwrap().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for name in names {
+                metrics::histogram!(*name).record(3.0);
+            }
+        });
+        handle.render()
+    }
+
+    #[test]
+    fn count_histograms_get_count_buckets() {
+        let names = ["molcajeted_frame_images", "molcajeted_unacked_frames"];
+        let out = render(&names);
+        for name in names {
+            assert!(
+                out.contains(&format!("{name}_bucket{{le=\"2\"}} 0")),
+                "{out}"
+            );
+            assert!(
+                out.contains(&format!("{name}_bucket{{le=\"4\"}} 1")),
+                "{out}"
+            );
+            assert!(
+                out.contains(&format!("{name}_bucket{{le=\"1024\"}} 1")),
+                "{out}"
+            );
+            assert!(
+                !out.contains(&format!("{name}_bucket{{le=\"0.00025\"}}")),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn latency_histograms_keep_latency_buckets() {
+        let name = "molcajeted_frame_flush_seconds";
+        let out = render(&[name]);
+        assert!(
+            out.contains(&format!("{name}_bucket{{le=\"0.00025\"}} 0")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("{name}_bucket{{le=\"5\"}} 1")),
+            "{out}"
+        );
+        assert!(
+            !out.contains(&format!("{name}_bucket{{le=\"1024\"}}")),
+            "{out}"
+        );
     }
 }
