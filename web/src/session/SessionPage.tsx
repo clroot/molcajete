@@ -9,6 +9,8 @@ import {useMolcajeteClient} from './useMolcajeteClient';
 import {useMenuShortcut} from './useMenuShortcut';
 import {useConnection} from './useConnection';
 import {useRemoteComposition} from './useRemoteComposition';
+import {effectiveDisplay, readDisplayChoices, tunnelOverrides, useDisplayChoices} from './displaySettings';
+import {screenDpi} from './displayScale';
 import StatusOverlay from './StatusOverlay';
 import CredentialsDialog from './CredentialsDialog';
 import SessionMenu, {type ScaleMode} from './SessionMenu';
@@ -25,12 +27,16 @@ const leave = () => navigate(href.connections);
 
 /** Protocols whose remote side runs its own input method. SSH is a terminal drawn by the daemon. */
 const hasRemoteIme = (protocol: string | null) => protocol === 'rdp' || protocol === 'vnc';
+/** Protocols whose scale and resizing the session menu changes. */
+const hasRemoteDisplay = (protocol: string | null) => protocol === 'rdp';
 
 export default function SessionPage({connectionId}: {connectionId: string}) {
   const displayRef = useRef<HTMLDivElement>(null);
   const [session, dispatch] = useSessionEvents();
-  const {name: connectionName, protocol} = useConnection(connectionId);
+  const {name: connectionName, protocol, display: connectionDisplay} = useConnection(connectionId);
   const [remoteComposition, setRemoteComposition] = useRemoteComposition(connectionId);
+  const displayChoices = useDisplayChoices(connectionId);
+  const display = effectiveDisplay(displayChoices.choices, connectionDisplay);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [scaleMode, setScaleMode] = useState<ScaleMode>('fit');
   const [showStats, setShowStats] = useState(false);
@@ -48,13 +54,30 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
     (detail: string) => dispatch({type: 'failed', title: 'The client could not start', detail}),
     [dispatch],
   );
-  const {client, mode, connect} = useMolcajeteClient({displayRef, connectionId, onEvent, onStartFailed});
+  // Read at every connect, so a reconnect starts with the latest choices.
+  const tunnelParameters = useCallback(
+    () => tunnelOverrides(readDisplayChoices(connectionId)),
+    [connectionId],
+  );
+  const {client, mode, connect} = useMolcajeteClient({
+    displayRef,
+    connectionId,
+    tunnelParameters,
+    onEvent,
+    onStartFailed,
+  });
 
   // `mode` is set once the client exists.
   const composesRemotely = remoteComposition && hasRemoteIme(protocol);
   useEffect(() => {
     if (mode) client()?.set_remote_composition(composesRemotely);
   }, [mode, client, composesRemotely]);
+
+  // The window's size only goes to servers that follow it.
+  const followsWindow = hasRemoteDisplay(protocol) ? display.resize : true;
+  useEffect(() => {
+    if (mode) client()?.set_auto_resize(followsWindow);
+  }, [mode, client, followsWindow]);
 
   const reconnect = () => {
     dispatch({type: 'reconnecting'});
@@ -127,6 +150,16 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
         onScaleModeChange={mode => {
           setScaleMode(mode);
           client()?.set_scale_mode(mode);
+        }}
+        remoteDisplay={hasRemoteDisplay(protocol) ? {...display, canChange: session.canChangeDisplay} : null}
+        onRemoteScaleChange={scale => {
+          displayChoices.setScale(scale);
+          client()?.send_argv('dpi', String(scale === 'auto' ? screenDpi() : scale));
+        }}
+        onResizeToWindowChange={resize => {
+          displayChoices.setResize(resize);
+          // Before the size the effect sends, so that the server applies it.
+          client()?.send_argv('resize-method', resize ? 'display-update' : '');
         }}
         showStats={showStats}
         onShowStatsChange={setShowStats}

@@ -19,6 +19,9 @@ export type ConnectionSummary = {
   port: string | null;
   guacdHost: string | null;
   guacdPort: number | null;
+  /** The `dpi` and `resize-method` parameters, for the session menu. */
+  dpi: string | null;
+  resizeMethod: string | null;
 };
 
 export type Connection = {

@@ -35,6 +35,8 @@ export type SessionEvent =
   | {type: 'clipboard'; detail: string}
   | {type: 'required'; detail: string[]}
   | {type: 'unstable'; detail: boolean}
+  /** Whether the server can change the remote display during the session (molcajeted only). */
+  | {type: 'display-control'; detail: boolean}
   | {type: 'stats'; detail: SessionStats};
 
 export interface MolcajeteSession {
@@ -48,6 +50,8 @@ export interface MolcajeteSession {
   send_argv(name: string, value: string): void;
   send_ctrl_alt_del(): void;
   set_scale_mode(mode: 'fit' | 'native'): void;
+  /** Whether window size changes are sent to the server; turning it on sends the current size. */
+  set_auto_resize(enabled: boolean): void;
   /** The remote host's IME composes text; keys are sent as pressed. */
   set_remote_composition(enabled: boolean): void;
   release_keys(): void;
