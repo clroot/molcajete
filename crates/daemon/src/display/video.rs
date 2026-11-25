@@ -36,6 +36,19 @@ pub(super) const VIDEO_STREAM: i32 = 101;
 /// so this is reached after ~0.3 s at 30 fps, ~0.6 s at 15 fps, and never
 /// below ~6 updates per second.
 pub(super) const MOTION_HOT: f32 = 8.0;
+/// Motion score at which a tile counts as busy when it is part of a large
+/// area. A remote server refreshes a large picture only a few times per
+/// second (Windows sent a 7 MP player 2.4 times per second, in pieces), and
+/// sent that often a tile settles near 3.5, far below [`MOTION_HOT`], while
+/// every refresh costs megapixels of JPEG. This score is held from about 1.4
+/// updates per second.
+const MOTION_WARM: f32 = 2.0;
+/// Busy tiles (≈ 0.5 MP) from which an area counts as large.
+const LARGE_TILES: usize = 128;
+/// How long a large area must stay busy before its video starts. A page
+/// that is painted three times while it loads is as busy for a moment, but
+/// not for this long.
+const SUSTAINED: Duration = Duration::from_millis(1000);
 /// Smallest busy area worth a video stream, in tiles (≈ 25k pixels).
 const MIN_TILES: usize = 6;
 /// Shortest side of a video. A strip (a taskbar animation, a progress bar)
@@ -81,6 +94,9 @@ pub(super) struct VideoSupport {
     codecs: Vec<(VideoCodec, u64)>,
     factory: Mutex<EncoderFactory>,
     failures: u32,
+    /// Since when a large area has been busy at [`MOTION_WARM`] without a
+    /// pause.
+    large_since: Option<Instant>,
 }
 
 impl VideoSupport {
@@ -213,6 +229,7 @@ impl Display {
             codecs,
             factory: Mutex::new(factory),
             failures: 0,
+            large_since: None,
         });
     }
 
@@ -243,39 +260,89 @@ impl Display {
         }
     }
 
-    /// Bounding box (tile-aligned, clipped) and count of busy tiles.
-    fn busy_area(&self) -> Option<(Rect, usize)> {
-        let (mut x0, mut y0, mut x1, mut y1, mut count) = (u32::MAX, u32::MAX, 0, 0, 0usize);
-        for ty in 0..self.tile_rows {
-            for tx in 0..self.tile_cols {
-                if self.motion[(ty * self.tile_cols + tx) as usize] >= MOTION_HOT {
-                    x0 = x0.min(tx);
-                    y0 = y0.min(ty);
-                    x1 = x1.max(tx + 1);
-                    y1 = y1.max(ty + 1);
-                    count += 1;
+    /// The largest group of adjoining tiles with a motion score of `score`
+    /// or more: its bounding box (tile-aligned, clipped) and tile count.
+    ///
+    /// Only one group is looked at, so that something else moving on the
+    /// screen (a taskbar animation under a player) neither stretches the
+    /// box nor thins it out.
+    fn busy_area(&self, score: f32) -> Option<(Rect, usize)> {
+        let (cols, rows) = (self.tile_cols as usize, self.tile_rows as usize);
+        let mut seen = vec![false; cols * rows];
+        let mut stack = Vec::new();
+        // (tile count, first column, first row, end column, end row)
+        let mut best: Option<(usize, usize, usize, usize, usize)> = None;
+        for start in 0..cols * rows {
+            if seen[start] || self.motion[start] < score {
+                continue;
+            }
+            seen[start] = true;
+            stack.push(start);
+            let (mut count, mut x0, mut y0, mut x1, mut y1) = (0, cols, rows, 0, 0);
+            while let Some(i) = stack.pop() {
+                let (tx, ty) = (i % cols, i / cols);
+                count += 1;
+                x0 = x0.min(tx);
+                y0 = y0.min(ty);
+                x1 = x1.max(tx + 1);
+                y1 = y1.max(ty + 1);
+                let neighbours = [
+                    (tx > 0).then(|| i - 1),
+                    (tx + 1 < cols).then(|| i + 1),
+                    (ty > 0).then(|| i - cols),
+                    (ty + 1 < rows).then(|| i + cols),
+                ];
+                for n in neighbours.into_iter().flatten() {
+                    if !seen[n] && self.motion[n] >= score {
+                        seen[n] = true;
+                        stack.push(n);
+                    }
                 }
             }
+            if best.is_none_or(|(most, ..)| count > most) {
+                best = Some((count, x0, y0, x1, y1));
+            }
         }
-        if count == 0 {
-            return None;
-        }
-        let rect = Rect::new(x0 * TILE, y0 * TILE, (x1 - x0) * TILE, (y1 - y0) * TILE)
-            .clip(self.width, self.height);
+        let (count, x0, y0, x1, y1) = best?;
+        let rect = Rect::new(
+            x0 as u32 * TILE,
+            y0 as u32 * TILE,
+            (x1 - x0) as u32 * TILE,
+            (y1 - y0) as u32 * TILE,
+        )
+        .clip(self.width, self.height);
         Some((rect, count))
     }
 
-    /// The busy area, if it qualifies for a video stream.
-    fn video_candidate(&self) -> Option<Rect> {
-        let (rect, count) = self.busy_area()?;
+    /// The busy area at `score`, if it has `min_tiles` busy tiles and the
+    /// shape and content of a video.
+    fn video_area(&self, score: f32, min_tiles: usize) -> Option<Rect> {
+        let (rect, count) = self.busy_area(score)?;
         let tiles = (rect.w.div_ceil(TILE) * rect.h.div_ceil(TILE)) as usize;
-        if count < MIN_TILES || (count as f32) < MIN_DENSITY * tiles as f32 {
+        if count < min_tiles || (count as f32) < MIN_DENSITY * tiles as f32 {
             return None;
         }
         if rect.w < MIN_SIDE || rect.h < MIN_SIDE {
             return None;
         }
         (self.sampled_colors(&rect) > MIN_COLORS).then_some(rect)
+    }
+
+    /// The busy area, if it qualifies for a video stream: at once when its
+    /// tiles are sent many times per second, and after [`SUSTAINED`] when it
+    /// is large and sent a few times per second.
+    fn video_candidate(&mut self, now: Instant) -> Option<Rect> {
+        let large = self.video_area(MOTION_WARM, LARGE_TILES);
+        let support = self.video_support.as_mut()?;
+        let since = match large {
+            Some(_) => Some(*support.large_since.get_or_insert(now)),
+            None => support.large_since.take(),
+        };
+        let sustained = since.is_some_and(|since| now >= since + SUSTAINED);
+        // The large area contains the hot one wherever both exist.
+        large
+            .filter(|_| sustained)
+            .or_else(|| self.video_area(MOTION_HOT, MIN_TILES))
     }
 
     /// Distinct colours among ~2048 pixels sampled evenly from `rect` (like
@@ -303,7 +370,7 @@ impl Display {
             return FlushStats::default();
         }
         let now = Instant::now();
-        let candidate = self.video_candidate();
+        let candidate = self.video_candidate(now);
 
         let Some(active) = &mut self.video else {
             return match candidate {
@@ -653,6 +720,7 @@ mod tests {
             codecs: vec![(VideoCodec::Av1, 1000), (VideoCodec::H265, 5000)],
             factory: Mutex::new(Box::new(|c| Err(VideoError::Unavailable(c.codec)))),
             failures: 0,
+            large_since: None,
         };
         assert_eq!(support.codec_for(1000), VideoCodec::Av1);
         assert_eq!(support.codec_for(1001), VideoCodec::H265);
@@ -688,6 +756,10 @@ mod tests {
     }
 
     fn display_with_video() -> (Display, EncodeLog) {
+        display_of(640, 480)
+    }
+
+    fn display_of(width: u32, height: u32) -> (Display, EncodeLog) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut display = Display::new(
             ImageFormats {
@@ -707,9 +779,91 @@ mod tests {
             }),
         );
         let mut out = Output::text();
-        display.resize(640, 480, &mut out);
+        display.resize(width, height, &mut out);
         display.flush(&mut out);
         (display, log)
+    }
+
+    /// A 1280×800 display showing colourful content, whose tiles under
+    /// `rect` (tile-aligned) have the motion score `score`.
+    fn display_with_motion(rect: Rect, score: f32) -> Display {
+        let (mut display, _log) = display_of(1280, 800);
+        display.put(0, 0, 1280, 800, &noise(1, 1280, 800));
+        set_motion(&mut display, rect, score);
+        display
+    }
+
+    fn set_motion(display: &mut Display, rect: Rect, score: f32) {
+        let (cols, rows) = display.tiles_of(&rect);
+        for ty in rows {
+            for tx in cols.clone() {
+                display.motion[(ty * display.tile_cols + tx) as usize] = score;
+            }
+        }
+    }
+
+    /// The score a tile settles at when it is sent `per_second` times per
+    /// second: one more each time, halved every second.
+    fn settled(per_second: f32) -> f32 {
+        per_second / std::f32::consts::LN_2
+    }
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// What a Windows host does with a large player: every tile a few
+    /// times per second, never often enough to be hot.
+    #[test]
+    fn a_large_area_repainted_slowly_becomes_a_video() {
+        let player = Rect::new(64, 64, 1024, 512);
+        let score = settled(2.4);
+        assert!(score < MOTION_HOT);
+        let mut display = display_with_motion(player, score);
+        let t0 = Instant::now();
+        assert_eq!(display.video_candidate(t0), None);
+        assert_eq!(display.video_candidate(t0 + SECOND / 2), None);
+        assert_eq!(display.video_candidate(t0 + SECOND), Some(player));
+    }
+
+    #[test]
+    fn a_small_area_repainted_slowly_stays_images() {
+        let mut display = display_with_motion(Rect::new(64, 64, 448, 256), settled(2.4));
+        let t0 = Instant::now();
+        assert_eq!(display.video_candidate(t0), None);
+        assert_eq!(display.video_candidate(t0 + 5 * SECOND), None);
+    }
+
+    /// A page that is painted three times while it loads: as busy as a
+    /// video for a moment, and a second later it is not.
+    #[test]
+    fn a_large_area_repainted_briefly_stays_images() {
+        let page = Rect::new(64, 64, 1024, 512);
+        let mut display = display_with_motion(page, 3.0);
+        let t0 = Instant::now();
+        assert_eq!(display.video_candidate(t0), None);
+        set_motion(&mut display, page, 3.0 / 2.0);
+        assert_eq!(display.video_candidate(t0 + SECOND), None);
+        // Busy again later: the second counts from then.
+        set_motion(&mut display, page, 3.0);
+        assert_eq!(display.video_candidate(t0 + 10 * SECOND), None);
+        assert_eq!(display.video_candidate(t0 + 11 * SECOND), Some(page));
+    }
+
+    #[test]
+    fn a_hot_area_becomes_a_video_at_once() {
+        let player = Rect::new(64, 64, 320, 256);
+        let mut display = display_with_motion(player, MOTION_HOT);
+        assert_eq!(display.video_candidate(Instant::now()), Some(player));
+    }
+
+    /// Something else that moves (here a strip along the bottom, wider than
+    /// the player) is not part of the video and does not keep it from
+    /// starting.
+    #[test]
+    fn the_largest_busy_group_is_the_video() {
+        let player = Rect::new(64, 64, 512, 320);
+        let mut display = display_with_motion(player, MOTION_HOT);
+        set_motion(&mut display, Rect::new(0, 704, 1280, 64), MOTION_HOT);
+        assert_eq!(display.video_candidate(Instant::now()), Some(player));
     }
 
     /// Noisy, colourful content that changes every frame.
