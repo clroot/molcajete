@@ -174,7 +174,13 @@ export class MolcajeteSession {
     this.#worker = worker;
     const ready = new Promise((resolve) => {
       worker.onmessage = ({ data }) => {
-        if (data.type === "ready") resolve();
+        if (data.type === "ready") {
+          // The worker says whether its client decodes zstd images. A
+          // worker of an earlier version does not say, and must not be
+          // sent a type it would drop.
+          if (data.zstd !== true) this.#zstd = false;
+          resolve();
+        }
         else if (data.type === "event") this.#onEvent(data.event, data.detail);
         else if (data.type === "result") {
           const request = this.#requests.get(data.id);
