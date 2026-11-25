@@ -6,27 +6,21 @@
 //! never sees a half-drawn frame, while the actual pixel work happens on the
 //! GPU through [`crate::gl::Renderer`].
 
+mod frames;
 pub mod path;
 
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
 
 use molcajete_protocol::{CompositeMode, LineCap, LineJoin, TransferFunction};
 
 use crate::geom::{Affine, Rect};
 use crate::gl::{Clip, CompositeItem, CompositeNode, Paint, Readback, Renderer, Surface};
 use crate::image::DecodedImage;
+use frames::Frames;
 use path::{Path, Shape};
 
-/// Decoding state of an image referenced by a queued draw.
-pub enum ImageState {
-    Pending,
-    Ready(DecodedImage),
-    Failed,
-}
-
-pub type ImageSlot = Rc<RefCell<ImageState>>;
+pub type ImageState = frames::ImageState<DecodedImage>;
+pub type ImageSlot = frames::ImageSlot<DecodedImage>;
 
 /// Drawing operations, already decoded from instructions.
 #[derive(Debug, Clone)]
@@ -390,6 +384,8 @@ pub struct Display {
     order_counter: u64,
     queue: VecDeque<Op>,
     queued_syncs: usize,
+    /// The images each queued frame still waits for.
+    frames: Frames,
     width: u32,
     height: u32,
     cursor: SoftwareCursor,
@@ -431,6 +427,7 @@ impl Display {
             order_counter: 1,
             queue: VecDeque::new(),
             queued_syncs: 0,
+            frames: Frames::default(),
             width: 0,
             height: 0,
             cursor: SoftwareCursor::default(),
@@ -494,6 +491,7 @@ impl Display {
     pub fn reset(&mut self) {
         self.queue.clear();
         self.queued_syncs = 0;
+        self.frames = Frames::default();
         self.layers.clear();
         self.layers.insert(0, Layer::new(0, 0, false));
         self.cursor = SoftwareCursor::default();
@@ -510,13 +508,18 @@ impl Display {
     // ------------------------------------------------------------------
 
     pub fn enqueue(&mut self, op: Op) {
-        match op {
+        match &op {
             Op::Sync { received_at, .. } => {
+                let received_at = *received_at;
                 self.queued_syncs += 1;
+                self.frames.end_frame();
                 let started = self.frame_started.take().unwrap_or(received_at);
                 self.stats.receive.add(received_at - started);
             }
             _ => {
+                if let Op::Image { slot, .. } = &op {
+                    self.frames.add_image(slot);
+                }
                 self.frame_started
                     .get_or_insert_with(crate::scope::performance_now);
             }
@@ -531,15 +534,9 @@ impl Display {
 
     /// Executes every complete frame whose images are ready.
     pub fn process(&mut self) {
-        while self.queued_syncs > 0 {
-            let blocked = self
-                .queue
-                .iter()
-                .take_while(|op| !matches!(op, Op::Sync { .. }))
-                .any(|op| matches!(op, Op::Image { slot, .. } if matches!(*slot.borrow(), ImageState::Pending)));
-            if blocked {
-                return;
-            }
+        // This runs after every decoded image, so whether the oldest frame
+        // still waits for one is counted rather than searched for.
+        while self.queued_syncs > 0 && !self.frames.oldest_is_waiting() {
             while let Some(op) = self.queue.pop_front() {
                 match op {
                     Op::Sync {
@@ -548,6 +545,7 @@ impl Display {
                         received_at,
                     } => {
                         self.queued_syncs -= 1;
+                        self.frames.pop_oldest();
                         self.stats.frames_applied += 1;
                         self.needs_composite = true;
                         let lag_ms = crate::scope::performance_now() - received_at;
@@ -567,8 +565,7 @@ impl Display {
                         y,
                         slot,
                     } => {
-                        let state = std::mem::replace(&mut *slot.borrow_mut(), ImageState::Failed);
-                        if let ImageState::Ready(image) = state {
+                        if let ImageState::Ready(image) = slot.take() {
                             self.draw_image(layer, mode, x, y, &image);
                             image.close();
                         }

@@ -73,7 +73,7 @@ type Pending = Rc<RefCell<VecDeque<ImageSlot>>>;
 
 fn fail_all(pending: &Pending) {
     for slot in pending.borrow_mut().drain(..) {
-        *slot.borrow_mut() = ImageState::Failed;
+        slot.finish(ImageState::Failed);
     }
 }
 
@@ -108,7 +108,7 @@ impl VideoStream {
                         source: frame,
                         opaque: true,
                     };
-                    *slot.borrow_mut() = ImageState::Ready(image);
+                    slot.finish(ImageState::Ready(image));
                 }
                 None => {
                     // More frames than requested: release it immediately.
@@ -180,11 +180,11 @@ impl VideoStream {
                 &js_sys::Uint8Array::from(frame.payload.as_slice()).into(),
             );
             let chunk = JsEncodedVideoChunk::new(&init).map_err(|e| format!("{e:?}"))?;
-            let slot: ImageSlot = Rc::new(RefCell::new(ImageState::Pending));
+            let slot = ImageSlot::pending();
             self.pending.borrow_mut().push_back(slot.clone());
             if let Err(err) = self.decoder.decode(chunk.unchecked_ref()) {
                 self.pending.borrow_mut().pop_back();
-                *slot.borrow_mut() = ImageState::Failed;
+                slot.finish(ImageState::Failed);
                 return Err(format!("{err:?}"));
             }
             slots.push(slot);
