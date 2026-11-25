@@ -126,7 +126,7 @@ The host name and port of the connection are resolved and reached by the last ju
 
 ### Stored credentials
 
-The credentials of a connection are the parameters `password`, `passphrase`, `private-key`, `sftp-password`, `sftp-passphrase`, `sftp-private-key`, `gateway-password` (RDP gateway), `client-key` (Kubernetes) and the password, private key and passphrase of SSH jump hosts (`jump-host-password`, `jump-host-1-private-key`, …), whether typed in a form field or added under *Advanced*.
+The credentials of a connection are the parameters whose name contains `password`, `passphrase`, `private-key` or `secret` (`password`, `sftp-password`, `gateway-password` for an RDP gateway, `jump-host-2-private-key`, …), and `client-key` (Kubernetes) and `token`, whether typed in a form field or added under *Advanced*. Patterns such as telnet's `password-regex` are not credentials, nor are host keys (`jump-host-host-key`), which are public.
 
 - **They are write-only.** Once saved, nobody can read them back, administrators included: the form shows a stored one as an empty field saying *Saved — type to replace*. Typing a new value replaces it, saving without touching it keeps it, and the trash button next to it removes it when you save.
 - **They are encrypted in the database** with a key the database does not hold, and decrypted only to open a session. Someone with a copy of the database, or a backup of it, does not get them without the key. Keeping that key and backing it up is described in [deployment](deployment.md#secrets).
@@ -301,10 +301,11 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | `oidc.user.create`, `oidc.user.link`, `oidc.user.rename`, `oidc.user.groups`, `oidc.user.role` | What the provider changed at sign-in: a user created on their first sign-in or linked to their identity, renamed after the provider, groups or role set from the provider's groups. The actor is the user signing in. |
 | `user.create`, `user.update`, `user.delete` | Users, including their role, disabled state, groups and grants. A password set by an administrator shows as a changed `password`. |
 | `group.create`, `group.update`, `group.delete` | Groups, including their role, members and grants. |
-| `connection.create`, `connection.update`, `connection.delete`, `connection.move` | Connections and their parameters and settings. |
+| `connection.create`, `connection.update`, `connection.delete`, `connection.move` | Connections and their parameters and settings. A [stored credential](#stored-credentials) shows only as set, replaced (any value typed again, even the same one) or removed, never its value. |
 | `connection.access`, `folder.access` | Who is granted a connection or folder (users and groups added and removed). |
 | `folder.create`, `folder.rename`, `folder.move`, `folder.delete` | Folders. |
 | `recording.download`, `recording.delete` | Recordings downloaded (playing one back in the page is not recorded) or deleted. |
+| `secrets.encrypt`, `secrets.rotate` | Stored credentials encrypted at start because they were in plain text (`count`), and re-encrypted by `rotate-key` (`count`, `keyId`). No actor. |
 
 The names are stable, so filters and alert rules can rely on them; `GET /api/audit/actions` lists them.
 
