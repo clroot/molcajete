@@ -229,6 +229,7 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | --- | --- | --- | --- |
 | `molcajeted_frame_flush_seconds` | histogram | protocol | CPU time to diff and encode one frame |
 | `molcajeted_flush_phase_seconds` | histogram | protocol, phase | Time per flush phase: `video`, `scroll`, `moves`, `pixels` (includes image encoding), `refine` |
+| `molcajeted_copies_total` | counter | protocol, phase | Copies found by `scroll` and by `moves` detection; compare with that phase's share of `molcajeted_flush_phase_seconds` to see what the detection costs per copy |
 | `molcajeted_image_encode_seconds` | histogram | protocol, format | Encoding one image (`png`, `jpeg`, `zstd`: the zstd image type, see below) |
 | `molcajeted_image_encoded_bytes` | histogram | protocol, format | Size of one encoded image: many small images cost the client a decode each |
 | `molcajeted_image_bytes_total`, `molcajeted_image_pixels_total` | counter | protocol, format | Encoded size and pixels processed (compression efficiency) |
@@ -284,7 +285,7 @@ Main events of the JSON logs. In Loki, extract the fields with `| json`.
 | `tunnel established` / `tunnel closed` | gateway | `tunnel_id`, `connection`, `session`, `peer`, `guacd_id`, `handshake_ms`, `duration_s`, `bytes_to_browser`, `status` |
 | `client report` | gateway | `session`, `fps_avg`, `fps_min`, `frame_lag_ms_avg/max`, `frame_present_ms_avg/max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `display_width/height` |
 | `connection established` / `connection closed` | molcajeted | `id`, `protocol`, `peer`, `width`, `height`, `image`, `video`, `duration_s` |
-| `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*`, `video_*` |
+| `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `scroll_copies`, `move_copies`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*`, `video_*` |
 | `video mode started` | molcajeted | `codec`, area, `kbps` |
 
 Keys to follow one session end to end:

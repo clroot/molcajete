@@ -319,7 +319,8 @@ fn joined_images_stay_below_the_size_limit() {
             .collect();
         d.put(0, line * 28, 2048, 20, &text);
     }
-    let rects = d.changed_rects(&Rect::new(0, 0, 2048, 1024));
+    let all = Rect::new(0, 0, 2048, 1024);
+    let rects = d.changed_rects(&all, &d.region_diff(&all));
     assert!(
         rects.len() > 1 && rects.len() < 36,
         "{} images",
@@ -839,4 +840,25 @@ fn windows_moved_on_a_large_screen_are_found_by_sampling() {
         "pixels: {}",
         stats.pixels
     );
+}
+
+#[test]
+fn row_differences_of_a_segment_follow_from_the_whole_row() {
+    let w = 300u32;
+    let (mut d, _, _) = setup(w, 1);
+    let mut rng = Rng(99);
+    for _ in 0..200 {
+        // A few changed pixels anywhere in the row.
+        d.pixels.copy_from_slice(&d.sent);
+        for _ in 0..1 + rng.below(4) {
+            let x = rng.below(w) as usize * 4;
+            d.pixels[x + rng.below(3) as usize] ^= 0x10;
+        }
+        let whole = d.row_diff(0, 0, w);
+        for _ in 0..20 {
+            let x0 = rng.below(w);
+            let x1 = x0 + 1 + rng.below(w - x0);
+            assert_eq!(d.diff_within(whole, 0, x0, x1), d.row_diff(0, x0, x1));
+        }
+    }
 }

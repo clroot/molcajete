@@ -9,6 +9,7 @@
 //! cargo test --release -p molcajete-daemon display::bench -- --ignored --nocapture --test-threads=1
 //! ```
 
+use std::hash::{DefaultHasher, Hasher};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -295,6 +296,36 @@ fn run_format(name: &str, zstd: bool, step: &mut impl FnMut(u32, &mut Desktop, &
         stats.bytes as f64 / 1024.0 / n,
         binary_stats.bytes as f64 / 1024.0 / n,
     );
+    println!(
+        "output {name:<8} {format:<4} lossless digest {:016x}",
+        lossless_digest(formats, step)
+    );
+}
+
+/// Hash of everything a lossless display sends for the same frames: equal
+/// before and after a change that must keep the output the same instruction
+/// for instruction. (Lossy encoding is left out because it depends on how
+/// fast the frames follow each other.)
+fn lossless_digest(
+    formats: ImageFormats,
+    step: &mut impl FnMut(u32, &mut Desktop, &mut Display),
+) -> u64 {
+    let mut desktop = Desktop::new();
+    let mut display = Display::new(formats, true);
+    let mut out = Output::text();
+    let mut digest = DefaultHasher::new();
+    display.resize(WIDTH, HEIGHT, &mut out);
+    step(0, &mut desktop, &mut display);
+    desktop.update(&mut display, &Rect::new(0, 0, WIDTH, HEIGHT));
+    for frame in 0..=FRAMES {
+        if frame > 0 {
+            step(frame, &mut desktop, &mut display);
+        }
+        display.flush(&mut out);
+        digest.write(out.as_bytes());
+        out.clear();
+    }
+    digest.finish()
 }
 
 /// What a series of frames puts on the tunnel.

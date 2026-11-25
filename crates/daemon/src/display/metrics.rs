@@ -85,6 +85,8 @@ impl Timing {
 struct Totals {
     flush: Timing,
     phases: [Timing; PHASES],
+    scroll_copies: u64,
+    move_copies: u64,
     frames: u64,
     frame_bytes: u64,
     ack: Timing,
@@ -104,6 +106,9 @@ pub(super) struct DisplayMetrics {
     started: Instant,
     flush: Histogram,
     phases: [Histogram; PHASES],
+    /// Copies found by scroll and by move detection.
+    scroll_copies: Counter,
+    move_copies: Counter,
     frames: Counter,
     frame_bytes: Histogram,
     client_ack: Histogram,
@@ -131,6 +136,8 @@ impl DisplayMetrics {
             started: Instant::now(),
             flush: Histogram::noop(),
             phases: std::array::from_fn(|_| Histogram::noop()),
+            scroll_copies: Counter::noop(),
+            move_copies: Counter::noop(),
             frames: Counter::noop(),
             frame_bytes: Histogram::noop(),
             client_ack: Histogram::noop(),
@@ -153,6 +160,13 @@ impl DisplayMetrics {
                 "phase" => name,
             )
         };
+        let copies = |name: &'static str| {
+            counter!(
+                "molcajeted_copies_total",
+                "protocol" => protocol,
+                "phase" => name,
+            )
+        };
         Self {
             protocol,
             started: Instant::now(),
@@ -164,6 +178,8 @@ impl DisplayMetrics {
                 phase("pixels"),
                 phase("refine"),
             ],
+            scroll_copies: copies("scroll"),
+            move_copies: copies("moves"),
             frames: counter!("molcajeted_frames_total", &labels),
             frame_bytes: histogram!("molcajeted_frame_encoded_bytes", &labels),
             client_ack: histogram!("molcajeted_client_ack_seconds", &labels),
@@ -180,6 +196,18 @@ impl DisplayMetrics {
     pub(super) fn phase(&mut self, phase: Phase, elapsed: Duration) {
         self.phases[phase as usize].record(elapsed);
         self.totals.phases[phase as usize].add(elapsed);
+    }
+
+    /// `copies` copies were found by the detection of `phase` (scroll or
+    /// moves) in one flush.
+    pub(super) fn copies(&mut self, phase: Phase, copies: u32) {
+        let (counter, total) = match phase {
+            Phase::Scroll => (&self.scroll_copies, &mut self.totals.scroll_copies),
+            Phase::Moves => (&self.move_copies, &mut self.totals.move_copies),
+            _ => return,
+        };
+        counter.increment(copies as u64);
+        *total += copies as u64;
     }
 
     /// Total time spent in `phase` so far.
@@ -287,6 +315,8 @@ impl DisplayMetrics {
             flush_ms_max = t.flush.max_ms(),
             scroll_ms_avg = t.phases[Phase::Scroll as usize].avg_ms(),
             moves_ms_avg = t.phases[Phase::Moves as usize].avg_ms(),
+            scroll_copies = t.scroll_copies,
+            move_copies = t.move_copies,
             pixels_ms_avg = t.phases[Phase::Pixels as usize].avg_ms(),
             client_ack_ms_avg = t.ack.avg_ms(),
             client_ack_ms_max = t.ack.max_ms(),

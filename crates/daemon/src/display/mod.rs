@@ -23,7 +23,7 @@ mod pacing;
 mod source;
 mod video;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -180,10 +180,42 @@ impl FlushStats {
 }
 
 /// Changed column range (inclusive) of one row.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowDiff {
     first: u32,
     last: u32,
+}
+
+/// The changed column range of every row of one dirty region, from one
+/// comparison of the framebuffer with the client copy per flush. Scroll
+/// detection, move detection and the pixel phase all read it; the copies
+/// the first two emit update the rows they cover (see
+/// [`Display::copied`]), so it always describes the client copy as it is.
+struct RegionDiff {
+    rect: Rect,
+    /// One entry per row of `rect`, top first.
+    rows: Vec<Option<RowDiff>>,
+}
+
+impl RegionDiff {
+    /// Changed columns of row `y`, which must lie inside the region.
+    fn row(&self, y: u32) -> Option<RowDiff> {
+        self.rows[(y - self.rect.y) as usize]
+    }
+
+    /// Bounding box of the differences.
+    fn bounds(&self) -> Option<Rect> {
+        let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
+        for (y, d) in (self.rect.y..).zip(&self.rows) {
+            if let Some(d) = d {
+                x0 = x0.min(d.first);
+                x1 = x1.max(d.last);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+        (y0 != u32::MAX).then(|| Rect::new(x0, y0, x1 - x0 + 1, y1 - y0 + 1))
+    }
 }
 
 pub struct Display {
@@ -850,24 +882,30 @@ impl Display {
         let regions = self.dirty_regions();
         self.dirty.iter_mut().for_each(|d| *d = false);
         let mut sent_tiles = vec![false; self.dirty.len()];
+        // The one full comparison with the client copy in this flush.
+        let mut diffs: Vec<RegionDiff> = regions.iter().map(|r| self.region_diff(r)).collect();
 
         // 1. Vertical scrolling inside each region (terminals, documents).
-        for region in &regions {
-            if let Some(changed) = self.diff_bounds(region)
+        for diff in &mut diffs {
+            if let Some(changed) = diff.bounds()
                 && changed.h >= 2 * MIN_SCROLL_ROWS
                 && changed.w >= 16
             {
-                stats.add(self.detect_scroll(&changed, out));
+                let found = self.detect_scroll(&changed, diff, out);
+                self.metrics.copies(Phase::Scroll, found.copies);
+                stats.add(found);
             }
         }
         phase_done(&mut self.metrics, Phase::Scroll);
         // 2. Blocks that moved anywhere (dragged windows, panning).
-        stats.add(self.detect_moves(&regions, out));
+        let found = self.detect_moves(&mut diffs, out);
+        self.metrics.copies(Phase::Moves, found.copies);
+        stats.add(found);
         phase_done(&mut self.metrics, Phase::Moves);
         // 3. Whatever still differs is sent as pixels.
-        for region in regions {
-            if let Some(changed) = self.diff_bounds(&region) {
-                for rect in self.changed_rects(&changed) {
+        for diff in &diffs {
+            if let Some(changed) = diff.bounds() {
+                for rect in self.changed_rects(&changed, diff) {
                     let (cols, rows) = self.tiles_of(&rect);
                     for ty in rows {
                         for tx in cols.clone() {
@@ -946,11 +984,38 @@ impl Display {
         })
     }
 
-    /// Bounding box of the differences inside `rect`.
-    fn diff_bounds(&self, rect: &Rect) -> Option<Rect> {
+    /// Compares every row of `rect` with the client copy.
+    fn region_diff(&self, rect: &Rect) -> RegionDiff {
+        RegionDiff {
+            rect: *rect,
+            rows: (rect.y..rect.bottom())
+                .map(|y| self.row_diff(y, rect.x, rect.right()))
+                .collect(),
+        }
+    }
+
+    /// Changed column range of the segment `[x0, x1)` of row `y`, given the
+    /// changed range `row` of a wider segment around it. Nothing outside
+    /// `row` differs, so only the part of the segment inside it is compared
+    /// again, and nothing at all when it lies inside the segment.
+    fn diff_within(&self, row: Option<RowDiff>, y: u32, x0: u32, x1: u32) -> Option<RowDiff> {
+        let row = row?;
+        let (a, b) = (x0.max(row.first), x1.min(row.last + 1));
+        if a >= b {
+            None
+        } else if (a, b) == (row.first, row.last + 1) {
+            Some(row)
+        } else {
+            self.row_diff(y, a, b)
+        }
+    }
+
+    /// Bounding box of the differences inside `rect`, a part of the region
+    /// of `diff`.
+    fn diff_bounds(&self, diff: &RegionDiff, rect: &Rect) -> Option<Rect> {
         let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
         for y in rect.y..rect.bottom() {
-            if let Some(d) = self.row_diff(y, rect.x, rect.right()) {
+            if let Some(d) = self.diff_within(diff.row(y), y, rect.x, rect.right()) {
                 x0 = x0.min(d.first);
                 x1 = x1.max(d.last);
                 y0 = y0.min(y);
@@ -958,6 +1023,35 @@ impl Display {
             }
         }
         (y0 != u32::MAX).then(|| Rect::new(x0, y0, x1 - x0 + 1, y1 - y0 + 1))
+    }
+
+    /// Updates `diffs` after a copy to `dst` whose content now equals the
+    /// framebuffer there (every copy of scroll and move detection is
+    /// checked for that before it is sent). Only the rows it covers can
+    /// have changed, and in them only the columns that differed before and
+    /// lie outside `dst` can still differ.
+    fn copied(&self, diffs: &mut [RegionDiff], dst: &Rect) {
+        for diff in diffs {
+            let r = diff.rect;
+            if dst.x >= r.right()
+                || r.x >= dst.right()
+                || dst.y >= r.bottom()
+                || r.y >= dst.bottom()
+            {
+                continue;
+            }
+            for y in dst.y.max(r.y)..dst.bottom().min(r.bottom()) {
+                let slot = &mut diff.rows[(y - r.y) as usize];
+                *slot = slot.and_then(|d| {
+                    if dst.x <= d.first && d.last < dst.right() {
+                        None
+                    } else {
+                        self.row_diff(y, d.first, d.last + 1)
+                    }
+                });
+                debug_assert_eq!(*slot, self.row_diff(y, r.x, r.right()));
+            }
+        }
     }
 
     /// Hash of the `TILE`×`TILE` block at (x, y): Σ p·A^(63-col)·B^(63-row)
@@ -998,21 +1092,24 @@ impl Display {
     /// block of anything that moved across it, and the displacements found
     /// are then tried on every changed block. Only things smaller than the
     /// grid spacing can slip through, and those are cheap to send as pixels.
-    fn detect_moves(&mut self, regions: &[Rect], out: &mut Output) -> FlushStats {
+    fn detect_moves(&mut self, diffs: &mut [RegionDiff], out: &mut Output) -> FlushStats {
         let mut stats = FlushStats::default();
-        let (areas, owner) = cluster(regions, MOVE_SEARCH_GAP);
+        let regions: Vec<Rect> = diffs.iter().map(|d| d.rect).collect();
+        let (areas, owner) = cluster(&regions, MOVE_SEARCH_GAP);
         let weights = row_weights();
         // Changed, non-blank, fully visible tiles of the new frame, per area.
         let mut wanted: Vec<Vec<(u32, u32, u64)>> = vec![Vec::new(); areas.len()];
-        for (region, &area) in regions.iter().zip(&owner) {
-            let (cols, rows) = self.tiles_of(region);
+        for (diff, &area) in diffs.iter().zip(&owner) {
+            let (cols, rows) = self.tiles_of(&diff.rect);
             for ty in rows {
                 for tx in cols.clone() {
                     let (x, y) = (tx * TILE, ty * TILE);
                     if x + TILE > self.width || y + TILE > self.height {
                         continue;
                     }
-                    if self.blocks_equal(&self.pixels, x, y, &self.sent, x, y) {
+                    let unchanged = (y..y + TILE)
+                        .all(|r| self.diff_within(diff.row(r), r, x, x + TILE).is_none());
+                    if unchanged {
                         continue;
                     }
                     let first = self.segment(&self.pixels, y, x, x + 1);
@@ -1071,7 +1168,9 @@ impl Display {
 
         // Blocks moved by the same offset are merged into larger rectangles,
         // each sent as one copy (the client handles overlap within a copy).
-        let mut by_offset: HashMap<(i64, i64), Vec<(u32, u32)>> = HashMap::new();
+        // (In a fixed order, so that the output does not depend on a hash
+        // seed.)
+        let mut by_offset: BTreeMap<(i64, i64), Vec<(u32, u32)>> = BTreeMap::new();
         for ((sx, sy), (dx, dy)) in found {
             let offset = (dx as i64 - sx as i64, dy as i64 - sy as i64);
             by_offset.entry(offset).or_default().push((dx, dy));
@@ -1096,7 +1195,8 @@ impl Display {
                     s == self.segment(&self.pixels, dst.y + r, dst.x, dst.right()) && is_opaque(s)
                 });
                 if valid {
-                    self.emit_copy(&src, dst.x, dst.y, out);
+                    self.emit_opaque_copy(&src, dst.x, dst.y, out);
+                    self.copied(diffs, &dst);
                     stats.copies += 1;
                 }
             }
@@ -1197,9 +1297,15 @@ impl Display {
         &buf[self.offset(x0, y)..self.offset(x1, y)]
     }
 
-    /// Finds content that moved vertically inside `rect` (relative to what
-    /// the client shows) and emits `copy` instructions for it.
-    fn detect_scroll(&mut self, rect: &Rect, out: &mut Output) -> FlushStats {
+    /// Finds content that moved vertically inside `rect`, a part of the
+    /// region of `diff` (relative to what the client shows), and emits
+    /// `copy` instructions for it.
+    fn detect_scroll(
+        &mut self,
+        rect: &Rect,
+        diff: &mut RegionDiff,
+        out: &mut Output,
+    ) -> FlushStats {
         let (x0, x1) = (rect.x, rect.right());
 
         // Index the client's rows around the region by hash.
@@ -1215,11 +1321,13 @@ impl Display {
 
         // Every changed, non-blank row votes for the shift that explains it.
         let mut votes: HashMap<i64, u32> = HashMap::new();
+        // (row, shift) of the votes, whose rows need not be compared again.
+        let mut verified: Vec<(u32, i64)> = Vec::new();
         for y in rect.y..rect.bottom() {
-            let new = self.segment(&self.pixels, y, x0, x1);
-            if new == self.segment(&self.sent, y, x0, x1) {
+            if diff.row(y).is_none() {
                 continue;
             }
+            let new = self.segment(&self.pixels, y, x0, x1);
             let Some(hash) = row_signature(new) else {
                 continue;
             };
@@ -1228,11 +1336,15 @@ impl Display {
             let same = index[first..].iter().take_while(|&&(h, _)| h == hash);
             for &(_, oy) in same.take(4) {
                 if oy != y && self.segment(&self.sent, oy, x0, x1) == new {
-                    *votes.entry(oy as i64 - y as i64).or_default() += 1;
+                    let shift = oy as i64 - y as i64;
+                    *votes.entry(shift).or_default() += 1;
+                    verified.push((y, shift));
                 }
             }
         }
-        let Some((&dy, &count)) = votes.iter().max_by_key(|(dy, n)| (**n, -dy.abs())) else {
+        // Ties go to the smaller shift, and then to the downward one, so
+        // that the result does not depend on the order of the map.
+        let Some((&dy, &count)) = votes.iter().max_by_key(|&(&dy, &n)| (n, -dy.abs(), dy)) else {
             return FlushStats::default();
         };
         if count < MIN_SCROLL_ROWS {
@@ -1240,13 +1352,20 @@ impl Display {
         }
 
         // Rows of `rect` whose new content equals the client row `dy` away.
+        let mut known = vec![false; rect.h as usize];
+        for &(y, shift) in &verified {
+            if shift == dy {
+                known[(y - rect.y) as usize] = true;
+            }
+        }
         let height = self.height;
         let matches = |y: u32| {
             let oy = y as i64 + dy;
-            oy >= 0
-                && (oy as u32) < height
-                && self.segment(&self.sent, oy as u32, x0, x1)
-                    == self.segment(&self.pixels, y, x0, x1)
+            known[(y - rect.y) as usize]
+                || (oy >= 0
+                    && (oy as u32) < height
+                    && self.segment(&self.sent, oy as u32, x0, x1)
+                        == self.segment(&self.pixels, y, x0, x1))
         };
         let mut copies: Vec<(u32, u32)> = runs(rect.h as usize, 0, |i| matches(rect.y + i as u32))
             .into_iter()
@@ -1265,7 +1384,11 @@ impl Display {
             let opaque =
                 (src.y..src.bottom()).all(|y| is_opaque(self.segment(&self.sent, y, x0, x1)));
             if opaque {
-                self.emit_copy(&src, x0, start, out);
+                self.emit_opaque_copy(&src, x0, start, out);
+                self.copied(
+                    std::slice::from_mut(diff),
+                    &Rect::new(x0, start, x1 - x0, end - start),
+                );
                 stats.copies += 1;
             }
         }
@@ -1277,7 +1400,8 @@ impl Display {
     /// by copy), adjacent changed tiles are merged, each result is cut
     /// further into changed row bands and column runs, and those are joined
     /// again wherever one image is cheaper than two.
-    fn changed_rects(&self, rect: &Rect) -> Vec<Rect> {
+    /// `rect` is a part of the region of `diff`.
+    fn changed_rects(&self, rect: &Rect, diff: &RegionDiff) -> Vec<Rect> {
         // (first tile column, end tile column, bounding box) per open run.
         let mut open: Vec<(u32, u32, Rect)> = Vec::new();
         let mut merged = Vec::new();
@@ -1296,7 +1420,7 @@ impl Display {
                     tile.bottom().min(rect.bottom()).saturating_sub(y),
                 );
                 let Some(bounds) = (!tile.is_empty())
-                    .then(|| self.diff_bounds(&tile))
+                    .then(|| self.diff_bounds(diff, &tile))
                     .flatten()
                 else {
                     continue;
@@ -1323,7 +1447,12 @@ impl Display {
             open = next_open;
         }
         merged.extend(open.into_iter().map(|o| o.2));
-        self.join_by_cost(merged.iter().flat_map(|r| self.split_bands(r)).collect())
+        self.join_by_cost(
+            merged
+                .iter()
+                .flat_map(|r| self.split_bands(r, diff))
+                .collect(),
+        )
     }
 
     /// Joins rectangles into their bounding box while the unchanged pixels
@@ -1396,24 +1525,27 @@ impl Display {
         (x1 - x0) as u64 * if flat { 1 } else { busy }
     }
 
-    /// Splits the differences inside `rect` into bands of changed rows and,
-    /// within each band, runs of changed columns.
-    fn split_bands(&self, rect: &Rect) -> Vec<Rect> {
-        let rows: Vec<bool> = (rect.y..rect.bottom())
-            .map(|y| self.row_diff(y, rect.x, rect.right()).is_some())
+    /// Splits the differences inside `rect` (a part of the region of
+    /// `diff`) into bands of changed rows and, within each band, runs of
+    /// changed columns.
+    fn split_bands(&self, rect: &Rect, diff: &RegionDiff) -> Vec<Rect> {
+        let rows: Vec<Option<RowDiff>> = (rect.y..rect.bottom())
+            .map(|y| self.diff_within(diff.row(y), y, rect.x, rect.right()))
             .collect();
         let mut rects = Vec::new();
-        for (b0, b1) in runs(rows.len(), ROW_GAP_MERGE as usize, |i| rows[i]) {
+        for (b0, b1) in runs(rows.len(), ROW_GAP_MERGE as usize, |i| rows[i].is_some()) {
             let (y0, y1) = (rect.y + b0 as u32, rect.y + b1 as u32);
             // Columns that changed anywhere in the band.
             let w = rect.w as usize;
             let mut changed = vec![false; w];
-            for y in y0..y1 {
-                let a = self.segment(&self.pixels, y, rect.x, rect.right());
-                let b = self.segment(&self.sent, y, rect.x, rect.right());
-                if a == b {
+            for (y, d) in (y0..y1).zip(&rows[b0..b1]) {
+                // Only the changed range of the row can differ.
+                let Some(d) = d else {
                     continue;
-                }
+                };
+                let a = self.segment(&self.pixels, y, d.first, d.last + 1);
+                let b = self.segment(&self.sent, y, d.first, d.last + 1);
+                let changed = &mut changed[(d.first - rect.x) as usize..];
                 for (c, (p, q)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
                     changed[c] |= p != q;
                 }
@@ -1587,6 +1719,19 @@ impl Display {
 
     /// Emits a layer-0 copy and replays it on the mirror.
     fn emit_copy(&mut self, src: &Rect, dx: u32, dy: u32, out: &mut Output) {
+        Self::copy_instruction(src, dx, dy, out);
+        copy_rect_over(&mut self.sent, self.width, src, dx, dy);
+    }
+
+    /// Emits a layer-0 copy from a source known to be opaque, which
+    /// replaces the destination as it is (no row needs blending on the
+    /// mirror).
+    fn emit_opaque_copy(&mut self, src: &Rect, dx: u32, dy: u32, out: &mut Output) {
+        Self::copy_instruction(src, dx, dy, out);
+        copy_rect(&mut self.sent, self.width, src, dx, dy);
+    }
+
+    fn copy_instruction(src: &Rect, dx: u32, dy: u32, out: &mut Output) {
         *out += &InstructionBuilder::new("copy")
             .arg(0)
             .arg(src.x)
@@ -1598,7 +1743,6 @@ impl Display {
             .arg(dx)
             .arg(dy)
             .finish();
-        copy_rect_over(&mut self.sent, self.width, src, dx, dy);
     }
 
     #[allow(clippy::too_many_arguments)]
