@@ -138,12 +138,15 @@ export class MolcajeteSession {
    *   raw image, video and audio data; `zstd: false` does not announce the
    *   zstd image type, so that lossless updates arrive as PNG;
    *   `playback: true` makes a player of session recordings (see `playback`),
-   *   which takes no input
+   *   which takes no input; `audioContext` is the context audio streams play
+   *   in, best created during the click that opened the session so that the
+   *   browser lets it run (one is made at the first stream otherwise)
    */
   static async create(container, options = {}) {
     const useWorker = options.worker ?? supportsWorker();
     const session = new MolcajeteSession(container, useWorker);
     session.#playback = options.playback === true;
+    session.#audioContext = options.audioContext ?? null;
     session.#video = await supportedVideo();
     if (useWorker) await session.#startWorker();
     else await session.#startMain();
@@ -169,8 +172,11 @@ export class MolcajeteSession {
   #video = [];
   /** Whether the zstd image type is announced (see `create`). */
   #zstd = true;
+  /** Where audio streams play, in either mode (see `#onAudio`). */
   #audioContext = null;
   #players = new Map();
+  /** What the last `audio` event said: a stream is open but the browser holds the sound back. */
+  #audioBlocked = false;
   #remoteComposition = false;
   /** Terminal copy, paste and link shortcuts are on (see `set_terminal_shortcuts`). */
   #terminal = false;
@@ -199,10 +205,14 @@ export class MolcajeteSession {
   async #startMain() {
     await init();
     this.#client = new MolcajeteClient(this.#container);
+    // Audio plays on this page in both modes, in one AudioContext.
+    this.#client.set_audio_forwarding(typeof AudioContext !== "undefined");
     this.#client.set_event_handler((type, detail) => {
+      if (this.#onAudio(type, detail)) return;
       this.#track(type, detail);
       this.#handler?.(type, detail);
     });
+    this.#installAudioUnlock();
   }
 
   async #startWorker() {
@@ -256,6 +266,7 @@ export class MolcajeteSession {
       [offscreen],
     );
     this.#installInput();
+    this.#installAudioUnlock();
     await ready;
   }
 
@@ -271,20 +282,7 @@ export class MolcajeteSession {
       this.#canvas.style.cursor = cssCursor(detail);
       return;
     }
-    // Audio forwarded by the worker is played here and not reported.
-    if (type === "audio-start") {
-      this.#audioContext ??= new AudioContext();
-      this.#players.set(detail.stream, new PcmPlayer(this.#audioContext, detail));
-      return;
-    }
-    if (type === "audio-data") {
-      this.#players.get(detail.stream)?.play(detail.data);
-      return;
-    }
-    if (type === "audio-end") {
-      this.#players.delete(detail.stream);
-      return;
-    }
+    if (this.#onAudio(type, detail)) return;
     if (type === "state" && detail === "connected") this.focus();
     this.#track(type, detail);
     this.#handler?.(type, detail);
@@ -364,9 +362,58 @@ export class MolcajeteSession {
     }
   }
 
-  /** Browsers only start audio after a user gesture. */
+  /**
+   * Plays the audio streams the client forwards, and reports with `audio`
+   * events whether one is open while the browser holds the sound back.
+   * Returns whether the event was about audio.
+   */
+  #onAudio(type, detail) {
+    if (type === "audio-start") {
+      if (!this.#audioContext) {
+        this.#audioContext = new AudioContext();
+        this.#watchAudioContext();
+      }
+      this.#players.set(detail.stream, new PcmPlayer(this.#audioContext, detail));
+    } else if (type === "audio-data") {
+      this.#players.get(detail.stream)?.play(detail.data);
+    } else if (type === "audio-end") {
+      this.#players.delete(detail.stream);
+    } else {
+      // A tunnel that closes ends its streams without `audio-end`.
+      if (type === "state" && (detail === "connecting" || detail === "disconnected")) this.#players.clear();
+      if (type === "state") this.#reportAudio();
+      return false;
+    }
+    this.#reportAudio();
+    return true;
+  }
+
+  #reportAudio() {
+    const blocked = this.#players.size > 0 && this.#audioContext?.state !== "running";
+    if (blocked === this.#audioBlocked) return;
+    this.#audioBlocked = blocked;
+    this.#handler?.("audio", { blocked });
+  }
+
+  #watchAudioContext() {
+    this.#listen(this.#audioContext, "statechange", () => this.#reportAudio());
+  }
+
+  /**
+   * Browsers only let audio play after a user gesture: any press, click,
+   * touch or key on the page resumes the context, even before a stream
+   * starts, so that the first sound is not lost.
+   */
+  #installAudioUnlock() {
+    if (this.#audioContext) this.#watchAudioContext();
+    const resume = () => this.#resumeAudio();
+    for (const type of ["pointerdown", "pointerup", "touchend", "click", "keydown"]) {
+      this.#listen(window, type, resume, { capture: true, passive: true });
+    }
+  }
+
   #resumeAudio() {
-    if (this.#audioContext?.state === "suspended") this.#audioContext.resume();
+    if (this.#audioContext?.state === "suspended") this.#audioContext.resume().catch(() => {});
   }
 
   #post(method, ...args) {

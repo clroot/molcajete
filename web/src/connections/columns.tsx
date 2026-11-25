@@ -8,6 +8,7 @@ import {proportional, type TableColumn} from '@astryxdesign/core/Table';
 import {FolderIcon} from '@heroicons/react/24/outline';
 import type {ConnectionSummary} from '../api';
 import {href} from '../route';
+import {unlockAudio} from '../session/audio';
 import {protocolLabel} from './protocols';
 import type {TreeRow} from './tree';
 
@@ -38,7 +39,7 @@ export const nameColumn: Column = {
       </HStack>
     ) : (
       <VStack gap={0.5}>
-        <Link href={href.session(row.connection.id)} weight="medium">
+        <Link href={href.session(row.connection.id)} onClick={unlockAudio} weight="medium">
           {row.connection.name}
         </Link>
         <Text type="supporting" color="secondary">

@@ -1,5 +1,6 @@
 import {useCallback, useEffect, useRef, useState, type RefObject} from 'react';
 import {loadClient, loadReporter, tunnelBase, type MolcajeteSession, type SessionEvent} from './client';
+import {unlockAudio} from './audio';
 
 type Reporter = InstanceType<Awaited<ReturnType<typeof loadReporter>>['SessionReporter']>;
 
@@ -62,6 +63,8 @@ export function useMolcajeteClient({
           worker: forceMainThread ? false : undefined,
           binary: forceTextTunnel ? false : undefined,
           zstd: forcePngImages ? false : undefined,
+          // Usually already running: made by the click that opened the session.
+          audioContext: unlockAudio(),
         });
         if (!isCurrent) {
           client.free();

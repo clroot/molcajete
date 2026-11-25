@@ -1,15 +1,24 @@
 import * as stylex from '@stylexjs/stylex';
 import {Card} from '@astryxdesign/core/Card';
 import {HStack, VStack} from '@astryxdesign/core/Stack';
+import {Icon} from '@astryxdesign/core/Icon';
 import {Kbd} from '@astryxdesign/core/Kbd';
 import {StatusDot} from '@astryxdesign/core/StatusDot';
 import {Text} from '@astryxdesign/core/Text';
+import {SpeakerXMarkIcon} from '@heroicons/react/24/outline';
 import {formatStats, type SessionStats} from './client';
 import {terminalKeys} from './terminal';
 
 const styles = stylex.create({
   topLeft: {position: 'fixed', top: 8, left: 8, pointerEvents: 'none', whiteSpace: 'pre'},
   topCenter: {position: 'fixed', top: 8, left: '50%', transform: 'translateX(-50%)', pointerEvents: 'none'},
+  bottomCenter: {
+    position: 'fixed',
+    bottom: 8,
+    left: '50%',
+    transform: 'translateX(-50%)',
+    pointerEvents: 'none',
+  },
   bottomLeft: {
     position: 'fixed',
     bottom: 8,
@@ -42,6 +51,18 @@ export function UnstableNotice() {
       <HStack gap={2} vAlign="center">
         <StatusDot variant="warning" label="Unstable" isPulsing />
         <Text>Connection unstable</Text>
+      </HStack>
+    </Card>
+  );
+}
+
+/** Sound waits for a gesture; the click or key press that dismisses this goes to the session as usual. */
+export function AudioHint() {
+  return (
+    <Card padding={2} elevation="med" xstyle={styles.bottomCenter}>
+      <HStack gap={2} vAlign="center">
+        <Icon icon={SpeakerXMarkIcon} color="secondary" size="sm" />
+        <Text>Click or press a key to turn on sound</Text>
       </HStack>
     </Card>
   );
