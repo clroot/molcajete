@@ -4,6 +4,11 @@
 listen = "127.0.0.1:8080"
 static_dir = "web/dist"
 
+# Our client gets image, video and audio data as raw bytes instead of base64
+# (WebSocket subprotocol molcajete-binary-v1). Set to false to keep every
+# tunnel on the Guacamole text protocol.
+# binary_tunnel = true
+
 [guacd]
 host = "127.0.0.1"
 port = 4822

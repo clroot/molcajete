@@ -9,15 +9,25 @@
 //! - the first message is `0.,36.<tunnel uuid>;`;
 //! - internal `0.,4.ping,<ts>;` messages are echoed and never reach guacd;
 //! - on termination the close reason carries the numeric Guacamole status.
+//!
+//! A client that also offers the subprotocol `molcajete-binary-v1` gets it
+//! instead. What comes from guacd then reaches the browser as binary
+//! messages made of whole records (`molcajete_protocol::binary`): stream
+//! data as raw bytes, everything else as instruction text. molcajeted sends
+//! records itself and they are forwarded as they are; the `blob`
+//! instructions of a stock guacd are decoded here. The tunnel's own messages
+//! (UUID, ping replies) and everything the browser sends stay text.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use metrics::{Counter, counter, gauge, histogram};
-use molcajete_protocol::{InstructionBuilder, Limits, Parser, Status};
+use molcajete_protocol::binary::{self, RecordReader, RecordWriter};
+use molcajete_protocol::{InstructionBuilder, Limits, Parser, RawInstruction, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
@@ -28,7 +38,13 @@ use crate::AppState;
 use crate::db::ConnectionRecord;
 use crate::guacd::{self, ClientInfo, GuacdSession};
 
-/// Upper bound for a single outgoing WebSocket message.
+/// WebSocket subprotocol of the stock Guacamole tunnel.
+pub const TEXT_SUBPROTOCOL: &str = "guacamole";
+pub use binary::WEBSOCKET_SUBPROTOCOL as BINARY_SUBPROTOCOL;
+
+/// Size at which an outgoing WebSocket message is sent without waiting for
+/// more. A message ends with a whole instruction or record, so it can be
+/// larger by one of those.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -47,6 +63,8 @@ pub struct TunnelRequest {
     pub peer: Option<String>,
     /// The signed-in user opening the tunnel. Only used for logs.
     pub user: Option<String>,
+    /// The browser selected the binary subprotocol.
+    pub binary: bool,
     pub info: ClientInfo,
 }
 
@@ -161,6 +179,7 @@ async fn serve_tunnel(
         &connection.protocol,
         parameters,
         &request.info,
+        request.binary,
         Duration::from_secs(defaults.handshake_timeout),
     )
     .await
@@ -179,6 +198,7 @@ async fn serve_tunnel(
     info!(
         guacd_id = %session.id,
         version = %session.version,
+        framing = Framing::of(request.binary, &session).as_str(),
         handshake_ms = handshake.as_millis() as u64,
         "tunnel established"
     );
@@ -195,7 +215,7 @@ async fn serve_tunnel(
             &with(&labels, "direction", "to_guacd")
         ),
     };
-    let stats = relay(socket, session, tunnel_id, &counters).await;
+    let stats = relay(socket, session, tunnel_id, request.binary, &counters).await;
     active.decrement(1.0);
     let duration = started.elapsed();
     histogram!("molcajete_gateway_tunnel_duration_seconds", &labels).record(duration);
@@ -236,11 +256,45 @@ pub struct RelayStats {
     pub to_guacd: u64,
 }
 
+/// How data from guacd reaches the browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// Text messages of instructions (stock Guacamole).
+    Text,
+    /// Binary messages; the daemon sends records and they are forwarded.
+    Binary,
+    /// Binary messages; the daemon sends text and its blobs are decoded.
+    Transcoded,
+}
+
+impl Framing {
+    fn of(browser_binary: bool, session: &GuacdSession) -> Self {
+        match (browser_binary, session.binary) {
+            (true, true) => Self::Binary,
+            (true, false) => Self::Transcoded,
+            // A daemon is only asked for records on behalf of a browser
+            // that takes them.
+            (false, _) => Self::Text,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Binary => "binary",
+            Self::Transcoded => "transcoded",
+        }
+    }
+}
+
 /// Pumps data in both directions until either side terminates.
+/// `browser_binary` tells whether the browser selected the binary
+/// subprotocol.
 pub async fn relay(
     socket: WebSocket,
     session: GuacdSession,
     tunnel_id: Uuid,
+    browser_binary: bool,
     counters: &RelayCounters,
 ) -> RelayStats {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -258,6 +312,7 @@ pub async fn relay(
         let _ = ws_tx.close().await;
     });
 
+    let framing = Framing::of(browser_binary, &session);
     let GuacdSession { stream, parser, .. } = session;
     let (guacd_rd, guacd_wr) = stream.into_split();
 
@@ -269,8 +324,21 @@ pub async fn relay(
     let status = if out_tx.send(Message::Text(uuid.into())).await.is_err() {
         Status::SUCCESS
     } else {
+        let mut upstream = Upstream {
+            rd: guacd_rd,
+            out: &out_tx,
+            counter: &counters.to_browser,
+            total: &mut to_browser,
+        };
+        let to_browser = async {
+            match framing {
+                Framing::Text => upstream.text(parser).await,
+                Framing::Binary => upstream.records(parser.pending()).await,
+                Framing::Transcoded => upstream.transcoded(parser).await,
+            }
+        };
         tokio::select! {
-            status = guacd_to_browser(guacd_rd, parser, &out_tx, &counters.to_browser, &mut to_browser) => status,
+            status = to_browser => status,
             status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &mut to_guacd) => status,
         }
     };
@@ -285,61 +353,175 @@ pub async fn relay(
     }
 }
 
-async fn guacd_to_browser(
-    mut rd: OwnedReadHalf,
-    mut parser: Parser,
-    out: &mpsc::Sender<Message>,
-    counter: &Counter,
-    total: &mut u64,
-) -> Status {
-    let mut buf = vec![0u8; READ_BUFFER_BYTES];
-    let mut message = String::with_capacity(MAX_MESSAGE_BYTES);
-    loop {
-        // Forward every complete instruction; partial data stays buffered.
-        loop {
-            match parser.next_raw() {
-                Ok(Some(raw)) => {
-                    message.push_str(raw.as_str());
-                    if message.len() >= MAX_MESSAGE_BYTES {
-                        let chunk = std::mem::replace(
-                            &mut message,
-                            String::with_capacity(MAX_MESSAGE_BYTES),
-                        );
-                        if out.send(Message::Text(chunk.into())).await.is_err() {
-                            return Status::SUCCESS;
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    warn!(error = %err, "invalid data from guacd");
-                    return Status::UPSTREAM_ERROR;
-                }
-            }
-        }
-        // Flush before we might block on the next read.
-        if !message.is_empty() {
-            let chunk = std::mem::replace(&mut message, String::with_capacity(MAX_MESSAGE_BYTES));
-            if out.send(Message::Text(chunk.into())).await.is_err() {
-                return Status::SUCCESS;
-            }
-        }
-        match rd.read(&mut buf).await {
+/// The guacd → browser direction of a tunnel.
+struct Upstream<'a> {
+    rd: OwnedReadHalf,
+    out: &'a mpsc::Sender<Message>,
+    counter: &'a Counter,
+    total: &'a mut u64,
+}
+
+impl Upstream<'_> {
+    /// Reads more from guacd. `Err` carries the status the tunnel ends with.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Status> {
+        match self.rd.read(buf).await {
             Ok(0) => {
                 debug!("guacd closed the connection");
-                return Status::SUCCESS;
+                Err(Status::SUCCESS)
             }
             Ok(n) => {
-                counter.increment(n as u64);
-                *total += n as u64;
-                parser.feed(&buf[..n]);
+                self.counter.increment(n as u64);
+                *self.total += n as u64;
+                Ok(n)
             }
             Err(err) => {
                 debug!(error = %err, "guacd read failed");
-                return Status::UPSTREAM_ERROR;
+                Err(Status::UPSTREAM_ERROR)
             }
         }
     }
+
+    /// Sends a message to the browser; `Err` when the browser is gone.
+    async fn send(&self, message: Message) -> Result<(), Status> {
+        self.out.send(message).await.map_err(|_| Status::SUCCESS)
+    }
+
+    /// Instructions as text messages (stock Guacamole).
+    async fn text(&mut self, mut parser: Parser) -> Status {
+        let mut buf = vec![0u8; READ_BUFFER_BYTES];
+        let mut message = String::with_capacity(MAX_MESSAGE_BYTES);
+        let result: Result<(), Status> = async {
+            loop {
+                // Forward every complete instruction; partial data stays
+                // buffered.
+                loop {
+                    match parser.next_raw() {
+                        Ok(Some(raw)) => {
+                            message.push_str(raw.as_str());
+                            if message.len() >= MAX_MESSAGE_BYTES {
+                                let chunk = std::mem::replace(
+                                    &mut message,
+                                    String::with_capacity(MAX_MESSAGE_BYTES),
+                                );
+                                self.send(Message::Text(chunk.into())).await?;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!(error = %err, "invalid data from guacd");
+                            return Err(Status::UPSTREAM_ERROR);
+                        }
+                    }
+                }
+                // Flush before we might block on the next read.
+                if !message.is_empty() {
+                    let chunk =
+                        std::mem::replace(&mut message, String::with_capacity(MAX_MESSAGE_BYTES));
+                    self.send(Message::Text(chunk.into())).await?;
+                }
+                let n = self.read(&mut buf).await?;
+                parser.feed(&buf[..n]);
+            }
+        }
+        .await;
+        result.unwrap_err()
+    }
+
+    /// Records from molcajeted, forwarded unchanged in binary messages.
+    /// `pending` is what arrived together with the end of the handshake.
+    async fn records(&mut self, pending: &[u8]) -> Status {
+        let mut buf = vec![0u8; READ_BUFFER_BYTES];
+        let mut reader = RecordReader::new();
+        reader.feed(pending);
+        let mut message = Vec::with_capacity(MAX_MESSAGE_BYTES);
+        let result: Result<(), Status> = async {
+            loop {
+                loop {
+                    match reader.next_record() {
+                        Ok(Some(record)) => {
+                            let bytes = record.as_bytes();
+                            if !message.is_empty()
+                                && message.len() + bytes.len() > MAX_MESSAGE_BYTES
+                            {
+                                let chunk = std::mem::replace(
+                                    &mut message,
+                                    Vec::with_capacity(MAX_MESSAGE_BYTES),
+                                );
+                                self.send(Message::Binary(chunk.into())).await?;
+                            }
+                            message.extend_from_slice(bytes);
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!(error = %err, "invalid data from guacd");
+                            return Err(Status::UPSTREAM_ERROR);
+                        }
+                    }
+                }
+                if !message.is_empty() {
+                    let chunk =
+                        std::mem::replace(&mut message, Vec::with_capacity(MAX_MESSAGE_BYTES));
+                    self.send(Message::Binary(chunk.into())).await?;
+                }
+                let n = self.read(&mut buf).await?;
+                reader.feed(&buf[..n]);
+            }
+        }
+        .await;
+        result.unwrap_err()
+    }
+
+    /// Text from a stock guacd, turned into records: the data of `blob`
+    /// instructions is decoded, everything else is passed on as text.
+    async fn transcoded(&mut self, mut parser: Parser) -> Status {
+        let mut buf = vec![0u8; READ_BUFFER_BYTES];
+        let mut message = RecordWriter::new();
+        let mut data = Vec::new();
+        let result: Result<(), Status> = async {
+            loop {
+                loop {
+                    match parser.next_raw() {
+                        Ok(Some(raw)) => {
+                            push_record(&mut message, &raw, &mut data);
+                            if message.len() >= MAX_MESSAGE_BYTES {
+                                self.send(Message::Binary(message.take().into())).await?;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!(error = %err, "invalid data from guacd");
+                            return Err(Status::UPSTREAM_ERROR);
+                        }
+                    }
+                }
+                if !message.is_empty() {
+                    self.send(Message::Binary(message.take().into())).await?;
+                }
+                let n = self.read(&mut buf).await?;
+                parser.feed(&buf[..n]);
+            }
+        }
+        .await;
+        result.unwrap_err()
+    }
+}
+
+/// Appends an instruction to a binary message: a `blob` as a blob record,
+/// anything else (including a blob that is not valid base64, which is left
+/// to the client) as text. `scratch` is reused between calls.
+fn push_record(message: &mut RecordWriter, raw: &RawInstruction<'_>, scratch: &mut Vec<u8>) {
+    if raw.opcode() == "blob"
+        && raw.arg_count() == 2
+        && let Ok(stream) = raw.arg(0).parse::<i32>()
+    {
+        scratch.clear();
+        let base64 = base64::engine::general_purpose::STANDARD;
+        if base64.decode_vec(raw.arg(1), scratch).is_ok() {
+            message.blob(stream, scratch);
+            return;
+        }
+    }
+    message.instructions(raw.as_bytes());
 }
 
 async fn browser_to_guacd(
