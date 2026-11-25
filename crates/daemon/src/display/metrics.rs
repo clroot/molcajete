@@ -34,6 +34,7 @@ const PHASES: usize = 5;
 
 struct ImageMetrics {
     encode: Histogram,
+    size: Histogram,
     bytes: Counter,
     pixels: Counter,
 }
@@ -43,6 +44,7 @@ impl ImageMetrics {
         let labels = [("protocol", protocol), ("format", format)];
         Self {
             encode: histogram!("molcajeted_image_encode_seconds", &labels),
+            size: histogram!("molcajeted_image_encoded_bytes", &labels),
             bytes: counter!("molcajeted_image_bytes_total", &labels),
             pixels: counter!("molcajeted_image_pixels_total", &labels),
         }
@@ -112,6 +114,7 @@ impl DisplayMetrics {
     pub(super) fn disabled() -> Self {
         let image = || ImageMetrics {
             encode: Histogram::noop(),
+            size: Histogram::noop(),
             bytes: Counter::noop(),
             pixels: Counter::noop(),
         };
@@ -208,6 +211,7 @@ impl DisplayMetrics {
             ),
         };
         m.encode.record(elapsed);
+        m.size.record(bytes as f64);
         m.bytes.increment(bytes as u64);
         m.pixels.increment(pixels);
         timing.add(elapsed);
