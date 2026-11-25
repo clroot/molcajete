@@ -13,6 +13,7 @@ import {
   ClipboardDocumentListIcon,
   SignalIcon,
   ClockIcon,
+  CommandLineIcon,
 } from '@heroicons/react/24/outline';
 import type {Me} from '../api';
 import {href, type Route} from '../route';
@@ -42,6 +43,12 @@ export default function AppFrame({user, route, onSignOut, children}: Props) {
           footer={
             <SideNavSection title="Account" isHeaderHidden>
               <SideNavItem label={user.username} icon={UserCircleIcon} isDisabled />
+              <SideNavItem
+                label="API tokens"
+                icon={CommandLineIcon}
+                href={href.tokens}
+                isSelected={route.name === 'tokens'}
+              />
               {user.hasPassword && (
                 <SideNavItem label="Change password" icon={KeyIcon} onClick={() => setIsPasswordOpen(true)} />
               )}

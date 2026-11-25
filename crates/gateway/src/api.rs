@@ -1420,7 +1420,7 @@ pub struct AuditQuery {
     actor: Option<String>,
     /// An action or a prefix of whole parts: `user`, `oidc.user`, `login.failure`.
     action: Option<String>,
-    /// `user`, `group`, `connection`, `folder` or `recording`.
+    /// `user`, `group`, `connection`, `folder`, `recording` or `token`.
     target_type: Option<String>,
     /// The target's id or name.
     target: Option<String>,

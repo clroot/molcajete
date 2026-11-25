@@ -145,6 +145,40 @@ export type AuditEntry = {
   changes: Record<string, unknown> | null;
 };
 
+/** An API token as listed (`/api/tokens`); the token itself is only shown when it is created. */
+export type ApiToken = {
+  id: string;
+  name: string;
+  /** The first characters of the token, to recognise it. */
+  prefix: string;
+  userId: string;
+  username: string;
+  /** Addresses and CIDR ranges it may be used from; empty for any. */
+  allowedIps: string[];
+  createdAt: number;
+  expiresAt: number;
+  lastUsedAt: number | null;
+  lastUsedFrom: string | null;
+};
+
+export type ApiTokenInput = {name: string; expiresAt: number; allowedIps: string[]};
+
+/** A new token: the only time `token` is shown. */
+export type CreatedApiToken = ApiToken & {token: string};
+
+/** What a one-time session link opens (`GET /api/tickets/{ticket}`). */
+export type TicketInfo = {
+  connectionId: string;
+  name: string;
+  protocol: string;
+  dpi: string | null;
+  resizeMethod: string | null;
+  readOnly: boolean;
+  disableCopy: boolean;
+  disablePaste: boolean;
+  expiresAt: number;
+};
+
 /** What `GET /api/audit` narrows to; empty fields do not filter. */
 export type AuditFilter = {
   actor?: string;
@@ -297,6 +331,13 @@ export const api = {
   auditLog: (filter: AuditFilter, limit: number, offset: number) =>
     request<AuditPage>('GET', `audit?${auditQuery(filter, {limit, offset})}`),
   auditActions: () => request<string[]>('GET', 'audit/actions'),
+
+  /** `all`: every user's tokens (administrators). */
+  apiTokens: (scope: 'mine' | 'all') =>
+    request<ApiToken[]>('GET', scope === 'all' ? 'tokens?scope=all' : 'tokens'),
+  createApiToken: (input: ApiTokenInput) => request<CreatedApiToken>('POST', 'tokens', input),
+  revokeApiToken: (tokenId: string) => request<void>('DELETE', `tokens/${id(tokenId)}`),
+  ticket: (ticket: string) => request<TicketInfo>('GET', `tickets/${id(ticket)}`),
 
   settings: () => request<GatewaySettings>('GET', 'settings'),
 };

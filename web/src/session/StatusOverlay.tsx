@@ -16,8 +16,10 @@ const styles = stylex.create({
 type Props = {
   status: Exclude<ConnectionStatus, {kind: 'connected'}>;
   connectionName: string;
-  onReconnect: () => void;
-  onLeave: () => void;
+  /** Without it, there is no Reconnect button (a one-time link is used up). */
+  onReconnect?: () => void;
+  /** Without it, there is no way back (no connection list to go back to). */
+  onLeave?: () => void;
 };
 
 /** Covers the display while connecting, after an error or once disconnected. */
@@ -37,8 +39,10 @@ export default function StatusOverlay({status, connectionName, onReconnect, onLe
             </Text>
           </VStack>
           <HStack gap={2} hAlign="center" wrap="wrap">
-            {!isConnecting && <Button label="Reconnect" variant="primary" onClick={onReconnect} />}
-            <Button label="Back to connections" variant="secondary" onClick={onLeave} />
+            {!isConnecting && onReconnect && (
+              <Button label="Reconnect" variant="primary" onClick={onReconnect} />
+            )}
+            {onLeave && <Button label="Back to connections" variant="secondary" onClick={onLeave} />}
           </HStack>
         </VStack>
       </Card>

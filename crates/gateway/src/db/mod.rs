@@ -16,6 +16,7 @@ mod history;
 mod oidc;
 mod recordings;
 mod sessions;
+mod tokens;
 mod users;
 
 use std::borrow::Cow;
@@ -38,6 +39,7 @@ pub use groups::{Group, GroupUpdate};
 pub use history::{HistoryEntry, HistoryFilter};
 pub use oidc::PendingLogin;
 pub use recordings::Recording;
+pub use tokens::{ApiToken, NewApiToken, NewSessionTicket};
 pub use users::{NewUser, Role, User, UserUpdate};
 
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("migrations/sqlite");
@@ -242,6 +244,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
         for table in [
+            "molcajete_session_ticket",
+            "molcajete_api_token",
             "molcajete_audit_log",
             "molcajete_connection_history",
             "molcajete_oidc_login",
@@ -288,6 +292,8 @@ pub(crate) mod tests {
 
     /// Every table, children first.
     const TABLES: &[&str] = &[
+        "molcajete_session_ticket",
+        "molcajete_api_token",
         "molcajete_audit_log",
         "molcajete_connection_history",
         "molcajete_recording",

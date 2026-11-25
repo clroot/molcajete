@@ -8,13 +8,22 @@ type Props<T> = {
   target: T | null;
   title: (target: T) => string;
   description: string;
+  /** The confirm button; `Delete` by default. */
+  actionLabel?: string;
   onDelete: (target: T) => Promise<void>;
   /** Called after a successful delete, and on cancel. */
   onClose: (deleted: boolean) => void;
 };
 
 /** Confirms a delete, shows progress, and reports failures as a toast. */
-export default function ConfirmDeleteDialog<T>({target, title, description, onDelete, onClose}: Props<T>) {
+export default function ConfirmDeleteDialog<T>({
+  target,
+  title,
+  description,
+  actionLabel = 'Delete',
+  onDelete,
+  onClose,
+}: Props<T>) {
   const [isDeleting, setIsDeleting] = useState(false);
   const showToast = useToast();
 
@@ -37,7 +46,7 @@ export default function ConfirmDeleteDialog<T>({target, title, description, onDe
       onOpenChange={open => !open && onClose(false)}
       title={target === null ? '' : title(target)}
       description={description}
-      actionLabel="Delete"
+      actionLabel={actionLabel}
       isActionLoading={isDeleting}
       onAction={confirm}
     />
