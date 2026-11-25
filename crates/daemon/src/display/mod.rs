@@ -891,12 +891,16 @@ impl Display {
                 && changed.h >= 2 * MIN_SCROLL_ROWS
                 && changed.w >= 16
             {
-                stats.add(self.detect_scroll(&changed, diff, out));
+                let found = self.detect_scroll(&changed, diff, out);
+                self.metrics.copies(Phase::Scroll, found.copies);
+                stats.add(found);
             }
         }
         phase_done(&mut self.metrics, Phase::Scroll);
         // 2. Blocks that moved anywhere (dragged windows, panning).
-        stats.add(self.detect_moves(&mut diffs, out));
+        let found = self.detect_moves(&mut diffs, out);
+        self.metrics.copies(Phase::Moves, found.copies);
+        stats.add(found);
         phase_done(&mut self.metrics, Phase::Moves);
         // 3. Whatever still differs is sent as pixels.
         for diff in &diffs {
