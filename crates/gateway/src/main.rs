@@ -14,9 +14,11 @@ mod config;
 mod db;
 mod guacd;
 mod oidc;
+mod proxy;
 mod recording;
 mod secrets;
 mod sensitive;
+mod throttle;
 mod tunnel;
 
 use std::net::SocketAddr;
@@ -88,6 +90,8 @@ pub struct AppState {
     pub tunnels: client_report::Tunnels,
     /// Single sign-on, when `[oidc]` is configured.
     pub oidc: Option<oidc::Oidc>,
+    /// Failed password sign-ins and the Argon2 verification slots.
+    pub throttle: throttle::LoginThrottle,
 }
 
 impl AppState {
@@ -121,7 +125,8 @@ async fn websocket_tunnel(
         Err(err) => return err.into_response(),
     };
     let mut request = tunnel::TunnelRequest::from_query(query.as_deref().unwrap_or(""));
-    request.peer = Some(auth::client_address(&headers, Some(peer)));
+    let client = proxy::resolve(&headers, Some(peer), &state.config.server.trusted_proxies);
+    request.peer = Some(client.display);
     request.user = Some(recording::RecordedUser {
         id: user.id.clone(),
         username: user.username.clone(),
@@ -375,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
     audit::start_maintenance(db.clone(), config.audit.clone());
 
     let state = Arc::new(AppState {
+        throttle: throttle::LoginThrottle::new(&config.auth.throttle),
         config,
         db,
         client_reports: cli.client_reports,
@@ -400,6 +406,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use futures_util::StreamExt as _;
+    use std::time::Duration;
     use tower::ServiceExt as _;
 
     use super::*;
@@ -445,6 +452,7 @@ mod tests {
             .await
             .unwrap();
         let state = Arc::new(AppState {
+            throttle: throttle::LoginThrottle::new(&config.auth.throttle),
             config,
             db,
             client_reports: false,
@@ -2226,7 +2234,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_log_records_sign_ins_with_the_source_address() {
-        let app = app().await;
+        let app = app_with("trusted_proxies = [\"10.0.0.0/8\"]").await;
         let peer: SocketAddr = "10.0.0.2:40000".parse().unwrap();
         let attempt = |username: &str, password: &str, real_ip: Option<&str>| {
             let mut request =
@@ -2308,17 +2316,151 @@ mod tests {
         assert!(actions.as_array().unwrap().contains(&"user.update".into()));
     }
 
-    #[test]
-    fn client_address_prefers_the_edge_proxy_header() {
-        use auth::client_address;
-        let peer = Some("10.0.0.2:5000".parse().unwrap());
-        let mut headers = HeaderMap::new();
-        assert_eq!(client_address(&headers, peer), "10.0.0.2");
-        assert_eq!(client_address(&headers, None), "unknown");
-        headers.insert("x-forwarded-for", "100.96.0.1, 10.0.0.1".parse().unwrap());
-        assert_eq!(client_address(&headers, peer), "100.96.0.1 (via 10.0.0.2)");
-        headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
-        assert_eq!(client_address(&headers, peer), "203.0.113.7 (via 10.0.0.2)");
-        assert_eq!(client_address(&headers, None), "203.0.113.7");
+    /// A sign-in from `peer` with extra headers.
+    async fn sign_in_from(
+        app: &TestApp,
+        peer: &str,
+        headers: &[(&str, &str)],
+        username: &str,
+        password: &str,
+    ) -> Response {
+        let mut request =
+            Request::post("/api/auth/login").header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut request = request
+            .body(Body::from(
+                serde_json::json!({ "username": username, "password": password }).to_string(),
+            ))
+            .unwrap();
+        let peer: SocketAddr = peer.parse().unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        app.send(request).await
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_sign_ins_are_throttled_per_address() {
+        let app = app().await;
+        app.state.throttle.freeze();
+        let attacker = "192.0.2.10:40000";
+        for _ in 0..10 {
+            let response = sign_in_from(&app, attacker, &[], "bob", "guess").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = sign_in_from(&app, attacker, &[], "bob", "guess").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = response.headers()[header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(retry_after, 300);
+        let message = body_json(response).await["error"].clone();
+        assert_eq!(message, "Too many failed sign-ins. Try again in 5 minutes.");
+        // Not even the right password, nor another user, until the window passes.
+        for username in ["bob", "admin"] {
+            let response = sign_in_from(&app, attacker, &[], username, "bob-password").await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        // Another address is not affected.
+        let response = sign_in_from(&app, "192.0.2.11:40000", &[], "bob", "bob-password").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        app.state.throttle.advance(Duration::from_secs(300));
+        let response = sign_in_from(&app, attacker, &[], "bob", "bob-password").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let admin = app.login("admin", "admin-password").await;
+        let throttled = audit(&app, &admin, "action=login.throttled").await;
+        assert_eq!(throttled.len(), 1, "once per lockout: {throttled:#?}");
+        assert_eq!(throttled[0]["actorName"], "bob");
+        assert_eq!(throttled[0]["sourceAddress"], "192.0.2.10");
+        assert_eq!(throttled[0]["changes"]["reason"], "address");
+        let failures = audit(&app, &admin, "action=login.failure").await;
+        assert_eq!(failures.len(), 10, "throttled attempts are not failures");
+    }
+
+    #[tokio::test]
+    async fn a_username_limit_stops_a_distributed_guess() {
+        let app = app_with("[auth.throttle]\nusername_failures = 3").await;
+        app.state.throttle.freeze();
+        // Where admin usually signs in from.
+        let office = "198.51.100.1:40000";
+        let response = sign_in_from(&app, office, &[], "admin", "admin-password").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for n in 1..=3 {
+            let peer = format!("203.0.113.{n}:40000");
+            let response = sign_in_from(&app, &peer, &[], "admin", "guess").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = sign_in_from(&app, "203.0.113.4:40000", &[], "admin", "guess").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let response =
+            sign_in_from(&app, "203.0.113.5:40000", &[], "admin", "admin-password").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Unknown usernames are counted and answered the same way.
+        for n in 1..=3 {
+            let peer = format!("203.0.113.{n}:40000");
+            let response = sign_in_from(&app, &peer, &[], "ghost", "guess").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = sign_in_from(&app, "203.0.113.4:40000", &[], "ghost", "guess").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Other users, and admin from an address they signed in from, are not.
+        let response = sign_in_from(&app, "203.0.113.6:40000", &[], "bob", "bob-password").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = sign_in_from(&app, office, &[], "admin", "admin-password").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        app.state.throttle.advance(Duration::from_secs(900));
+        let response =
+            sign_in_from(&app, "203.0.113.5:40000", &[], "admin", "admin-password").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let admin = app.login("admin", "admin-password").await;
+        let throttled = audit(&app, &admin, "action=login.throttled&actor=admin").await;
+        assert_eq!(throttled.len(), 1);
+        assert_eq!(throttled[0]["changes"]["reason"], "username");
+    }
+
+    #[tokio::test]
+    async fn only_trusted_proxies_name_the_client() {
+        let app = app_with("trusted_proxies = [\"10.0.0.0/8\"]").await;
+        app.state.throttle.freeze();
+        let proxy = "10.0.0.2:40000";
+        let attacker = [("x-real-ip", "203.0.113.1")];
+        for _ in 0..10 {
+            let response = sign_in_from(&app, proxy, &attacker, "bob", "guess").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = sign_in_from(&app, proxy, &attacker, "bob", "guess").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Others behind the same proxy are told apart.
+        let neighbour = [("x-forwarded-for", "203.0.113.2, 10.0.0.1")];
+        let response = sign_in_from(&app, proxy, &neighbour, "bob", "bob-password").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A client that talks to the gateway directly cannot pick its address.
+        for n in 0..10 {
+            let spoofed = format!("198.51.100.{n}");
+            let headers = [
+                ("x-forwarded-for", spoofed.as_str()),
+                ("x-real-ip", spoofed.as_str()),
+            ];
+            let response = sign_in_from(&app, "192.0.2.50:40000", &headers, "admin", "guess").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let headers = [("x-real-ip", "198.51.100.99")];
+        let response = sign_in_from(&app, "192.0.2.50:40000", &headers, "admin", "guess").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let admin = app.login("admin", "admin-password").await;
+        let throttled = audit(&app, &admin, "action=login.throttled").await;
+        let sources: Vec<_> = throttled
+            .iter()
+            .map(|e| e["sourceAddress"].clone())
+            .collect();
+        assert_eq!(sources, ["192.0.2.50", "203.0.113.1 (via 10.0.0.2)"]);
     }
 }

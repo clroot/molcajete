@@ -19,7 +19,9 @@ use crate::db::{
     Access, ConnectionRecord, DbError, Folder, Group, GroupUpdate, NewUser, Principal, Recording,
     Role, Target, User, UserUpdate, attributes,
 };
+use crate::proxy::Client;
 use crate::recording;
+use crate::throttle;
 
 /// Error response: `{"error": "<message>"}` with a status code.
 #[derive(Debug)]
@@ -113,6 +115,7 @@ pub struct LoginRequest {
 pub async fn login(
     State(state): State<Arc<AppState>>,
     address: ClientAddress,
+    client: Client,
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> ApiResult<Response> {
@@ -121,6 +124,9 @@ pub async fn login(
             StatusCode::FORBIDDEN,
             "Password sign-in is turned off; use single sign-on.",
         ));
+    }
+    if let Err(throttled) = state.throttle.check(&body.username, client.ip) {
+        return Ok(throttle::refuse(&state, &body.username, &address, throttled).await);
     }
     let found = match state.db.user_credentials(body.username.trim()).await {
         Ok(found) => Some(found),
@@ -134,7 +140,10 @@ pub async fn login(
         .filter(|hash| *hash != auth::NO_PASSWORD)
         .unwrap_or_else(|| auth::dummy_hash())
         .to_owned();
-    let valid = auth::verify_password_blocking(body.password, hash).await;
+    let valid = match state.throttle.verify(body.password, hash).await {
+        Ok(valid) => valid,
+        Err(busy) => return Ok(throttle::refuse(&state, &body.username, &address, busy).await),
+    };
     let refused = match &found {
         None => Some((
             "unknown_user",
@@ -156,6 +165,7 @@ pub async fn login(
     let user = match (found, refused) {
         (Some((user, _)), None) => user,
         (_, refused) => {
+            state.throttle.failed(&body.username, client.ip);
             if let Some((reason, entry)) = refused {
                 let entry = entry.from(&address).detail("reason", reason);
                 audit::record(&state.db, entry).await;
@@ -167,6 +177,7 @@ pub async fn login(
         }
     };
 
+    state.throttle.succeeded(&body.username, client.ip);
     let cookie = start_session(&state, &user, auth::is_https(&headers), None).await?;
     let entry = Entry::new(action::LOGIN_SUCCESS).by(&user).from(&address);
     audit::record(&state.db, entry).await;
@@ -255,7 +266,17 @@ pub async fn change_password(
     Json(body): Json<ChangePasswordRequest>,
 ) -> ApiResult<StatusCode> {
     let hash = state.db.password_hash(&user.id).await?;
-    if !auth::verify_password_blocking(body.current_password, hash).await {
+    let valid = state
+        .throttle
+        .verify(body.current_password, hash)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The server is busy. Try again in a moment.",
+            )
+        })?;
+    if !valid {
         return Err(ApiError::bad_request(
             "The current password is not correct.",
         ));

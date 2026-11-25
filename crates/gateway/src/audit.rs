@@ -46,6 +46,10 @@ pub mod action {
     /// A username and password were refused. The actor is the user with
     /// that name, or only the name when there is none.
     pub const LOGIN_FAILURE: &str = "login.failure";
+    /// Too many failed sign-ins: further attempts from the address, or for
+    /// the username, are refused for a while. Once per lockout; the actor
+    /// is the name typed in the attempt that started it.
+    pub const LOGIN_THROTTLED: &str = "login.throttled";
     /// Signed out.
     pub const LOGOUT: &str = "logout";
     /// Changed their own password.
@@ -105,6 +109,7 @@ pub mod action {
     pub const ALL: &[&str] = &[
         LOGIN_SUCCESS,
         LOGIN_FAILURE,
+        LOGIN_THROTTLED,
         LOGOUT,
         USER_PASSWORD,
         OIDC_LOGIN_SUCCESS,

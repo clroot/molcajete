@@ -135,7 +135,11 @@ For development, `cargo run -p molcajete-gateway -- --config gateway.toml` and `
 - **No compression on the tunnel.** Do not let a proxy negotiate `permessage-deflate` on `/websocket-tunnel`: the payload is already compressed images and video.
 - **Host and Origin.** Pass `Host` (or `X-Forwarded-Host`) through unchanged. The gateway refuses state-changing API requests and tunnels whose `Origin` does not match it.
 - **HTTPS.** Send `X-Forwarded-Proto: https`; the gateway then marks its session cookie `Secure`. Cookies are `HttpOnly` and `SameSite=Strict`.
-- **Client addresses.** The gateway logs `X-Real-IP`, otherwise the first `X-Forwarded-For` entry, next to the TCP peer. Set both at the edge proxy to `$remote_addr`, overwriting rather than appending, so clients cannot spoof them. Proxies in between (such as the Tailscale ingress) replace `X-Forwarded-For` but pass `X-Real-IP` through. If nginx runs in Docker with published ports, `$remote_addr` may be the Docker bridge for every client; use host networking to see real addresses.
+- **Client addresses.** List the proxy that connects to the gateway in [`[server] trusted_proxies`](#server). The gateway takes the client's address from `X-Real-IP`, otherwise from `X-Forwarded-For`, **only when the TCP peer is one of those proxies**; from anyone else the headers are ignored, since a client could put any address there. The address goes into logs and the audit log (`203.0.113.9 (via 10.0.0.2)`) and is what [failed sign-ins are counted by](administration.md#repeated-failed-sign-ins). **Without `trusted_proxies`, every client behind the proxy has the proxy's address**: they share one limit of failed sign-ins, so a few typos in one place can make the gateway refuse everyone for a few minutes, and logs show only the proxy.
+  - Set both headers at the edge proxy to `$remote_addr`, overwriting rather than appending, so clients cannot spoof them. Proxies in between (such as the Tailscale ingress) replace `X-Forwarded-For` but pass `X-Real-IP` through, and `X-Real-IP` wins.
+  - `trusted_proxies` names the hop the gateway sees, not the edge: in Kubernetes that is the ingress controller's (or the Tailscale ingress proxy's) pod address, so list the cluster's pod range (`kubectl get pods -A -o wide` shows the addresses). From `X-Forwarded-For` the gateway takes the rightmost address that is not a trusted proxy, so list any proxies in between as well.
+  - Anyone who can reach the gateway from a trusted range can claim any address; keep those ranges to the proxies and the cluster.
+  - If nginx runs in Docker with published ports, `$remote_addr` may be the Docker bridge for every client; use host networking to see real addresses.
 - **Single sign-on.** The `redirect_url` and `post_logout_redirect_url` in `[oidc]` are the browser-visible URLs behind the proxy.
 
 Once the gateway is public, the remote desktops depend on its sign-in. Use long passwords, restrict client addresses at the proxy, or sign in through your identity provider and turn the password form off ([`[oidc]`](#oidc)). The example also rate-limits requests and connections per client address.
@@ -212,6 +216,7 @@ Two subcommands work on the database directly, without a running gateway. They o
 | `static_dir` | `web/dist` | The built web client. A warning is logged when it has no `index.html`. |
 | `data_dir` | `.` | Holds the default SQLite database (`molcajete.db`) and the default recordings directory. Created if missing. |
 | `binary_tunnel` | `true` | Offer the `molcajete-binary-v1` WebSocket subprotocol, which carries image, video and audio data as raw bytes. `false` keeps every tunnel on the Guacamole text protocol. |
+| `trusted_proxies` | `[]` | Reverse proxies whose `X-Real-IP` and `X-Forwarded-For` name the client: addresses or CIDR ranges, such as `["10.42.0.0/16", "127.0.0.1"]`. Requests from other peers are attributed to the peer. See [Reverse proxy](#reverse-proxy). |
 
 ### `[guacd]`
 
@@ -237,6 +242,29 @@ The schema is created and migrated when the gateway starts ([Upgrading](#upgradi
 | Key | Default | |
 | --- | --- | --- |
 | `session_ttl_hours` | `12` | Lifetime of a sign-in session (the `molcajete_session` cookie), at least 1. |
+
+`[auth.throttle]` limits failed password sign-ins; how it behaves is in [administration.md](administration.md#repeated-failed-sign-ins). A limit of `0` turns it off.
+
+| Key | Default | |
+| --- | --- | --- |
+| `address_failures` | `10` | Failed sign-ins from one client address (any username; an IPv6 address counts as its /64) within `address_window_secs`. The next attempt from there gets `429`. |
+| `address_window_secs` | `300` | |
+| `username_failures` | `20` | Failed sign-ins for one username, from any address, within `username_window_secs`. The next attempt for that username gets `429`, except from addresses the user signed in from recently. |
+| `username_window_secs` | `900` | |
+| `known_address_days` | `30` | How long an address the user signed in from stays exempt from the username limit. |
+| `max_concurrent_verifications` | `0` | Password checks (Argon2) running at once; `0` is the number of CPUs. |
+| `verification_wait_secs` | `10` | How long a sign-in waits for a free check before it gets `503`. |
+
+The counters are kept in memory: each gateway replica counts on its own, and a restart forgets them. Client addresses are only right behind a proxy listed in [`[server] trusted_proxies`](#server).
+
+```toml
+[server]
+trusted_proxies = ["10.42.0.0/16"]
+
+[auth.throttle]
+address_failures = 10
+username_failures = 20
+```
 
 ### `[secrets]`
 
@@ -447,7 +475,7 @@ Gateways from this change on keep [connection credentials](administration.md#sto
 
 ### Configuration files
 
-The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour.
+The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour, with one exception: since `[server] trusted_proxies` was added, `X-Real-IP` and `X-Forwarded-For` are read only from the proxies it lists. A gateway behind a proxy needs it set, or every client has the proxy's address in logs, in the audit log and for [failed sign-in limits](administration.md#repeated-failed-sign-ins).
 
 ## Mixed versions
 
