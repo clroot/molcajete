@@ -268,7 +268,7 @@ The page batches the client's once-per-second `stats` and posts them every 10 se
 | Metric | Meaning |
 | --- | --- |
 | `molcajete_client_frame_lag_seconds` | From receiving a frame's `sync` to applying it and acknowledging: waiting for its images to decode and for the frames before it (average per second) |
-| `molcajete_client_frame_receive_seconds` | From a frame's first instruction to its `sync`: how long its data took to arrive and be parsed (average per second) |
+| `molcajete_client_frame_receive_seconds` | From a frame's first instruction that draws on the screen (or into a buffer the frame then uses) to its `sync`: how long its data took to arrive and be parsed (average per second). A cursor change sent between frames does not start a frame |
 | `molcajete_client_frame_present_seconds` | From applying a frame to having drawn the canvas with it: the wait for the next animation frame plus the composite (average per second; no sample for a second without a drawn frame). The browser shows the canvas at a later display refresh, which is not included |
 | `molcajete_client_image_decode_seconds` | Decoding one image (average per second). For PNG, JPEG and WebP: from handing the data to the browser's decoder to the decoded image, waiting included. For zstd images: the decode itself, which runs while the frame is drawn |
 | `molcajete_client_images_ops` | Images decoded per second |

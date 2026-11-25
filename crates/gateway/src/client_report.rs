@@ -59,7 +59,7 @@ struct Sample {
     frame_lag_ms_avg: Option<f64>,
     #[serde(default)]
     frame_lag_ms_max: f64,
-    /// Time from a frame's first instruction to its `sync`.
+    /// Time from a frame's first drawing instruction to its `sync`.
     #[serde(default)]
     frame_receive_ms_avg: Option<f64>,
     #[serde(default)]
