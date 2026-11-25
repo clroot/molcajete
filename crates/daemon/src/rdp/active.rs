@@ -38,6 +38,7 @@ use super::pacing::FramePacer;
 use super::settings::{self, ResizeMethod, Settings};
 use super::slow_path;
 use crate::display::{Display, ImageFormats, Pacing};
+use crate::files::{self, Transfers};
 use crate::handshake::ClientInfo;
 use crate::io::GuacWriter;
 use crate::remote::DecodeTime;
@@ -97,6 +98,8 @@ pub struct Session<'a> {
     scale: u32,
     display_control: DisplayControlStatus,
     audio: Option<AudioOutput>,
+    /// The drive's files for the client (`enable-drive`).
+    files: Option<Transfers>,
     decode_time: DecodeTime,
     /// Frames the server marked the end of.
     server_frames: metrics::Counter,
@@ -113,6 +116,7 @@ impl<'a> Session<'a> {
         result: ConnectionResult,
         framed: RdpFramed,
         audio: Option<AudioOutput>,
+        files: Option<Transfers>,
     ) -> Self {
         let (rdp_reader, rdp_writer) = split_tokio_framed(framed);
         let size = result.desktop_size;
@@ -166,6 +170,7 @@ impl<'a> Session<'a> {
             scale: settings.desktop_scale_factor(),
             display_control: DisplayControlStatus::new(dynamic_channels, Instant::now()),
             audio,
+            files,
             decode_time: DecodeTime::new("rdp"),
             server_frames: crate::remote::frames("rdp"),
             copy_time: Duration::ZERO,
@@ -251,6 +256,10 @@ impl<'a> Session<'a> {
                         Flow::End
                     }
                 },
+                reply = files::next_reply(&mut self.files) => {
+                    reply.write(self.writer.buffer());
+                    Flow::Continue
+                }
                 _ = sleep_until(flush_at), if can_flush => {
                     self.send_frame().await?;
                     Flow::Continue
@@ -580,9 +589,15 @@ impl<'a> Session<'a> {
                 timestamp,
                 received,
             } => self.display.ack(timestamp, received),
+            ClientEvent::File(event) => {
+                if let Some(files) = &mut self.files {
+                    files.event(event, self.writer.buffer());
+                }
+            }
             ClientEvent::Ack { stream, status } => {
                 let audio = self.audio.as_mut().is_some_and(|a| a.ack(stream, status));
-                if !audio {
+                let file = !audio && self.files.as_mut().is_some_and(|f| f.ack(stream, status));
+                if !audio && !file {
                     self.display
                         .stream_ack(stream, status, self.writer.buffer());
                 }

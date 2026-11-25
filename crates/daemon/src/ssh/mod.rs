@@ -35,6 +35,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::display::{Display, ImageFormats, Pacing};
+use crate::files;
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
 use crate::jump::Chain;
@@ -57,6 +58,7 @@ pub async fn run(
     params: Params,
 ) -> anyhow::Result<()> {
     let mut settings = Settings::from_params(&params, &info);
+    let sftp = files::SftpSettings::from_params(|name| params.get(name).map(str::to_owned));
     let mut jump = match Chain::from_params(&params) {
         Ok(jump) => jump,
         Err(err) => {
@@ -105,7 +107,10 @@ pub async fn run(
         {
             return Ok(());
         }
-        connect_and_run(settings, &jump, renderer, display, writer, inputs, decoder).await
+        connect_and_run(
+            settings, sftp, &jump, renderer, display, writer, inputs, decoder,
+        )
+        .await
     }
     .await;
     client_task.abort();
@@ -191,14 +196,16 @@ async fn obtain_credentials(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     settings: Settings,
+    sftp: Option<files::SftpSettings>,
     jump: &Chain,
     renderer: Renderer,
     display: Display,
     mut writer: GuacWriter,
     inputs: mpsc::Receiver<Input>,
-    decoder: InputDecoder,
+    mut decoder: InputDecoder,
 ) -> anyhow::Result<()> {
     let target = format!("{}:{}", settings.hostname, settings.port);
     let credentials = Credentials {
@@ -242,9 +249,23 @@ async fn connect_and_run(
                 return Ok(());
             }
         };
+    // Files go over the same connection, in an SFTP channel of their own.
+    let files = match sftp {
+        Some(sftp) => match handle.channel_open_session().await {
+            Ok(channel) => {
+                decoder.accept_files();
+                Some(files::Transfers::sftp(channel, sftp, writer.buffer()))
+            }
+            Err(err) => {
+                warn!(%target, error = %err, "cannot open a channel for SFTP");
+                None
+            }
+        },
+        None => None,
+    };
     let (channel_reader, channel_writer) = channel.split();
     let (ssh, writer_task) = client::spawn_writer(channel_writer);
-    let bridge = Bridge::new(settings, renderer, display, writer, ssh);
+    let bridge = Bridge::new(settings, renderer, display, writer, ssh, files);
     let result = bridge.run(channel_reader, inputs, decoder).await;
     writer_task.abort();
     let _ = handle

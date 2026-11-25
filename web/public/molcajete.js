@@ -10,6 +10,22 @@
 //   session.connect(session.tunnel_url("wss://host/websocket-tunnel", "my-connection"));
 import init, { MolcajeteClient } from "./pkg/molcajete_client.js";
 import { RecordingPlayer } from "./molcajete-player.js";
+import { FileTransfers } from "./molcajete-files.js";
+
+/** Saves a Blob the browser holds as a download. */
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  link.rel = "noopener";
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  // The download has started from the URL; it may go once it did.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
 
 const supportsWorker = () =>
   typeof OffscreenCanvas !== "undefined" &&
@@ -188,6 +204,8 @@ export class MolcajeteSession {
   #heldPointer = null;
   #playback = false;
   #player = null; // main-thread mode
+  #files = null; // main-thread mode
+  #nextTransfer = 1;
 
   /** "worker" or "main". */
   mode;
@@ -207,7 +225,9 @@ export class MolcajeteSession {
     this.#client = new MolcajeteClient(this.#container);
     // Audio plays on this page in both modes, in one AudioContext.
     this.#client.set_audio_forwarding(typeof AudioContext !== "undefined");
+    this.#files = new FileTransfers(this.#client, (type, detail) => this.#onFileEvent(type, detail));
     this.#client.set_event_handler((type, detail) => {
+      if (this.#files.onEvent(type, detail)) return;
       if (this.#onAudio(type, detail)) return;
       this.#track(type, detail);
       this.#handler?.(type, detail);
@@ -283,6 +303,10 @@ export class MolcajeteSession {
       return;
     }
     if (this.#onAudio(type, detail)) return;
+    if (type === "transfer" || type === "filesystem" || type === "filesystem-removed") {
+      this.#onFileEvent(type, detail);
+      return;
+    }
     if (type === "state" && detail === "connected") this.focus();
     this.#track(type, detail);
     this.#handler?.(type, detail);
@@ -604,6 +628,81 @@ export class MolcajeteSession {
     }
     this.#player ??= new RecordingPlayer(this.#client, (type, detail) => this.#handler?.(type, detail));
     this.#player[command](...args);
+  }
+
+  #onFileEvent(type, detail) {
+    if (type === "transfer" && detail.blob) {
+      const { blob, ...rest } = detail;
+      saveBlob(blob, detail.name);
+      this.#handler?.(type, rest);
+      return;
+    }
+    this.#handler?.(type, detail);
+  }
+
+  /**
+   * How downloads reach the disk in this browser: `"file"`, written to a
+   * file the user picks as the data arrives (File System Access), or
+   * `"blob"`, collected in memory and saved at the end, which a large file
+   * may not fit in (see `BLOB_WARNING_BYTES`).
+   */
+  static get downloadMethod() {
+    return typeof window !== "undefined" && typeof window.showSaveFilePicker === "function" ? "file" : "blob";
+  }
+
+  /** Downloads above this size are worth a warning when they go through memory. */
+  static BLOB_WARNING_BYTES = 1024 * 1024 * 1024;
+
+  /**
+   * Lists the directory `path` of the filesystem `object` (from a
+   * `filesystem` event). Resolves to entries `{path, name, type, size}`,
+   * `type` being "directory" or "file".
+   */
+  list(object, path) {
+    if (this.#client) return this.#files.list(object, path);
+    return this.request("files_list", object, path);
+  }
+
+  /**
+   * Uploads a File: into the filesystem `object` at `path`, or without
+   * them into the server's upload directory (where a file dropped on the
+   * session goes). Returns the transfer's id; progress arrives as
+   * `transfer` events.
+   */
+  upload(file, { object = null, path = null } = {}) {
+    const id = `t${this.#nextTransfer++}`;
+    if (this.#client) this.#files.upload(id, file, object, path);
+    else this.#post("files_upload", id, file, object, path);
+    return id;
+  }
+
+  /**
+   * Downloads `path` of the filesystem `object`. Call it from the click
+   * that asks for it: with File System Access the browser asks where to
+   * save first, which needs the click. Resolves to the transfer's id, or
+   * null when the user cancelled the save dialog.
+   */
+  async download(object, path, { name, size = null } = {}) {
+    const suggestedName = name ?? path.split("/").filter(Boolean).pop() ?? "download";
+    let sink = { blob: true };
+    if (MolcajeteSession.downloadMethod === "file") {
+      try {
+        sink = { handle: await window.showSaveFilePicker({ suggestedName }) };
+      } catch (err) {
+        if (err?.name === "AbortError") return null;
+        // Not allowed here (no user gesture, a sandboxed frame): collect it in memory.
+      }
+    }
+    const id = `t${this.#nextTransfer++}`;
+    if (this.#client) this.#files.download(id, object, path, sink, size);
+    else this.#post("files_download", id, object, path, sink, size);
+    return id;
+  }
+
+  /** Stops a transfer. An upload stops where it is; what was sent stays on the server. */
+  cancel_transfer(id) {
+    if (this.#client) this.#files.cancel(id);
+    else this.#post("files_cancel", id);
   }
 
   /** Disconnects and releases all resources. */

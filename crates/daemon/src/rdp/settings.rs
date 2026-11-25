@@ -222,6 +222,8 @@ pub struct Settings {
     /// other) or the session is `force-lossless` (the pipeline's codecs,
     /// H.264 and progressive RemoteFX, are lossy).
     pub gfx: bool,
+    /// The redirected drive (`enable-drive`), see [`crate::files`].
+    pub drive: Option<crate::files::DriveSettings>,
 }
 
 impl Settings {
@@ -296,6 +298,9 @@ impl Settings {
                 AudioEncoding::negotiate(&info.audio)
             },
             gfx: !params.flag("disable-gfx") && !force_lossless && color_depth == GFX_COLOR_DEPTH,
+            drive: crate::files::DriveSettings::from_params(|name| {
+                params.value(name).map(str::to_owned)
+            }),
         })
     }
 

@@ -37,6 +37,9 @@ pub type WeakShared = Weak<RefCell<Inner>>;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// The lowest output stream index of an upload; libguac accepts up to 63.
+const FIRST_UPLOAD_STREAM: i32 = 32;
+
 /// Client connection state, as reported to JavaScript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -162,6 +165,9 @@ enum InStream {
         data: StreamData,
     },
     Audio,
+    /// A file or directory listing (`body`, `file`), handed to the page
+    /// as it arrives; the page acknowledges each blob (`ack_stream`).
+    File,
 }
 
 /// Keeps an event listener registered for as long as it is alive.
@@ -213,6 +219,8 @@ pub struct Inner {
     streams: HashMap<i32, InStream>,
     free_out_streams: Vec<i32>,
     next_out_stream: i32,
+    /// Output streams of uploads (see [`Inner::open_upload`]).
+    uploads: Vec<i32>,
     keyboard: Keyboard,
     wheel: WheelAccumulator,
     mouse: (i32, i32, MouseButtons),
@@ -381,6 +389,7 @@ impl Inner {
                 streams: HashMap::new(),
                 free_out_streams: Vec::new(),
                 next_out_stream: 0,
+                uploads: Vec::new(),
                 keyboard: Keyboard::default(),
                 wheel: WheelAccumulator::default(),
                 mouse: (0, 0, MouseButtons::default()),
@@ -669,6 +678,7 @@ impl Inner {
         self.audio.clear();
         self.free_out_streams.clear();
         self.next_out_stream = 0;
+        self.uploads.clear();
         if self.state != State::Idle {
             self.set_state(State::Disconnected);
         }
@@ -1071,10 +1081,18 @@ impl Inner {
                     },
                 );
             }
-            S::File { stream, .. }
-            | S::Pipe { stream, .. }
-            | S::Argv { stream, .. }
-            | S::Body { stream, .. } => {
+            S::File {
+                stream,
+                mimetype,
+                filename,
+            } => self.on_file(stream, None, mimetype, filename),
+            S::Body {
+                object,
+                stream,
+                mimetype,
+                name,
+            } => self.on_file(stream, Some(object), mimetype, name),
+            S::Pipe { stream, .. } | S::Argv { stream, .. } => {
                 self.send_ack(stream, "Unsupported", Status::UNSUPPORTED);
             }
             S::Video {
@@ -1082,6 +1100,23 @@ impl Inner {
                 layer,
                 mimetype,
             } => self.on_video(stream, layer, mimetype),
+            S::Ack {
+                stream,
+                status,
+                message,
+            } if self.uploads.contains(&stream) => {
+                if status.is_error() {
+                    self.uploads.retain(|&s| s != stream);
+                }
+                self.emit(
+                    "stream-ack",
+                    object(&[
+                        ("stream", JsValue::from(stream)),
+                        ("code", JsValue::from(status.code())),
+                        ("message", JsValue::from_str(message)),
+                    ]),
+                );
+            }
             S::Ack { stream, status, .. } => {
                 if status.is_error() {
                     self.free_out_stream(stream);
@@ -1115,13 +1150,43 @@ impl Inner {
             }
             S::Disconnect => self.disconnect_internal(None),
             S::Log { message } => web_sys::console::log_1(&format!("guacd: {message}").into()),
-            S::Filesystem { .. }
-            | S::Undefine { .. }
-            | S::Nest { .. }
-            | S::Nop
-            | S::Ready { .. }
-            | S::Required
-            | S::Unknown { .. } => {}
+            // Recordings hold no files, and a player offers none.
+            S::Filesystem { .. } | S::Undefine { .. } | S::GetError { .. } if self.replaying => {}
+            S::Filesystem {
+                object: index,
+                name,
+                download,
+                upload,
+            } => {
+                let flag = |v: Option<bool>| v.map_or(JsValue::NULL, JsValue::from_bool);
+                self.emit(
+                    "filesystem",
+                    object(&[
+                        ("object", JsValue::from(index)),
+                        ("name", JsValue::from_str(name)),
+                        ("download", flag(download)),
+                        ("upload", flag(upload)),
+                    ]),
+                );
+            }
+            S::Undefine { object: index } => {
+                self.emit("undefine", object(&[("object", JsValue::from(index))]));
+            }
+            S::GetError {
+                object: index,
+                name,
+                status,
+                message,
+            } => self.emit(
+                "get-error",
+                object(&[
+                    ("object", JsValue::from(index)),
+                    ("name", JsValue::from_str(name)),
+                    ("code", JsValue::from(status.code())),
+                    ("message", JsValue::from_str(message)),
+                ]),
+            ),
+            S::Nest { .. } | S::Nop | S::Ready { .. } | S::Required | S::Unknown { .. } => {}
         }
     }
 
@@ -1149,6 +1214,29 @@ impl Inner {
                     self.emit(
                         "audio-data",
                         object(&[("stream", JsValue::from(stream)), ("data", pcm.into())]),
+                    );
+                }
+            }
+            Some(InStream::File) => {
+                // A buffer of its own, which the worker can transfer.
+                let data = match data {
+                    BlobData::Base64(text) => B64
+                        .decode(text.as_bytes())
+                        .ok()
+                        .map(|bytes| js_sys::Uint8Array::from(bytes.as_slice())),
+                    BlobData::Raw(view) => Some(view.slice(0, view.length())),
+                };
+                if let Some(data) = data {
+                    self.emit(
+                        "stream-data",
+                        object(&[("stream", JsValue::from(stream)), ("data", data.into())]),
+                    );
+                } else {
+                    self.streams.remove(&stream);
+                    self.send_ack(stream, "Invalid data", Status::CLIENT_BAD_REQUEST);
+                    self.emit(
+                        "stream-end",
+                        object(&[("stream", JsValue::from(stream)), ("failed", JsValue::TRUE)]),
                     );
                 }
             }
@@ -1216,8 +1304,110 @@ impl Inner {
             Some(InStream::AudioForward) => {
                 self.emit("audio-end", object(&[("stream", JsValue::from(stream))]));
             }
+            Some(InStream::File) => {
+                self.emit("stream-end", object(&[("stream", JsValue::from(stream))]));
+            }
             Some(InStream::Video(video)) => video.finish(),
             None => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Files
+    // ------------------------------------------------------------------
+
+    /// A file or listing the server sends: the page decides whether to
+    /// take it, and acknowledges its data as it keeps up.
+    fn on_file(&mut self, stream: i32, object_index: Option<i32>, mimetype: &str, name: &str) {
+        if self.replaying {
+            return;
+        }
+        self.streams.insert(stream, InStream::File);
+        self.emit(
+            "stream-start",
+            object(&[
+                ("stream", JsValue::from(stream)),
+                ("object", object_index.map_or(JsValue::NULL, JsValue::from)),
+                ("mimetype", JsValue::from_str(mimetype)),
+                ("name", JsValue::from_str(name)),
+            ]),
+        );
+    }
+
+    /// Acknowledges an incoming file stream: its start, then each blob. An
+    /// error code stops it.
+    pub fn ack_stream(&mut self, stream: i32, message: &str, code: u16) {
+        if !matches!(self.streams.get(&stream), Some(InStream::File)) {
+            return;
+        }
+        let status = Status(code);
+        if status.is_error() {
+            self.streams.remove(&stream);
+        }
+        self.send_ack(stream, message, status);
+    }
+
+    /// Asks a filesystem object for a directory listing or a file.
+    pub fn get(&mut self, object_index: i32, name: &str) {
+        if self.is_connected() {
+            self.send(
+                &InstructionBuilder::new("get")
+                    .arg(object_index)
+                    .str_arg(name)
+                    .finish(),
+            );
+        }
+    }
+
+    /// Opens an upload: `put` into a filesystem object at the path `name`,
+    /// or with a negative `object_index`, `file` (the server's upload
+    /// directory). Returns the stream, or -1 when no more may be open.
+    pub fn open_upload(&mut self, object_index: i32, mimetype: &str, name: &str) -> i32 {
+        if !self.is_connected() {
+            return -1;
+        }
+        // libguac accepts stream indexes below 64; the clipboard's and
+        // argv's are taken from the bottom, these from the top.
+        let Some(stream) = (FIRST_UPLOAD_STREAM..64)
+            .rev()
+            .find(|s| !self.uploads.contains(s))
+        else {
+            return -1;
+        };
+        self.uploads.push(stream);
+        let instruction = if object_index >= 0 {
+            InstructionBuilder::new("put")
+                .arg(object_index)
+                .arg(stream)
+                .str_arg(mimetype)
+                .str_arg(name)
+        } else {
+            InstructionBuilder::new("file")
+                .arg(stream)
+                .str_arg(mimetype)
+                .str_arg(name)
+        };
+        self.send(&instruction.finish());
+        stream
+    }
+
+    /// Sends data of an upload; the server acknowledges it (`stream-ack`).
+    pub fn upload_blob(&mut self, stream: i32, data: &[u8]) {
+        if self.uploads.contains(&stream) {
+            self.send(
+                &InstructionBuilder::new("blob")
+                    .arg(stream)
+                    .str_arg(&B64.encode(data))
+                    .finish(),
+            );
+        }
+    }
+
+    /// Ends an upload and frees its stream.
+    pub fn end_upload(&mut self, stream: i32) {
+        if self.uploads.contains(&stream) {
+            self.uploads.retain(|&s| s != stream);
+            self.send(&InstructionBuilder::new("end").arg(stream).finish());
         }
     }
 

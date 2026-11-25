@@ -87,6 +87,7 @@ Connection managers and administrators create and edit connections under *Connec
 - optionally a **daemon** of its own (*Advanced → guacd host / port*) instead of the gateway's default `[guacd]`: this is how a connection is served by molcajeted while others use stock guacd, or the other way round. molcajeted serves VNC, SSH and RDP; Telnet and Kubernetes need stock guacd. *Advanced → Handshake timeout* gives the connection its own wait for the daemon to reach the remote desktop instead of `[guacd] handshake_timeout`, whichever daemon it uses;
 - optionally **SSH jump hosts** to reach the server through ([below](#ssh-jump-hosts));
 - **clipboard and input** restrictions for every protocol, the usual controls against data leaving through a session: *Read-only* (`read-only`: keys, clicks and touches are not sent), *Block copying from the remote side* (`disable-copy`) and *Block pasting into the remote side* (`disable-paste`). The daemon enforces them; the session shows a *Read-only* badge, and the session menu leaves out what is blocked (no clipboard field at all when both directions are);
+- for SSH and RDP, **file transfer** ([below](#file-transfer));
 - **recording** settings ([session recordings](#session-recordings));
 - the **folder** it is in.
 
@@ -138,6 +139,21 @@ jump-host-host-key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF8z..."
 ```
 
 The host name and port of the connection are resolved and reached by the last jump host, not by molcajeted. Each session opens its own SSH connections to the jump hosts.
+
+### File transfer
+
+SSH and RDP connections can move files between the browser and the remote side; the *File transfer* section of the connection form turns it on. Both daemons take the same parameters, which are guacd's, except the size limit.
+
+- **SSH: SFTP** (*Transfer files over SFTP*, `enable-sftp`). Files are reached over SFTP on the terminal's own SSH connection, with the same login, so the server's permissions decide what can be read and written. The *Root folder* (`sftp-root-directory`, default `/`) is where browsing starts; it is not a boundary, as anything the user can reach in the terminal they can reach anyway. The server must offer the `sftp` subsystem (OpenSSH does by default).
+- **RDP: a shared drive** (*Share a drive*, `enable-drive`). A folder on the host where molcajeted (or guacd) runs, *Folder on the molcajeted host* (`drive-path`), shows up in the remote session as a drive called *Drive name* (`drive-name`, default `molcajete`): under *This PC* on Windows, in `~/thinclient_drives` on xrdp (which needs FUSE on the server). Files uploaded in the browser land in that folder and the remote side sees them at once; files saved to the drive remotely can be downloaded. *Create the folder if it is missing* (`create-drive-path`) creates its last component, readable by molcajeted's user only. Every user of the connection shares the folder, so give each connection a folder of its own, and keep in mind that the files stay there until someone deletes them; see [deployment](deployment.md#molcajeted) for where to put it. A browser cannot share a folder of the user's own computer; the drive is always on the daemon's host.
+- **Blocking a direction.** *Block downloads* and *Block uploads* (`sftp-disable-download`, `sftp-disable-upload` for SSH; `disable-download`, `disable-upload` for RDP) refuse that direction in the browser. Browsing still works. For RDP they apply to the browser only; the remote session keeps reading and writing the drive.
+- **Size limit.** *Largest file (MiB)* (`max-file-size`) refuses larger files in both directions. Only molcajeted enforces it; an upload that goes over it is stopped and its partial file deleted.
+
+In a session, press Ctrl+Alt+Shift and choose **Files**: the panel lists the folders, downloads a file with the button next to it, and uploads into the folder shown. Files dropped anywhere on the session are uploaded too, into the user's home folder (SSH, when it lies below the root folder) or the top of the drive (RDP). Transfers show their progress in the panel, or in a corner while it is closed, and can be cancelled; a cancelled upload leaves what was sent so far on the remote side.
+
+Large files are fine in both directions: uploads are read from disk piece by piece, and in Chrome and Edge a download is written to the file the user picks as it arrives. Firefox and Safari cannot write a download to disk as it arrives, so they keep it in memory until it is complete and the panel warns before downloading a file over 1 GiB. The session stays responsive during a transfer; on a slow link file data shares the bandwidth with the screen.
+
+Only the user who opened the session transfers files: users who [joined it](#sharing-a-session) get no file panel, as with guacd. Neither files nor folder listings end up in [session recordings](#session-recordings).
 
 ### Stored credentials
 
@@ -252,6 +268,8 @@ Below *Record sessions*:
 - **Record the mouse** (on by default) records where the pointer was and what was clicked.
 - **Record key presses** (off by default) records every key typed. That includes passwords typed during the session, which every administrator can then read from the recording. The form warns about it, and the recordings list marks such recordings *Includes key presses*.
 - **Keep molcajete's image and video formats** (off by default): see [compatibility](#compatibility-with-guacamoles-tools).
+
+File transfer is not recorded: the files uploaded and downloaded and the folder listings stay out of the recording, as with guacd, whose recordings leave them out as well.
 
 A session that is to be recorded never runs unrecorded: if its file cannot be created, the session is refused with a server error. A write error during a session is logged, and the rest of that session is not recorded.
 

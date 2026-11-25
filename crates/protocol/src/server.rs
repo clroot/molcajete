@@ -269,9 +269,24 @@ pub enum ServerInstruction<'a> {
         mimetype: &'a str,
         filename: &'a str,
     },
+    /// A filesystem object the client may browse with `get` and upload
+    /// into with `put`. molcajeted adds whether files may be downloaded
+    /// and uploaded (`1`/`0`); stock guacd sends neither, and a client
+    /// then cannot tell until it tries.
     Filesystem {
         object: ObjectIndex,
         name: &'a str,
+        download: Option<bool>,
+        upload: Option<bool>,
+    },
+    /// A `get` that cannot be answered with a `body` (molcajeted): the
+    /// path does not exist, cannot be read or may not be downloaded. Stock
+    /// guacd sends nothing in that case.
+    GetError {
+        object: ObjectIndex,
+        name: &'a str,
+        status: Status,
+        message: &'a str,
     },
     Nest {
         index: i32,
@@ -617,9 +632,20 @@ impl<'a> ServerInstruction<'a> {
                 mimetype: d.s(1),
                 filename: d.s(2),
             },
-            "filesystem" => S::Filesystem {
+            "filesystem" => {
+                let flag = |index: usize| (ins.arg_count() > index).then(|| d.s(index) == "1");
+                S::Filesystem {
+                    object: d.i32(0)?,
+                    name: d.s(1),
+                    download: flag(2),
+                    upload: flag(3),
+                }
+            }
+            "get-error" => S::GetError {
                 object: d.i32(0)?,
                 name: d.s(1),
+                status: d.status(2).unwrap_or(Status::SERVER_ERROR),
+                message: d.s(3),
             },
             "nest" => S::Nest {
                 index: d.i32(0)?,
@@ -746,6 +772,40 @@ mod tests {
                 ServerInstruction::DisplayControl { available }
             );
         }
+    }
+
+    #[test]
+    fn filesystems_with_and_without_transfer_flags() {
+        let stock = Instruction::new("filesystem", ["0", "SFTP"]);
+        assert_eq!(
+            ServerInstruction::decode(&&stock).unwrap(),
+            ServerInstruction::Filesystem {
+                object: 0,
+                name: "SFTP",
+                download: None,
+                upload: None
+            }
+        );
+        let molcajeted = Instruction::new("filesystem", ["1", "Drive", "1", "0"]);
+        assert_eq!(
+            ServerInstruction::decode(&&molcajeted).unwrap(),
+            ServerInstruction::Filesystem {
+                object: 1,
+                name: "Drive",
+                download: Some(true),
+                upload: Some(false)
+            }
+        );
+        let failed = Instruction::new("get-error", ["1", "/a", "771", "Forbidden"]);
+        assert_eq!(
+            ServerInstruction::decode(&&failed).unwrap(),
+            ServerInstruction::GetError {
+                object: 1,
+                name: "/a",
+                status: Status::CLIENT_FORBIDDEN,
+                message: "Forbidden"
+            }
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ molcajete-protocol.workspace = true
 molcajete-telemetry.workspace = true
 anyhow.workspace = true
 base64.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
@@ -36,6 +37,8 @@ zstd = "0.13"
 ab_glyph = "0.2"
 alacritty_terminal = "0.26"
 russh = "0.65"
+# SFTP file transfer over the SSH connection
+russh-sftp = "4"
 
 # RDP
 ironrdp-cliprdr = "0.9"
@@ -57,6 +60,8 @@ x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 
 # RDP audio
 ironrdp-rdpsnd = "0.11"
+# RDP drive redirection: a directory on this host served to the server
+ironrdp-rdpdr-native = "0.9"
 
 # Video
 # Built-in H.264 encoder, enabled with `--features openh264`. OpenH264 is
