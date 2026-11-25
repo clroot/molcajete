@@ -56,6 +56,7 @@ async fn sso(extra: &str) -> Sso {
     bootstrap::seed(&db, &config).await.unwrap();
     let oidc = Oidc::new(config.oidc.clone().unwrap()).unwrap();
     let state = Arc::new(AppState {
+        throttle: crate::throttle::LoginThrottle::new(&config.auth.throttle),
         config,
         db,
         client_reports: false,
@@ -620,6 +621,7 @@ async fn unreachable_provider_is_reported() {
     // Nothing listens on port 9 here.
     config.issuer = "http://127.0.0.1:9".into();
     let state = Arc::new(AppState {
+        throttle: crate::throttle::LoginThrottle::new(&sso.state.config.auth.throttle),
         config: sso.state.config.clone(),
         db: sso.state.db.clone(),
         client_reports: false,

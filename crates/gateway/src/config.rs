@@ -68,14 +68,88 @@ pub struct AuthConfig {
     /// Lifetime of a login session.
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: u64,
+    /// `[auth.throttle]`: limits on failed password sign-ins.
+    #[serde(default)]
+    pub throttle: ThrottleConfig,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             session_ttl_hours: default_session_ttl_hours(),
+            throttle: ThrottleConfig::default(),
         }
     }
+}
+
+/// `[auth.throttle]`: how many failed password sign-ins are let through
+/// before `429 Too Many Requests` (see `throttle.rs`). A limit of 0 turns
+/// it off.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThrottleConfig {
+    /// Failed sign-ins from one client address (an IPv6 /64), whatever the
+    /// username, within `address_window_secs`.
+    #[serde(default = "default_address_failures")]
+    pub address_failures: u32,
+    #[serde(default = "default_address_window_secs")]
+    pub address_window_secs: u64,
+    /// Failed sign-ins for one username, from anywhere, within
+    /// `username_window_secs`. Not applied to addresses the user signed in
+    /// from within `known_address_days`.
+    #[serde(default = "default_username_failures")]
+    pub username_failures: u32,
+    #[serde(default = "default_username_window_secs")]
+    pub username_window_secs: u64,
+    /// How long an address the user signed in from stays exempt from the
+    /// username limit.
+    #[serde(default = "default_known_address_days")]
+    pub known_address_days: u64,
+    /// Password verifications (Argon2) running at once; 0 is the number of
+    /// CPUs. Sign-ins beyond that wait up to `verification_wait_secs`, then
+    /// get `503 Service Unavailable`.
+    #[serde(default)]
+    pub max_concurrent_verifications: usize,
+    #[serde(default = "default_verification_wait_secs")]
+    pub verification_wait_secs: u64,
+}
+
+impl Default for ThrottleConfig {
+    fn default() -> Self {
+        Self {
+            address_failures: default_address_failures(),
+            address_window_secs: default_address_window_secs(),
+            username_failures: default_username_failures(),
+            username_window_secs: default_username_window_secs(),
+            known_address_days: default_known_address_days(),
+            max_concurrent_verifications: 0,
+            verification_wait_secs: default_verification_wait_secs(),
+        }
+    }
+}
+
+fn default_address_failures() -> u32 {
+    10
+}
+
+fn default_address_window_secs() -> u64 {
+    5 * 60
+}
+
+fn default_username_failures() -> u32 {
+    20
+}
+
+fn default_username_window_secs() -> u64 {
+    15 * 60
+}
+
+fn default_known_address_days() -> u64 {
+    30
+}
+
+fn default_verification_wait_secs() -> u64 {
+    10
 }
 
 fn default_session_ttl_hours() -> u64 {
@@ -309,6 +383,29 @@ fn byte_size<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D
     }
 }
 
+/// `"10.0.0.0/8"` or a single address such as `"192.0.2.1"`.
+pub fn parse_ip_network(text: &str) -> Option<ipnet::IpNet> {
+    let text = text.trim();
+    text.parse()
+        .ok()
+        .or_else(|| text.parse::<std::net::IpAddr>().ok().map(Into::into))
+}
+
+fn ip_networks<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ipnet::IpNet>, D::Error> {
+    Vec::<String>::deserialize(deserializer)?
+        .iter()
+        .map(|text| {
+            parse_ip_network(text).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "{text:?} is not an address or a CIDR range such as \"10.0.0.0/8\""
+                ))
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -325,6 +422,11 @@ pub struct ServerConfig {
     /// tunnel on the Guacamole text protocol.
     #[serde(default = "default_true")]
     pub binary_tunnel: bool,
+    /// Reverse proxies (addresses or CIDR ranges) whose `X-Real-IP` and
+    /// `X-Forwarded-For` headers name the client. Requests from any other
+    /// peer are attributed to the peer itself.
+    #[serde(default, deserialize_with = "ip_networks")]
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl Default for ServerConfig {
@@ -334,6 +436,7 @@ impl Default for ServerConfig {
             static_dir: default_static_dir(),
             data_dir: default_data_dir(),
             binary_tunnel: true,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -493,6 +596,9 @@ mod tests {
         );
         assert_eq!(config.recordings.max_total_size, 0);
         assert_eq!(config.audit.retention_days, 365);
+        assert!(config.server.trusted_proxies.is_empty());
+        assert_eq!(config.auth.throttle.address_failures, 10);
+        assert_eq!(config.auth.throttle.username_window_secs, 900);
         let config: Config = toml::from_str("[audit]\nretention_days = 0\n").unwrap();
         assert_eq!(config.audit.retention_days, 0);
     }
@@ -518,6 +624,27 @@ mod tests {
         assert_eq!(parse_byte_size("10 KiB"), Some(10_240));
         assert_eq!(parse_byte_size("-1"), None);
         assert_eq!(parse_byte_size("1 parsec"), None);
+    }
+
+    #[test]
+    fn parses_trusted_proxies_and_throttle() {
+        let config: Config = toml::from_str(
+            "[server]\ntrusted_proxies = [\"10.0.0.0/8\", \"192.0.2.1\", \"fd00::/8\"]\n\
+             [auth.throttle]\naddress_failures = 3\nmax_concurrent_verifications = 2\n",
+        )
+        .unwrap();
+        let proxies: Vec<String> = config
+            .server
+            .trusted_proxies
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(proxies, ["10.0.0.0/8", "192.0.2.1/32", "fd00::/8"]);
+        assert_eq!(config.auth.throttle.address_failures, 3);
+        assert_eq!(config.auth.throttle.username_failures, 20);
+        assert_eq!(config.auth.throttle.max_concurrent_verifications, 2);
+        assert!(toml::from_str::<Config>("[server]\ntrusted_proxies = [\"nginx\"]\n").is_err());
+        assert!(toml::from_str::<Config>("[auth.throttle]\nlimit = 1\n").is_err());
     }
 
     #[test]
