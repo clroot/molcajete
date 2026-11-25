@@ -70,6 +70,42 @@ curl -s http://127.0.0.1:9101/metrics | head      # molcajeted
 
 If the remote desktops are on the LAN, check first that pods can reach LAN addresses. On a single-node cluster on a Mac (OrbStack), `host.orb.internal` is the Mac itself, and its port 5900 is macOS Screen Sharing, not a test VNC server.
 
+### molcajeted on macOS (hardware video encoding)
+
+Containers on a Mac (OrbStack, Docker Desktop) run in a Linux VM without access to the Mac's media engine, so molcajeted in a container encodes video in software. Run natively on macOS, molcajeted uses VideoToolbox for H.265 and H.264 (there is no AV1 hardware encoder; AV1 still uses SVT-AV1 when Homebrew's ffmpeg has it). The gateway can stay in the cluster:
+
+```text
+gateway (pod) -> host.orb.internal:4822 -> molcajeted (launchd agent, 127.0.0.1:4822 on the Mac)
+```
+
+1. Build and install the binary (the `profiling` profile keeps line tables for CPU profiles):
+
+   ```bash
+   cargo build --profile profiling -p molcajete-daemon
+   install -m 755 target/profiling/molcajeted ~/.local/bin/molcajeted
+   brew install ffmpeg   # software AV1 / fallback encoders
+   ```
+
+2. Copy `deploy/macos/io.molcajete.molcajeted.plist` to `~/Library/LaunchAgents/`, replace `/Users/USER`, and start it:
+
+   ```bash
+   mkdir -p ~/Library/Logs/molcajete
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.molcajete.molcajeted.plist
+   grep '"video encoders"' ~/Library/Logs/molcajete/molcajeted.log | tail -1
+   # H.265: VideoToolbox (hardware), then ffmpeg libx265; H.264: VideoToolbox (hardware), ...
+   ```
+
+   After replacing the binary: `launchctl kickstart -k gui/$(id -u)/io.molcajete.molcajeted`.
+
+   The plist sets `MOLCAJETED_VIDEO=h265,h264,av1`: with the default order, areas small enough for software AV1 would be encoded on the CPU instead of by VideoToolbox.
+
+3. Point the gateway at the Mac: `[guacd] host = "host.orb.internal"` and remove the molcajeted container from the pod.
+
+- molcajeted listens on loopback only, because the Guacamole protocol has no authentication. OrbStack forwards `host.orb.internal` to the Mac's loopback, so pods still reach it, and so does an in-cluster collector for the telemetry port (`host.orb.internal:9101`).
+- A launchd agent runs only while the user is logged in. So does OrbStack, so the cluster and the daemon start and stop together.
+- Remote desktop addresses are now resolved on the Mac, not in the pod: cluster DNS names no longer work, while LAN and Tailnet addresses do.
+- launchd does not rotate `StandardOutPath`. The log only grows by a few lines per session, but truncate it now and then or add an entry in `/etc/newsyslog.d/`.
+
 ### Reverse proxy
 
 `deploy/nas-nginx.conf` and `deploy/nas-nginx.upstream.inc` are written for an nginx (here on a NAS) in front of a Tailnet-only ingress. Copy both into nginx's `conf.d/` and fill in the domain, the Tailnet IP and the host name.

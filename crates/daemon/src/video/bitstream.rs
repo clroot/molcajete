@@ -7,7 +7,7 @@
 use super::VideoCodec;
 
 /// Four-byte Annex B start code.
-const START_CODE: [u8; 4] = [0, 0, 0, 1];
+pub(crate) const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 const H264_IDR: u8 = 5;
 const H264_SPS: u8 = 7;

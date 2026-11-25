@@ -388,9 +388,18 @@ fn absent_ffmpeg_is_fine() {
         "{}",
         encoders.describe()
     );
-    #[cfg(feature = "openh264")]
+    // Only the backends that do not need ffmpeg remain.
+    assert!(
+        encoders
+            .backends
+            .iter()
+            .all(|b| !matches!(b, Backend::Ffmpeg { .. })),
+        "{}",
+        encoders.describe()
+    );
+    #[cfg(all(feature = "openh264", not(target_os = "macos")))]
     assert_eq!(encoders.available(), [VideoCodec::H264]);
-    #[cfg(not(feature = "openh264"))]
+    #[cfg(not(any(feature = "openh264", target_os = "macos")))]
     assert!(encoders.available().is_empty());
 }
 
