@@ -86,6 +86,40 @@ function isMac() {
   return /mac/i.test(platform);
 }
 
+/** Link schemes the page opens; the daemon offers no others either. */
+function isOpenableLink(url) {
+  return typeof url === "string" && /^(https?:\/\/|mailto:)./i.test(url);
+}
+
+/**
+ * Writes text to the local clipboard from within a key or pointer event,
+ * which counts as a user gesture. Resolves to whether it worked.
+ */
+function writeClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      return navigator.clipboard.writeText(text).then(() => true, () => false);
+    } catch {
+      // Fall through to the copy command.
+    }
+  }
+  // Pages served over plain HTTP have no Clipboard API.
+  const onCopy = (e) => {
+    e.clipboardData.setData("text/plain", text);
+    e.preventDefault();
+  };
+  document.addEventListener("copy", onCopy, { capture: true });
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  } finally {
+    document.removeEventListener("copy", onCopy, { capture: true });
+  }
+  return Promise.resolve(copied);
+}
+
 function timezone() {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -109,6 +143,7 @@ export class MolcajeteSession {
     session.#video = await supportedVideo();
     if (useWorker) await session.#startWorker();
     else await session.#startMain();
+    session.#installTerminalShortcuts();
     if (options.binary === false) session.call("set_binary_tunnel", false);
     if (options.zstd === false) {
       session.#zstd = false;
@@ -133,6 +168,14 @@ export class MolcajeteSession {
   #audioContext = null;
   #players = new Map();
   #remoteComposition = false;
+  /** Terminal copy, paste and link shortcuts are on (see `set_terminal_shortcuts`). */
+  #terminal = false;
+  /** Text the terminal selected last, until it says nothing is selected. */
+  #selection = null;
+  /** Target of the link under the pointer, as the terminal reported it. */
+  #link = null;
+  /** Pointer whose events are kept from the remote side after it opened a link. */
+  #heldPointer = null;
 
   /** "worker" or "main". */
   mode;
@@ -150,7 +193,10 @@ export class MolcajeteSession {
   async #startMain() {
     await init();
     this.#client = new MolcajeteClient(this.#container);
-    this.#client.set_event_handler((type, detail) => this.#handler?.(type, detail));
+    this.#client.set_event_handler((type, detail) => {
+      this.#track(type, detail);
+      this.#handler?.(type, detail);
+    });
   }
 
   async #startWorker() {
@@ -232,7 +278,82 @@ export class MolcajeteSession {
       return;
     }
     if (type === "state" && detail === "connected") this.focus();
+    this.#track(type, detail);
     this.#handler?.(type, detail);
+  }
+
+  /** Keeps what the terminal shortcuts need from the client's events. */
+  #track(type, detail) {
+    if (type === "clipboard") this.#selection = detail;
+    else if (type === "selection" && !detail) this.#selection = null;
+    else if (type === "link") this.#link = detail;
+    else if (type === "state" && detail === "connecting") {
+      this.#selection = null;
+      this.#link = null;
+    }
+  }
+
+  /**
+   * Copy, paste and link shortcuts of terminals. They listen on the
+   * container in the capture phase, ahead of the client's own listeners on
+   * the canvas and the input sink (in either mode), and keep the keys they
+   * handle from the remote side.
+   *
+   * - Copy (⌘C on macOS, Ctrl+Shift+C elsewhere) writes the last selection
+   *   to the local clipboard within the key event, so it counts as a user
+   *   gesture. Without a selection, Ctrl+Shift+C goes to the remote side.
+   * - Paste (⌘V, Ctrl+Shift+V) is left to the browser, which then fires
+   *   `paste`; its text is sent, followed by the terminal's paste keys.
+   * - ⌘-click (Ctrl-click elsewhere) on a link the terminal reported opens
+   *   it within the click, so popup blockers let it through.
+   */
+  #installTerminalShortcuts() {
+    const container = this.#container;
+    const mac = isMac();
+    const isShortcut = (e, letter) =>
+      !e.altKey &&
+      (mac ? e.metaKey && !e.ctrlKey && !e.shiftKey : e.ctrlKey && e.shiftKey && !e.metaKey) &&
+      (e.key.toLowerCase() === letter || e.code === `Key${letter.toUpperCase()}`);
+    const capture = { capture: true };
+
+    this.#listen(container, "keydown", (e) => {
+      if (!this.#terminal || e.isComposing) return;
+      if (isShortcut(e, "c")) {
+        const text = this.#selection;
+        if (!text && !mac) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (text) writeClipboard(text).then((ok) => this.#handler?.("copy", { ok }));
+      } else if (isShortcut(e, "v")) {
+        // Not prevented: the browser pastes, firing `paste` below.
+        e.stopPropagation();
+      }
+    }, capture);
+    this.#listen(container, "paste", (e) => {
+      if (!this.#terminal) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const text = e.clipboardData?.getData("text/plain");
+      if (text) this.call("paste_text", text);
+    }, capture);
+
+    this.#listen(container, "pointerdown", (e) => {
+      const opens = mac ? e.metaKey : e.ctrlKey;
+      if (!this.#terminal || e.button !== 0 || !opens || !isOpenableLink(this.#link)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.#heldPointer = e.pointerId;
+      this.focus();
+      window.open(this.#link, "_blank", "noopener,noreferrer");
+    }, capture);
+    for (const type of ["pointermove", "pointerup", "pointercancel"]) {
+      this.#listen(container, type, (e) => {
+        if (e.pointerId !== this.#heldPointer) return;
+        // The press never reached the remote side; neither does the rest.
+        e.stopPropagation();
+        if (type !== "pointermove") this.#heldPointer = null;
+      }, capture);
+    }
   }
 
   /** Browsers only start audio after a user gesture. */
@@ -377,6 +498,15 @@ export class MolcajeteSession {
       this.#sink.value = "";
     }
     this.call("set_remote_composition", enabled, isMac());
+  }
+
+  /**
+   * Turns on the copy, paste and link shortcuts of terminals (SSH, telnet,
+   * Kubernetes). Other protocols get those keys and clicks as they are.
+   */
+  set_terminal_shortcuts(enabled) {
+    this.#terminal = enabled;
+    this.#heldPointer = null;
   }
 
   send_clipboard(text) {
