@@ -165,6 +165,9 @@ max_age_days = 90
 [audit]
 retention_days = 365
 
+[history]
+retention_days = 365
+
 [[users]]
 username = "admin"
 password = "change-me"
@@ -378,6 +381,16 @@ How long the [audit log](administration.md#audit-log) of sign-ins and administra
 
 The audit log is in the database, so it is backed up with it. Each entry is also a log line with the target `audit` ([observability.md](observability.md#sign-ins-and-changes)), for keeping a copy elsewhere or for longer.
 
+### `[history]`
+
+How long the [connection history](administration.md#connection-history) of closed sessions is kept.
+
+| Key | Default | |
+| --- | --- | --- |
+| `retention_days` | `365` | Delete sessions that ended more than this many days ago, at startup and every hour. `0` keeps them forever. |
+
+The history grows by one row per session, so a busy gateway may want a shorter period than the audit log's.
+
 ### `[[users]]`
 
 Administrators created at startup when no user with that username exists yet. Existing users and their passwords are left alone, so changing a password here later has no effect; use the web UI or `set-password`.
@@ -459,6 +472,7 @@ The gateway applies pending migrations when it starts (and when `set-password` r
 | `20261126000100_recordings` | `molcajete_connection_attribute` (molcajete's own connection settings) and `molcajete_recording` (the recordings index). |
 | `20261126000200_oidc` | `molcajete_user_identity` (provider `iss` and `sub` per user), `molcajete_oidc_login` (sign-ins in progress) and `molcajete_session.id_token`. |
 | `20261127000000_audit_log` | `molcajete_audit_log` (the audit log). It starts empty: changes made before the upgrade are only in old process logs. |
+| `20261127000200_connection_history` | `molcajete_connection_history` (closed sessions). It starts empty: sessions before the upgrade are only in old process logs (`tunnel closed`). |
 
 - A gateway that predates `20261126000000_groups_roles_folders` cannot start on a migrated database, because the column it reads is gone. Do not run old and new gateways against one database: stop the old one first (the Kubernetes template's `Recreate` strategy does this).
 - The JSON API keeps `isAdmin` on users, derived from the role, and accepts it in user requests, so scripts that used it keep working.
@@ -475,7 +489,7 @@ Gateways from this change on keep [connection credentials](administration.md#sto
 
 ### Configuration files
 
-The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour, with one exception: since `[server] trusted_proxies` was added, `X-Real-IP` and `X-Forwarded-For` are read only from the proxies it lists. A gateway behind a proxy needs it set, or every client has the proxy's address in logs, in the audit log and for [failed sign-in limits](administration.md#repeated-failed-sign-ins).
+The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`, `[history]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour, with one exception: since `[server] trusted_proxies` was added, `X-Real-IP` and `X-Forwarded-For` are read only from the proxies it lists. A gateway behind a proxy needs it set, or every client has the proxy's address in logs, in the audit log and for [failed sign-in limits](administration.md#repeated-failed-sign-ins).
 
 ## Mixed versions
 

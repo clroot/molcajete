@@ -198,7 +198,8 @@ export function setUnauthorizedHandler(handler: () => void) {
   onUnauthorized = handler;
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+/** Calls `api/<path>`; failures throw an {@link ApiError}. */
+export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const response = await fetch(`api/${path}`, {
     method,
     credentials: 'same-origin',

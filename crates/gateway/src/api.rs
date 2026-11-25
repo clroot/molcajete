@@ -21,6 +21,7 @@ use crate::db::{
 };
 use crate::proxy::Client;
 use crate::recording;
+use crate::sessions;
 use crate::throttle;
 
 /// Error response: `{"error": "<message>"}` with a status code.
@@ -486,6 +487,7 @@ pub async fn delete_connection(
             &Value::Null,
         ));
     audit::record(&state.db, entry).await;
+    sessions::policy::enforce(&state, &admin, &address).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -519,6 +521,7 @@ pub async fn move_connection(
             &json!({ "folder": names.folder(parent(&body)) }),
         ));
     audit::record(&state.db, entry).await;
+    sessions::policy::enforce(&state, &by, &address).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -550,6 +553,7 @@ pub async fn set_connection_access(
         .from(&address)
         .target(target::CONNECTION, &id, &connection.name);
     record_access(&state, entry, &before, &after).await?;
+    sessions::policy::enforce(&state, &by, &address).await;
     Ok(Json(after))
 }
 
@@ -578,6 +582,7 @@ pub async fn set_folder_access(
         .from(&address)
         .target(target::FOLDER, &id, &folder.name);
     record_access(&state, entry, &before, &after).await?;
+    sessions::policy::enforce(&state, &by, &address).await;
     Ok(Json(after))
 }
 
@@ -723,6 +728,7 @@ pub async fn move_folder(
             &json!({ "folder": names.folder(folder.parent_id.as_deref()) }),
         ));
     audit::record(&state.db, entry).await;
+    sessions::policy::enforce(&state, &by, &address).await;
     Ok(Json(folder))
 }
 
@@ -745,6 +751,7 @@ pub async fn delete_folder(
             &Value::Null,
         ));
     audit::record(&state.db, entry).await;
+    sessions::policy::enforce(&state, &by, &address).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1044,6 +1051,7 @@ pub async fn update_user(
         entry = entry.changes(password_change(had_one));
     }
     audit::record(&state.db, entry).await;
+    sessions::policy::enforce(&state, &admin, &address).await;
     Ok(Json(detail))
 }
 
@@ -1066,6 +1074,7 @@ pub async fn delete_user(
         .target(target::USER, &id, &user.username)
         .changes(audit::diff(&before, &Value::Null));
     audit::record(&state.db, entry).await;
+    sessions::policy::enforce(&state, &admin, &address).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1228,6 +1237,7 @@ pub async fn update_group(
         .target(target::GROUP, &id, &group.name)
         .changes(audit::diff(&before, &group_snapshot(&detail, &names)));
     audit::record(&state.db, entry).await;
+    sessions::policy::enforce(&state, &admin, &address).await;
     Ok(Json(detail))
 }
 
@@ -1246,6 +1256,7 @@ pub async fn delete_group(
         .target(target::GROUP, &id, &detail.group.name)
         .changes(audit::diff(&group_snapshot(&detail, &names), &Value::Null));
     audit::record(&state.db, entry).await;
+    sessions::policy::enforce(&state, &admin, &address).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

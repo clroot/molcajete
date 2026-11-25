@@ -47,4 +47,18 @@ describe('session events', () => {
     const failed = reduce(connected, {type: 'error', detail: {message: 'gone', name: 'UPSTREAM_ERROR'}});
     expect(reduce(failed, {type: 'state', detail: 'disconnected'}).status.kind).toBe('failed');
   });
+
+  test('says when the gateway ended the session and why', () => {
+    const ended = (code: number, message = `tunnel closed: X`) =>
+      reduce(connected, {type: 'error', detail: {message, name: 'X', code}}).status;
+    expect(ended(0x020b)).toEqual({
+      kind: 'failed',
+      title: 'Ended by an administrator',
+      detail: 'An administrator ended this session.',
+    });
+    expect(ended(0x0303)).toMatchObject({title: 'Access removed'});
+    // The same code from the remote desktop is an ordinary error.
+    expect(ended(0x0303, 'denied')).toMatchObject({title: 'Connection error'});
+    expect(ended(0x0203)).toMatchObject({title: 'Connection error'});
+  });
 });

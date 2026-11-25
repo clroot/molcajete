@@ -40,6 +40,28 @@ const initialState: SessionState = {
   isAudioBlocked: false,
 };
 
+/** Statuses the gateway closes a tunnel with when it ends the session itself. */
+const ENDED_BY_GATEWAY: Record<number, {title: string; detail: string}> = {
+  // SESSION_CLOSED
+  0x020b: {title: 'Ended by an administrator', detail: 'An administrator ended this session.'},
+  // CLIENT_FORBIDDEN
+  0x0303: {
+    title: 'Access removed',
+    detail: 'You can no longer use this connection. Ask an administrator if you need it.',
+  },
+};
+
+function errorStatus(error: {message: string; name: string; code?: number}): ConnectionStatus {
+  // Only the tunnel's close carries the gateway's own status; an `error`
+  // from the remote desktop with the same code means something else.
+  const ended =
+    error.message.startsWith('tunnel closed') && error.code !== undefined
+      ? ENDED_BY_GATEWAY[error.code]
+      : undefined;
+  if (ended) return {kind: 'failed', ...ended};
+  return {kind: 'failed', title: 'Connection error', detail: `${error.message} (${error.name})`};
+}
+
 export function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case 'state':
@@ -54,14 +76,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
       }
       return state;
     case 'error':
-      return {
-        ...state,
-        status: {
-          kind: 'failed',
-          title: 'Connection error',
-          detail: `${action.detail.message} (${action.detail.name})`,
-        },
-      };
+      return {...state, status: errorStatus(action.detail)};
     case 'failed':
       return {...state, status: {kind: 'failed', title: action.title, detail: action.detail}};
     case 'clipboard':

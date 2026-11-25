@@ -12,6 +12,8 @@ import SessionPage from './session/SessionPage';
 import RecordingsPage from './recordings/RecordingsPage';
 import PlaybackPage from './recordings/PlaybackPage';
 import AuditPage from './audit/AuditPage';
+import ActiveSessionsPage from './activity/ActiveSessionsPage';
+import HistoryPage from './activity/HistoryPage';
 
 type Auth = {status: 'checking'} | {status: 'signedOut'} | {status: 'signedIn'; user: User};
 
@@ -72,6 +74,10 @@ function SignedInApp({user, onSignOut}: {user: User; onSignOut: () => void}) {
         <RecordingsPage />
       ) : route.name === 'audit' && user.isAdmin ? (
         <AuditPage />
+      ) : route.name === 'activeSessions' && user.isAdmin ? (
+        <ActiveSessionsPage currentUser={user} />
+      ) : route.name === 'history' && user.isAdmin ? (
+        <HistoryPage />
       ) : (
         <ConnectionsPage user={user} />
       )}

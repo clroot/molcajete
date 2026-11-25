@@ -94,6 +94,8 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajete_gateway_relayed_bytes_total` | counter | connection, protocol, direction | Bytes relayed: `to_browser` (as read from the daemon), `to_guacd` |
 | `molcajete_gateway_logins_throttled_total` | counter | reason | Password sign-ins refused before the password was checked: `address` or `username` (too many failures, `429`), `busy` (no free password check within `verification_wait_secs`, `503`). See [Repeated failed sign-ins](administration.md#repeated-failed-sign-ins) |
 | `molcajete_gateway_audit_write_failures_total` | counter | | Audit log entries that could not be stored in the database (the change itself went through and the `audit` log line was written) |
+| `molcajete_gateway_sessions_ended_total` | counter | reason | Sessions ended by the gateway: `admin` (an administrator ended them), `user_disabled`, `user_deleted`, `access_revoked` |
+| `molcajete_gateway_history_write_failures_total` | counter | | Closed sessions that could not be stored in the connection history |
 
 ### Browser reports
 
@@ -134,7 +136,8 @@ Both processes log to stdout. With `--log-format json`, every line is one JSON o
 | --- | --- | --- |
 | `opening tunnel` | gateway | `connection`, `protocol`, `width`, `height`, `overrides` (display parameters the browser asked for), `record` |
 | `tunnel established` | gateway | `guacd_id`, `version`, `framing` (`text`, `transcoded`, `binary`), `handshake_ms` |
-| `tunnel closed` | gateway | `status`, `duration_s`, `bytes_to_browser`, `bytes_to_guacd` |
+| `tunnel closed` | gateway | `status`, `duration_s`, `bytes_to_browser`, `bytes_to_guacd`, and for a session the gateway ended `ended_for` (`admin`, `user_disabled`, `user_deleted`, `access_revoked`) and `ended_by` |
+| `ending session` | gateway | `session` (tunnel id), `user`, `connection`, `reason`, `by` |
 | `client report` | gateway | `session`, `tunnel_id`, `guacd_id`, `connection`, `mode`, `browser`, `device`, `samples`, `fps_avg`, `fps_min`, `frame_lag_ms_avg`, `frame_lag_ms_max`, `frame_receive_ms_max`, `images_per_s`, `image_decode_ms_max`, `frame_present_ms_avg`, `frame_present_ms_max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `send_buffered_max`, `display_width`, `display_height` |
 | `guacd handshake failed`, `tunnel requested for unknown or forbidden connection` | gateway | `error`, `connection` |
 | `connection established` | molcajeted | `width`, `height`, `dpi`, `image` (mimetypes the client announced), `video`, `binary` |

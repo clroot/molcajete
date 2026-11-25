@@ -19,7 +19,9 @@
 //! (UUID, ping replies) and everything the browser sends stay text.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
@@ -38,6 +40,7 @@ use crate::AppState;
 use crate::db::{ConnectionRecord, attributes, now_millis};
 use crate::guacd::{self, ClientInfo, GuacdSession};
 use crate::recording::{self, RecordedUser, Recorder};
+use crate::sessions::{self, SessionStart, Traffic};
 
 /// WebSocket subprotocol of the stock Guacamole tunnel.
 pub const TEXT_SUBPROTOCOL: &str = "guacamole";
@@ -274,6 +277,21 @@ async fn serve_tunnel(
         handshake_ms = handshake.as_millis() as u64,
         "tunnel established"
     );
+    let user = request.user.clone().unwrap_or_default();
+    let registration = state.sessions.register(
+        tunnel_id,
+        SessionStart {
+            user_id: user.id,
+            username: user.username,
+            connection_id: connection.id.clone(),
+            connection_name: connection.name.clone(),
+            protocol: connection.protocol.clone(),
+            peer: request.peer.clone(),
+            guacd: (guacd_host.to_owned(), guacd_port),
+            guacd_id: session.id.clone(),
+            recording_id: recorder.as_ref().map(|r| r.id().to_owned()),
+        },
+    );
     let session_id = request.session.as_deref().filter(|_| state.client_reports);
     if let Some(session_id) = session_id {
         state
@@ -299,7 +317,9 @@ async fn serve_tunnel(
         tunnel_id,
         request.binary,
         &counters,
+        registration.traffic(),
         recorder.as_ref(),
+        async { registration.ended().await.reason.status() },
     )
     .await;
     if let Some(recorder) = recorder {
@@ -308,6 +328,9 @@ async fn serve_tunnel(
     if let Some(session_id) = session_id {
         state.tunnels.closed(session_id, tunnel_id);
     }
+    sessions::history::record(&state.db, &registration, stats.status).await;
+    let ending = registration.ending();
+    drop(registration);
     active.decrement(1.0);
     let duration = started.elapsed();
     histogram!("molcajete_gateway_tunnel_duration_seconds", &labels).record(duration);
@@ -321,6 +344,8 @@ async fn serve_tunnel(
         duration_s = duration.as_secs_f64(),
         bytes_to_browser = stats.to_browser,
         bytes_to_guacd = stats.to_guacd,
+        ended_for = ending.as_ref().map(|e| e.reason.as_str()),
+        ended_by = ending.as_ref().and_then(|e| e.by.as_deref()),
         "tunnel closed"
     );
 }
@@ -379,17 +404,22 @@ impl Framing {
     }
 }
 
-/// Pumps data in both directions until either side terminates.
-/// `browser_binary` tells whether the browser selected the binary
-/// subprotocol. With a `recorder`, what the browser is sent and its mouse
-/// and keys are recorded too.
+/// Pumps data in both directions until either side terminates or `ended`
+/// resolves with the status to close the tunnel with (an administrator
+/// ended the session). `browser_binary` tells whether the browser selected
+/// the binary subprotocol. Relayed bytes are counted into `traffic`. With
+/// a `recorder`, what the browser is sent and its mouse and keys are
+/// recorded too.
+#[allow(clippy::too_many_arguments)]
 pub async fn relay(
     socket: WebSocket,
     session: GuacdSession,
     tunnel_id: Uuid,
     browser_binary: bool,
     counters: &RelayCounters,
+    traffic: &Traffic,
     recorder: Option<&Recorder>,
+    ended: impl Future<Output = Status>,
 ) -> RelayStats {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
@@ -413,8 +443,6 @@ pub async fn relay(
     let uuid = InstructionBuilder::new("")
         .str_arg(&tunnel_id.to_string())
         .finish();
-    let mut to_browser = 0u64;
-    let mut to_guacd = 0u64;
     let status = if out_tx.send(Message::Text(uuid.into())).await.is_err() {
         Status::SUCCESS
     } else {
@@ -422,7 +450,7 @@ pub async fn relay(
             rd: guacd_rd,
             out: &out_tx,
             counter: &counters.to_browser,
-            total: &mut to_browser,
+            total: &traffic.to_browser,
             recorder,
         };
         let to_browser = async {
@@ -434,7 +462,11 @@ pub async fn relay(
         };
         tokio::select! {
             status = to_browser => status,
-            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &mut to_guacd, recorder) => status,
+            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &traffic.to_guacd, recorder) => status,
+            status = ended => {
+                debug!(%status, "session ended by the gateway");
+                status
+            }
         }
     };
 
@@ -443,8 +475,8 @@ pub async fn relay(
     let _ = writer.await;
     RelayStats {
         status,
-        to_browser,
-        to_guacd,
+        to_browser: traffic.to_browser.load(Ordering::Relaxed),
+        to_guacd: traffic.to_guacd.load(Ordering::Relaxed),
     }
 }
 
@@ -453,7 +485,7 @@ struct Upstream<'a> {
     rd: OwnedReadHalf,
     out: &'a mpsc::Sender<Message>,
     counter: &'a Counter,
-    total: &'a mut u64,
+    total: &'a AtomicU64,
     recorder: Option<&'a Recorder>,
 }
 
@@ -473,7 +505,7 @@ impl Upstream<'_> {
             }
             Ok(n) => {
                 self.counter.increment(n as u64);
-                *self.total += n as u64;
+                self.total.fetch_add(n as u64, Ordering::Relaxed);
                 Ok(n)
             }
             Err(err) => {
@@ -638,7 +670,7 @@ async fn browser_to_guacd(
     mut wr: OwnedWriteHalf,
     out: &mpsc::Sender<Message>,
     counter: &Counter,
-    total: &mut u64,
+    total: &AtomicU64,
     recorder: Option<&Recorder>,
 ) -> Status {
     let mut parser = Parser::with_limits(Limits::STRICT);
@@ -691,7 +723,7 @@ async fn browser_to_guacd(
                 return Status::UPSTREAM_ERROR;
             }
             counter.increment(forward.len() as u64);
-            *total += forward.len() as u64;
+            total.fetch_add(forward.len() as u64, Ordering::Relaxed);
         }
     }
     Status::SUCCESS

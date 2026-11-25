@@ -284,6 +284,9 @@ pub async fn receive(
         sum.add(s);
     }
     let last = report.samples.last().expect("checked non-empty");
+    if let (Some((tunnel_id, _)), Some(rtt)) = (&tunnel, last.rtt_ms) {
+        state.sessions.set_rtt(*tunnel_id, rtt);
+    }
     info!(
         target: "molcajete::client_report",
         session = %session,
