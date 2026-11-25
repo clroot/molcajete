@@ -247,6 +247,20 @@ pub struct Inner {
     last_lag_ms: f64,
     counters: Counters,
     stats_since: f64,
+    /// Whether changes are drawn to the canvas (see [`Inner::set_presenting`]).
+    presenting: bool,
+    /// A recording loaded for playback.
+    playback: Option<Playback>,
+    /// Instructions are being fed from a recording.
+    replaying: bool,
+}
+
+/// A session recording being played (see [`Inner::load_recording`]).
+struct Playback {
+    data: Vec<u8>,
+    index: crate::recording::Index,
+    /// How many points of the index have been fed.
+    fed: usize,
 }
 
 fn now() -> f64 {
@@ -394,6 +408,9 @@ impl Inner {
                 last_lag_ms: 0.0,
                 counters: Counters::default(),
                 stats_since: now(),
+                presenting: true,
+                playback: None,
+                replaying: false,
             })
         })
     }
@@ -1090,6 +1107,8 @@ impl Inner {
             S::Msg { id } => self.emit("msg", JsValue::from(id)),
             S::Link { url } => self.emit("link", url.map_or(JsValue::NULL, JsValue::from_str)),
             S::Selection { active } => self.emit("selection", JsValue::from_bool(active)),
+            // A recording ends where the session did; the player stays.
+            S::Error { .. } | S::Disconnect if self.replaying => {}
             S::Error { message, status } => {
                 let message = message.to_owned();
                 self.fail(status, &message);
@@ -1176,6 +1195,12 @@ impl Inner {
                     // Nothing to wait for: the frame decodes it when it is
                     // drawn, in wasm.
                     slot.finish(ImageState::Ready(QueuedImage::Zstd(data.into_vec())));
+                    return;
+                }
+                if mimetype == "image/png" && !self.presenting {
+                    // Seeking: nothing is shown, and decoding here costs a
+                    // fifth of the browser's decoder and staging canvas.
+                    slot.finish(ImageState::Ready(QueuedImage::Png(data.into_vec())));
                     return;
                 }
                 let (data, opaque) = data.into_image(&mimetype);
@@ -1812,7 +1837,7 @@ impl Inner {
                 }
             }
         }
-        if self.display.needs_composite() && !self.raf_pending {
+        if self.presenting && self.display.needs_composite() && !self.raf_pending {
             // With early compositing, nothing has been drawn in this refresh
             // interval yet, so the change need not wait for the animation
             // frame. The frame that is requested then ends the interval:
@@ -1970,7 +1995,7 @@ impl Inner {
     }
 
     /// Processes instructions as if they had arrived from the server. Used
-    /// by tests and for replaying recordings.
+    /// by tests and benchmarks.
     pub fn feed(&mut self, text: &str) {
         if self.parser.is_none() {
             self.parser = Some(Parser::new());
@@ -1978,6 +2003,111 @@ impl Inner {
         let last = self.last_received;
         self.receive(text.to_owned());
         self.last_received = last;
+    }
+
+    // ------------------------------------------------------------------
+    // Playback of session recordings
+    // ------------------------------------------------------------------
+
+    /// Whether changes reach the canvas. Off while seeking, so that the
+    /// frames passed on the way are applied to the layers but never drawn;
+    /// turning it back on draws the result once.
+    pub fn set_presenting(&mut self, presenting: bool) {
+        self.presenting = presenting;
+        if presenting {
+            self.display.invalidate();
+        }
+    }
+
+    /// Loads a session recording (Guacamole's format) for playback, in
+    /// place of any session, and returns its duration in milliseconds.
+    /// Nothing is drawn until [`Inner::playback_advance`].
+    pub fn load_recording(&mut self, data: Vec<u8>) -> f64 {
+        self.disconnect_internal(None);
+        self.set_state(State::Idle);
+        let index = crate::recording::Index::build(&data);
+        let duration = index.duration() as f64;
+        self.playback = Some(Playback {
+            data,
+            index,
+            fed: 0,
+        });
+        self.rewind();
+        duration
+    }
+
+    /// Back to an empty display before the first instruction.
+    fn rewind(&mut self) {
+        self.display.reset();
+        self.streams.clear();
+        self.audio.clear();
+        self.parser = Some(Parser::new());
+        self.last_sync_ack = None;
+        if let Some(playback) = &mut self.playback {
+            playback.fed = 0;
+        }
+    }
+
+    /// Plays the recording up to `time` (milliseconds from its start),
+    /// starting over when `time` lies before what was played. At most
+    /// about `max_bytes` are fed per call, so that the caller can let the
+    /// images decode in between; returns whether `time` was reached.
+    pub fn playback_advance(&mut self, time: f64, max_bytes: usize) -> bool {
+        let Some(playback) = &self.playback else {
+            return true;
+        };
+        let target = playback.index.points_until(time as i64);
+        if target < playback.fed {
+            self.rewind();
+        }
+        let Some(mut playback) = self.playback.take() else {
+            return true;
+        };
+        let points = &playback.index.points;
+        let fed = playback.fed;
+        if target > fed {
+            let from = fed.checked_sub(1).map_or(0, |i| points[i].end);
+            // The furthest point within the budget, and at least the next.
+            let limit = from.saturating_add(max_bytes);
+            let within = points[fed..target].partition_point(|p| p.end <= limit);
+            let to = fed + within.max(1);
+            let end = points[to - 1].end;
+            self.replaying = true;
+            self.feed_bytes(&playback.data[from..end]);
+            self.replaying = false;
+            playback.fed = to;
+        }
+        let done = playback.fed >= target;
+        self.playback = Some(playback);
+        done
+    }
+
+    /// Time of the last instruction played (milliseconds from the start).
+    pub fn playback_time(&self) -> f64 {
+        self.playback.as_ref().map_or(0.0, |p| {
+            p.fed
+                .checked_sub(1)
+                .map_or(0.0, |i| p.index.points[i].time as f64)
+        })
+    }
+
+    /// Unix milliseconds of the start of the recording.
+    pub fn playback_start(&self) -> f64 {
+        self.playback.as_ref().map_or(0.0, |p| p.index.start as f64)
+    }
+
+    /// Drops the loaded recording.
+    pub fn unload_recording(&mut self) {
+        self.playback = None;
+        self.rewind();
+    }
+
+    fn feed_bytes(&mut self, bytes: &[u8]) {
+        let mut parser = self.parser.take().unwrap_or_default();
+        parser.feed(bytes);
+        self.drain(&mut parser);
+        self.parser = Some(parser);
+        self.display.process();
     }
 
     pub fn display(&mut self) -> &mut Display {

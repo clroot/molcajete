@@ -8,15 +8,24 @@
 //               {type: "event", event, detail}
 //               {type: "result", id, result, error?}
 import init, { MolcajeteClient } from "./pkg/molcajete_client.js";
+import { RecordingPlayer } from "./molcajete-player.js";
 
 let client = null;
+let player = null;
+const emit = (event, detail) => self.postMessage({ type: "event", event, detail });
 const pending = [];
 
 function dispatch({ method, args = [], id }) {
   let result;
   let error;
   try {
-    if (method === "connect_to") {
+    if (method.startsWith("player_")) {
+      // Session recordings: player_load(url), player_play(), player_pause(),
+      // player_seek(ms), player_speed(x), player_close().
+      player ??= new RecordingPlayer(client, emit);
+      result = player[method.slice("player_".length)](...args);
+      if (result instanceof Promise) result = undefined;
+    } else if (method === "connect_to") {
       const [base, connection] = args;
       result = client.connect(client.tunnel_url(base, connection));
     } else {

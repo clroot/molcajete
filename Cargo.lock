@@ -2875,6 +2875,7 @@ dependencies = [
  "js-sys",
  "lyon_tessellation",
  "molcajete-protocol",
+ "png",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

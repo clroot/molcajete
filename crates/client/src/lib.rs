@@ -10,6 +10,8 @@ pub mod geom;
 pub mod gl;
 pub mod image;
 pub mod input;
+pub mod png;
+pub mod recording;
 pub mod scope;
 
 #[cfg(target_arch = "wasm32")]
@@ -235,6 +237,51 @@ mod wasm_api {
 
         pub fn display_height(&self) -> u32 {
             self.inner.borrow().display_size().1
+        }
+
+        /// Loads a session recording (Guacamole's format) for playback in
+        /// place of a session and returns its duration in milliseconds.
+        pub fn load_recording(&self, data: Vec<u8>) -> f64 {
+            let mut duration = 0.0;
+            self.run(|inner| duration = inner.load_recording(data));
+            duration
+        }
+
+        /// Plays the loaded recording up to `time` milliseconds from its
+        /// start, starting over for a time before what was played. Feeds at
+        /// most about `max_bytes` per call; returns whether `time` was
+        /// reached. Call again (after letting images decode) until it is.
+        pub fn playback_advance(&self, time: f64, max_bytes: usize) -> bool {
+            let mut done = true;
+            self.run(|inner| done = inner.playback_advance(time, max_bytes));
+            done
+        }
+
+        /// Time of the last instruction played, in milliseconds from the
+        /// start of the recording.
+        pub fn playback_time(&self) -> f64 {
+            self.inner.borrow().playback_time()
+        }
+
+        /// Unix milliseconds at which the recording starts.
+        pub fn playback_start(&self) -> f64 {
+            self.inner.borrow().playback_start()
+        }
+
+        /// Frames of the recording fed but not applied yet, because their
+        /// images are still being decoded.
+        pub fn playback_pending(&self) -> usize {
+            self.inner.borrow_mut().display().pending_frames()
+        }
+
+        pub fn unload_recording(&self) {
+            self.run(|inner| inner.unload_recording());
+        }
+
+        /// Whether changes are drawn to the canvas; off while seeking, so
+        /// that nothing on the way is drawn.
+        pub fn set_presenting(&self, presenting: bool) {
+            self.run(|inner| inner.set_presenting(presenting));
         }
 
         /// Feeds raw protocol text as if received from the server.
