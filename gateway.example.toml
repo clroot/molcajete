@@ -26,6 +26,27 @@ port = 4822
 username = "admin"
 password = "change-me"
 
+# Single sign-on through an OpenID Connect provider (docs/deployment.md,
+# "Single sign-on"). docker/keycloak/ has a test realm for it.
+# [oidc]
+# issuer = "https://sso.example.com/realms/example"
+# client_id = "molcajete"
+# client_secret = "..."          # or client_secret_file, or MOLCAJETE_OIDC_CLIENT_SECRET
+# redirect_url = "https://molcajete.example.com/api/auth/oidc/callback"
+# scopes = ["profile", "email"]
+# username_claim = "preferred_username"
+# groups_claim = "groups"
+# display_name = "Example SSO"   # "Sign in with Example SSO"
+# admin_groups = ["molcajete-admins"]                # role admin
+# connection_manager_groups = ["molcajete-operators"] # role connection_manager
+# sync_role = true               # leaving those groups lowers the role again
+# sync_groups = false            # memberships in molcajete groups follow the provider
+# create_groups = false          # create groups the provider names but we lack
+# group_prefix = "molcajete-"    # sync only provider groups with this prefix
+# auto_create_users = true       # false: only users created here beforehand
+# password_login = true          # false: hide the password form
+# post_logout_redirect_url = "https://molcajete.example.com/"
+
 # Connections below are imported once, when their id is not in the
 # database yet; afterwards, edit them in the web UI.
 
