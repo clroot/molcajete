@@ -12,6 +12,7 @@
 //! - [`terminal`]: the emulator, scrollback and selection
 //! - [`render`], [`font`], [`boxdraw`], [`color`]: drawing cells
 //! - [`keys`], [`mouse`]: input translation
+//! - [`link`]: links under the pointer
 //! - [`bridge`]: the session loop tying it all together
 
 mod boxdraw;
@@ -20,6 +21,7 @@ mod client;
 mod color;
 mod font;
 mod keys;
+mod link;
 mod mouse;
 mod render;
 mod settings;

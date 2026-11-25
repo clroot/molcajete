@@ -10,13 +10,14 @@ use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb as VteRgb};
-use molcajete_protocol::Status;
+use molcajete_protocol::{InstructionBuilder, Status};
 use russh::{ChannelMsg, ChannelReadHalf};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use super::client::{Outgoing, PtySize};
 use super::keys::{self, KeyOptions, Modifiers};
+use super::link::{self, Link};
 use super::mouse::{self, MouseAction};
 use super::render::{Pointer, Renderer};
 use super::settings::Settings;
@@ -46,8 +47,29 @@ struct MouseState {
     selecting: bool,
     last_click: Option<(Instant, usize, usize)>,
     clicks: u8,
-    /// Pointer image in use (`true`: arrow).
-    arrow: Option<bool>,
+    /// Pointer image in use.
+    pointer: Option<PointerKind>,
+    /// Link under the pointer, as last told to the client.
+    link: Option<Link>,
+}
+
+/// Pointer images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerKind {
+    /// Selecting text.
+    Text,
+    /// The application gets mouse events.
+    Arrow,
+    /// Over a link.
+    Hand,
+}
+
+/// Instruction telling the client that nothing is selected any more, so
+/// that a copy shortcut does not copy the previous selection. A selection
+/// arrives as `clipboard`. Stock guacd never sends it, and clients that do
+/// not know it ignore it.
+fn selection_cleared() -> String {
+    InstructionBuilder::new("selection").arg(0).finish()
 }
 
 pub struct Bridge {
@@ -88,7 +110,7 @@ impl Bridge {
             dirty_since: Instant::now(),
         };
         bridge.renderer.invalidate(size);
-        bridge.set_pointer(false);
+        bridge.set_pointer(PointerKind::Text);
         bridge
     }
 
@@ -218,6 +240,8 @@ impl Bridge {
     }
 
     fn render_frame(&mut self) {
+        // Output may have moved or replaced the link under the pointer.
+        self.update_link();
         let before = self.writer.pending();
         let (renderer, terminal, display, writer) = (
             &mut self.renderer,
@@ -311,7 +335,12 @@ impl Bridge {
     }
 
     fn key(&mut self, keysym: u32, pressed: bool) {
-        if self.mods.update(keysym, pressed) || !pressed {
+        if self.mods.update(keysym, pressed) {
+            // Shift lets the pointer bypass mouse reporting, links included.
+            self.update_link();
+            return;
+        }
+        if !pressed {
             return;
         }
         let mode = self.terminal.mode();
@@ -379,9 +408,8 @@ impl Bridge {
         self.mouse.cell = Some((col, row, side));
 
         let mode = self.terminal.mode();
-        let reporting =
-            mode.intersects(TermMode::MOUSE_MODE) && !self.mods.shift && !self.settings.read_only;
-        self.set_pointer(reporting);
+        let reporting = self.reporting();
+        self.update_link();
         if reporting {
             self.report_mouse(pressed, released, moved, col, row, mode);
             return;
@@ -510,22 +538,55 @@ impl Bridge {
             }
             None => {
                 self.terminal.clear_selection();
+                self.writer.push(&selection_cleared());
                 self.mark_dirty();
             }
         }
     }
 
-    /// Switches between the I-beam (selection) and the arrow (the
-    /// application gets mouse events).
-    fn set_pointer(&mut self, arrow: bool) {
-        if self.mouse.arrow == Some(arrow) {
+    /// Whether the application gets mouse events (Shift bypasses it).
+    fn reporting(&self) -> bool {
+        self.terminal.mode().intersects(TermMode::MOUSE_MODE)
+            && !self.mods.shift
+            && !self.settings.read_only
+    }
+
+    /// Finds the link under the pointer, tells the client when it changed,
+    /// underlines it and picks the pointer image. Links are not offered
+    /// while the application gets mouse events or a button is held.
+    fn update_link(&mut self) {
+        let reporting = self.reporting();
+        let link = match self.mouse.cell {
+            Some((col, row, _)) if !reporting && self.mouse.mask == 0 && !self.mouse.selecting => {
+                self.terminal.link_at(col, row)
+            }
+            _ => None,
+        };
+        if link != self.mouse.link {
+            self.writer.push(&link::instruction(link.as_ref()));
+            self.renderer
+                .set_link(link.as_ref().map(|link| (link.start, link.end)));
+            self.mouse.link = link;
+            self.mark_dirty();
+        }
+        self.set_pointer(if self.mouse.link.is_some() {
+            PointerKind::Hand
+        } else if reporting {
+            PointerKind::Arrow
+        } else {
+            PointerKind::Text
+        });
+    }
+
+    fn set_pointer(&mut self, kind: PointerKind) {
+        if self.mouse.pointer == Some(kind) {
             return;
         }
-        self.mouse.arrow = Some(arrow);
-        let p = if arrow {
-            Pointer::arrow()
-        } else {
-            Pointer::ibeam()
+        self.mouse.pointer = Some(kind);
+        let p = match kind {
+            PointerKind::Text => Pointer::ibeam(),
+            PointerKind::Arrow => Pointer::arrow(),
+            PointerKind::Hand => Pointer::hand(),
         };
         self.display.set_cursor(
             p.hotspot.0,

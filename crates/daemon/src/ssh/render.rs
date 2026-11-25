@@ -8,6 +8,7 @@
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Indexed;
+use alacritty_terminal::index::Point;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
@@ -79,6 +80,9 @@ pub struct Renderer {
     /// Background colour of the area outside the cell grid, once painted.
     margin: Option<(Rgb, u32, u32)>,
     pixels: Vec<u8>,
+    /// Cells of the link under the pointer (grid points, inclusive), drawn
+    /// underlined.
+    link: Option<(Point, Point)>,
 }
 
 impl Renderer {
@@ -91,6 +95,7 @@ impl Renderer {
             next: Vec::new(),
             margin: None,
             pixels: Vec::new(),
+            link: None,
         }
     }
 
@@ -109,6 +114,12 @@ impl Renderer {
             cols: ((width / m.width) as usize).max(2),
             rows: ((height / m.height) as usize).max(1),
         }
+    }
+
+    /// Underlines the cells of the link under the pointer from the next
+    /// frame on.
+    pub fn set_link(&mut self, link: Option<(Point, Point)>) {
+        self.link = link;
     }
 
     /// Forgets what the client shows, forcing a full redraw (after a
@@ -134,6 +145,7 @@ impl Renderer {
             colors,
             selection,
             cursor,
+            link: self.link,
         };
         let default_bg = self
             .scheme
@@ -232,6 +244,7 @@ struct Frame<'a> {
     colors: &'a Colors,
     selection: Option<SelectionRange>,
     cursor: RenderableCursor,
+    link: Option<(Point, Point)>,
 }
 
 /// Bold text in one of the 8 basic colours uses the bright variant (like
@@ -296,7 +309,10 @@ fn cell_view(scheme: &ColorScheme, indexed: &Indexed<&Cell>, frame: &Frame<'_>) 
         bg,
         style: Style {
             bold,
-            underline: flags.intersects(Flags::ALL_UNDERLINES),
+            underline: flags.intersects(Flags::ALL_UNDERLINES)
+                || frame
+                    .link
+                    .is_some_and(|(start, end)| (start..=end).contains(&indexed.point)),
             double_underline: flags.contains(Flags::DOUBLE_UNDERLINE),
             strikeout: flags.contains(Flags::STRIKEOUT),
         },
@@ -404,6 +420,32 @@ impl Pointer {
             "  #.#  ", "  #.#  ", "  #.#  ", "  #.#  ", "  #.#  ", "###.###", "#..#..#", "###.###",
         ];
         Self::from_art(ART, (3, 8))
+    }
+
+    /// Pointing hand, shown over a link.
+    pub fn hand() -> Self {
+        const ART: &[&str] = &[
+            "     ##",
+            "    #..#",
+            "    #..#",
+            "    #..#",
+            "    #..###",
+            "    #..#..###",
+            "    #..#..#..##",
+            "    #..#..#..#.#",
+            "### #..#..#..#..#",
+            "#..##...........#",
+            "#...#...........#",
+            " #..............#",
+            "  #.............#",
+            "  #.............#",
+            "   #...........#",
+            "   #...........#",
+            "    #.........#",
+            "    #.........#",
+            "    ###########",
+        ];
+        Self::from_art(ART, (5, 0))
     }
 
     /// Arrow, shown while the application receives mouse events.
@@ -514,6 +556,26 @@ mod tests {
         assert_eq!(r.next[0].bg, palette[7]);
         assert_eq!(r.next[1].bg, palette[7]);
         assert_eq!(r.next[2].bg, palette[0]);
+    }
+
+    #[test]
+    fn link_under_the_pointer_is_underlined() {
+        let (mut r, mut t, mut d) = setup(20, 3);
+        t.feed(b"abcd");
+        let point = |col| {
+            Point::new(
+                alacritty_terminal::index::Line(0),
+                alacritty_terminal::index::Column(col),
+            )
+        };
+        r.set_link(Some((point(1), point(2))));
+        assert_eq!(r.render(t.term(), &mut d), 3);
+        let underlined: Vec<bool> = (0..4).map(|col| r.next[col].style.underline).collect();
+        assert_eq!(underlined, [false, true, true, false]);
+        // Taking the underline away redraws the row.
+        r.set_link(None);
+        assert_eq!(r.render(t.term(), &mut d), 1);
+        assert!(!r.next[1].style.underline);
     }
 
     #[test]
