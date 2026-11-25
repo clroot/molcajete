@@ -226,3 +226,4 @@ histogram_quantile(0.99, sum by (le) (rate(molcajeted_socket_write_seconds_bucke
 - **메트릭**: Prometheus 호환 저장소(Prometheus에 remote-write receiver를 켜거나 Mimir)와 Grafana datasource가 필요하다.
 - **프로파일**: Pyroscope와 Grafana datasource가 필요하다.
 - 수집 설정은 `deploy/observability/molcajete.alloy`를 기존 Alloy 설정에 붙인다. pod label `app.kubernetes.io/name=molcajete`와 `telemetry` 이름의 포트로 대상을 찾는다.
+- 대시보드: `deploy/observability/grafana-dashboard.json`(`Molcajete Performance`, datasource uid `prometheus`·`loki`·`pyroscope`). 개요 → 서버 프레임 파이프라인 → 클라이언트·네트워크 → gateway → CPU flamegraph → 세션 로그 순서로 병목을 좁혀 간다.
