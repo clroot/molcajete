@@ -8,6 +8,7 @@
 
 mod frames;
 pub mod path;
+mod present;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -18,6 +19,7 @@ use crate::gl::{Clip, CompositeItem, CompositeNode, Paint, Readback, Renderer, S
 use crate::image::DecodedImage;
 use frames::Frames;
 use path::{Path, Shape};
+use present::Unpresented;
 
 pub type ImageState = frames::ImageState<DecodedImage>;
 pub type ImageSlot = frames::ImageSlot<DecodedImage>;
@@ -347,7 +349,7 @@ pub struct Span {
 }
 
 impl Span {
-    fn add(&mut self, ms: f64) {
+    pub(crate) fn add(&mut self, ms: f64) {
         self.count += 1;
         self.total_ms += ms;
         self.max_ms = self.max_ms.max(ms);
@@ -376,6 +378,9 @@ pub struct RenderStats {
     pub lag: Span,
     /// Per image: from handing the bytes to the decoder to the decoded image.
     pub decode: Span,
+    /// Per frame: from being applied to the layers to being drawn to the
+    /// canvas (waiting for the next composite, and the composite itself).
+    pub present: Span,
 }
 
 pub struct Display {
@@ -395,6 +400,7 @@ pub struct Display {
     needs_composite: bool,
     events: Vec<DisplayEvent>,
     stats: RenderStats,
+    unpresented: Unpresented,
     /// When the first instruction of the frame being received arrived.
     frame_started: Option<f64>,
     /// Source of layer generations (unique across layers and re-creations).
@@ -436,6 +442,7 @@ impl Display {
             needs_composite: true,
             events: Vec::new(),
             stats: RenderStats::default(),
+            unpresented: Unpresented::default(),
             frame_started: None,
             generation_counter: 0,
             last_cursor: None,
@@ -498,6 +505,7 @@ impl Display {
         self.last_cursor = None;
         self.pending_cursor = None;
         self.last_cursor_image = None;
+        self.unpresented = Unpresented::default();
         self.width = 0;
         self.height = 0;
         self.needs_composite = true;
@@ -550,6 +558,7 @@ impl Display {
                         self.needs_composite = true;
                         let lag_ms = crate::scope::performance_now() - received_at;
                         self.stats.lag.add(lag_ms);
+                        self.unpresented.add(received_at + lag_ms);
                         self.events.push(DisplayEvent::FrameComplete {
                             timestamp,
                             frames,
@@ -1210,6 +1219,10 @@ impl Display {
         let smooth = (f - f.round()).abs() > 1e-6 || f < 1.0;
         self.renderer.composite(&items, [0.0, 0.0, 0.0], smooth);
         self.stats.composites += 1;
+        if !self.unpresented.is_empty() {
+            self.unpresented
+                .present(crate::scope::performance_now(), &mut self.stats.present);
+        }
     }
 }
 

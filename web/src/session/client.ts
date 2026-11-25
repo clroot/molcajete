@@ -18,6 +18,9 @@ export type SessionStats = {
   imagesPerSecond?: number;
   imageDecodeMsAvg?: number;
   imageDecodeMsMax?: number;
+  /** Null for a second in which no frame was drawn to the canvas. */
+  framePresentMsAvg?: number | null;
+  framePresentMsMax?: number;
   rttMs: number | null;
   queuedOps: number;
 };
@@ -93,6 +96,7 @@ export function formatStats(s: SessionStats, mode: string): string {
     `instr     ${s.instructionsPerSecond.toFixed(0)}/s`,
     `recv      ${kb} KiB/s`,
     `lag       ${s.frameLagMs.toFixed(1)} ms`,
+    `present   ${s.framePresentMsAvg == null ? '-' : s.framePresentMsAvg.toFixed(1) + ' ms'}`,
     `rtt       ${s.rttMs == null ? '-' : s.rttMs.toFixed(0) + ' ms'}`,
     `queued    ${s.queuedOps}`,
   ].join('\n');

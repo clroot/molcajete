@@ -225,6 +225,13 @@ mod wasm_api {
                 .set_staged_uploads(enabled);
         }
 
+        /// Draws to the canvas as soon as a frame is applied (`true`) or in
+        /// the next animation frame (`false`, the default), for comparing
+        /// the two (benchmarking aid).
+        pub fn debug_set_early_composite(&self, enabled: bool) {
+            self.run(|inner| inner.set_early_composite(enabled));
+        }
+
         /// Number of display operations still waiting (e.g. image decodes).
         pub fn debug_queued(&self) -> usize {
             self.inner.borrow_mut().display().queued()

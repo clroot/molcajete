@@ -195,6 +195,7 @@ The page batches the client's once-per-second `stats` and posts them every 10 se
 | --- | --- |
 | `molcajete_client_frame_lag_seconds` | From receiving a frame's `sync` to applying it and acknowledging: waiting for its images to decode and for the frames before it (average per second) |
 | `molcajete_client_frame_receive_seconds` | From a frame's first instruction to its `sync`: how long its data took to arrive and be parsed (average per second) |
+| `molcajete_client_frame_present_seconds` | From applying a frame to having drawn the canvas with it: the wait for the next animation frame plus the composite (average per second; no sample for a second without a drawn frame). The browser shows the canvas at a later display refresh, which is not included |
 | `molcajete_client_image_decode_seconds` | Decoding one image (average per second) |
 | `molcajete_client_images_ops` | Images decoded per second |
 | `molcajete_client_rtt_seconds` | Tunnel ping round trip |
@@ -209,7 +210,7 @@ Main events of the JSON logs. In Loki, extract the fields with `| json`.
 | message | Source | Main fields |
 | --- | --- | --- |
 | `tunnel established` / `tunnel closed` | gateway | `tunnel_id`, `connection`, `session`, `peer`, `guacd_id`, `handshake_ms`, `duration_s`, `bytes_to_browser`, `status` |
-| `client report` | gateway | `session`, `fps_avg`, `fps_min`, `frame_lag_ms_avg/max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `display_width/height` |
+| `client report` | gateway | `session`, `fps_avg`, `fps_min`, `frame_lag_ms_avg/max`, `frame_present_ms_avg/max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `display_width/height` |
 | `connection established` / `connection closed` | molcajeted | `id`, `protocol`, `peer`, `width`, `height`, `image`, `video`, `duration_s` |
 | `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `video_*` |
 | `video mode started` | molcajeted | `codec`, area, `kbps` |
