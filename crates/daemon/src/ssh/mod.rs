@@ -27,7 +27,7 @@ mod terminal;
 
 use std::future::Future;
 
-use molcajete_protocol::{Instruction, Status};
+use molcajete_protocol::Status;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -35,7 +35,7 @@ use crate::display::{Display, ImageFormats};
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
 use crate::send_error;
-use crate::session::{self, ClientEvent, InputDecoder};
+use crate::session::{self, ClientEvent, Input, InputDecoder};
 
 use bridge::{Bridge, KEEPALIVE};
 use client::Credentials;
@@ -112,7 +112,7 @@ fn paint_background(display: &mut Display, writer: &mut GuacWriter, background: 
 async fn obtain_credentials(
     settings: &mut Settings,
     info: &ClientInfo,
-    inputs: &mut mpsc::Receiver<Instruction>,
+    inputs: &mut mpsc::Receiver<Input>,
     decoder: &mut InputDecoder,
     display: &mut Display,
     writer: &mut GuacWriter,
@@ -158,7 +158,9 @@ async fn obtain_credentials(
                         display.resize(width, height, writer.buffer());
                         paint_background(display, writer, background);
                     }
-                    Some(ClientEvent::Sync(timestamp)) => display.ack(timestamp),
+                    Some(ClientEvent::Sync { timestamp, received }) => {
+                        display.ack(timestamp, received)
+                    }
                     Some(ClientEvent::Disconnect) => return Ok(false),
                     _ => {}
                 }
@@ -175,7 +177,7 @@ async fn connect_and_run(
     renderer: Renderer,
     display: Display,
     mut writer: GuacWriter,
-    inputs: mpsc::Receiver<Instruction>,
+    inputs: mpsc::Receiver<Input>,
     decoder: InputDecoder,
 ) -> anyhow::Result<()> {
     let target = format!("{}:{}", settings.hostname, settings.port);

@@ -168,7 +168,8 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | `molcajeted_video_streams_total`, `molcajeted_video_failures_total` | counter | codec | Video mode starts and encoder failures |
 | `molcajeted_frames_total` | counter | protocol | Frames (`sync`) sent |
 | `molcajeted_frame_encoded_bytes` | histogram | protocol | Encoded image bytes per frame |
-| `molcajeted_client_ack_seconds` | histogram | protocol | From sending a frame to the client's ack: network round trip + browser processing |
+| `molcajeted_client_ack_seconds` | histogram | protocol | From sending a frame to the client's ack arriving: network round trip + browser processing |
+| `molcajeted_client_ack_wait_seconds` | histogram | protocol | How long an ack then waited for the session loop (busy building a frame or handling server data); not part of `client_ack` |
 | `molcajeted_unacked_frames` | histogram | protocol | Frames still unacknowledged when a frame is sent |
 | `molcajeted_socket_write_seconds` | histogram | protocol | Time blocked in `write_all`; grows when the gateway or browser cannot keep up (backpressure) |
 | `molcajeted_sent_bytes_total` | counter | protocol | Bytes sent to the gateway |
@@ -192,7 +193,10 @@ The page batches the client's once-per-second `stats` and posts them every 10 se
 
 | Metric | Meaning |
 | --- | --- |
-| `molcajete_client_frame_lag_seconds` | From receiving a frame to drawing it (decoding + GPU) |
+| `molcajete_client_frame_lag_seconds` | From receiving a frame's `sync` to applying it and acknowledging: waiting for its images to decode and for the frames before it (average per second) |
+| `molcajete_client_frame_receive_seconds` | From a frame's first instruction to its `sync`: how long its data took to arrive and be parsed (average per second) |
+| `molcajete_client_image_decode_seconds` | Decoding one image (average per second) |
+| `molcajete_client_images_ops` | Images decoded per second |
 | `molcajete_client_rtt_seconds` | Tunnel ping round trip |
 | `molcajete_client_frames_fps` | Frames applied per second |
 | `molcajete_client_queued_ops` | Operations waiting to be drawn |

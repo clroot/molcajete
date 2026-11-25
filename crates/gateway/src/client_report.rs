@@ -51,9 +51,26 @@ struct Sample {
     bytes_per_second: f64,
     #[serde(default)]
     queued_ops: f64,
-    /// Time from receiving a frame's `sync` to presenting it.
+    /// Time from receiving a frame's `sync` to applying it (last frame of
+    /// the second, then average and maximum over the second).
     #[serde(default)]
     frame_lag_ms: f64,
+    #[serde(default)]
+    frame_lag_ms_avg: Option<f64>,
+    #[serde(default)]
+    frame_lag_ms_max: f64,
+    /// Time from a frame's first instruction to its `sync`.
+    #[serde(default)]
+    frame_receive_ms_avg: Option<f64>,
+    #[serde(default)]
+    frame_receive_ms_max: f64,
+    #[serde(default)]
+    images_per_second: f64,
+    /// Time to decode one image.
+    #[serde(default)]
+    image_decode_ms_avg: Option<f64>,
+    #[serde(default)]
+    image_decode_ms_max: f64,
     #[serde(default)]
     rtt_ms: Option<f64>,
     #[serde(default)]
@@ -111,11 +128,23 @@ pub async fn receive(
     let fps = histogram!("molcajete_client_frames_fps", &labels);
     let queued = histogram!("molcajete_client_queued_ops", &labels);
     let received = histogram!("molcajete_client_receive_rate_bytes", &labels);
+    let frame_receive = histogram!("molcajete_client_frame_receive_seconds", &labels);
+    let decode = histogram!("molcajete_client_image_decode_seconds", &labels);
+    let images = histogram!("molcajete_client_images_ops", &labels);
 
     let n = report.samples.len() as f64;
     let mut sum = Summary::default();
     for s in &report.samples {
-        lag.record(ms(s.frame_lag_ms));
+        // Older clients only report the last frame of each second.
+        lag.record(ms(s.frame_lag_ms_avg.unwrap_or(s.frame_lag_ms)));
+        // Seconds without frames or images say nothing about their cost.
+        if let Some(v) = s.frame_receive_ms_avg.filter(|_| s.frames_per_second > 0.0) {
+            frame_receive.record(ms(v));
+        }
+        if let Some(v) = s.image_decode_ms_avg.filter(|_| s.images_per_second > 0.0) {
+            decode.record(ms(v));
+            images.record(clean(s.images_per_second));
+        }
         if let Some(r) = s.rtt_ms {
             rtt.record(ms(r));
         }
@@ -139,6 +168,9 @@ pub async fn receive(
         recv_bytes_per_s = sum.bytes / n,
         frame_lag_ms_avg = sum.lag / n,
         frame_lag_ms_max = sum.lag_max,
+        frame_receive_ms_max = sum.receive_max,
+        images_per_s = sum.images / n,
+        image_decode_ms_max = sum.decode_max,
         rtt_ms_avg = (sum.rtt_n > 0).then(|| sum.rtt / sum.rtt_n as f64),
         queued_ops_max = sum.queued_max,
         send_buffered_max = sum.buffered_max,
@@ -159,6 +191,9 @@ struct Summary {
     bytes: f64,
     lag: f64,
     lag_max: f64,
+    receive_max: f64,
+    images: f64,
+    decode_max: f64,
     rtt: f64,
     rtt_n: u32,
     queued_max: f64,
@@ -174,8 +209,14 @@ impl Summary {
         self.draws += clean(s.draw_calls_per_second);
         self.instructions += clean(s.instructions_per_second);
         self.bytes += clean(s.bytes_per_second);
-        self.lag += clean(s.frame_lag_ms);
-        self.lag_max = self.lag_max.max(clean(s.frame_lag_ms));
+        self.lag += clean(s.frame_lag_ms_avg.unwrap_or(s.frame_lag_ms));
+        self.lag_max = self
+            .lag_max
+            .max(clean(s.frame_lag_ms))
+            .max(clean(s.frame_lag_ms_max));
+        self.receive_max = self.receive_max.max(clean(s.frame_receive_ms_max));
+        self.images += clean(s.images_per_second);
+        self.decode_max = self.decode_max.max(clean(s.image_decode_ms_max));
         if let Some(r) = s.rtt_ms {
             self.rtt += clean(r);
             self.rtt_n += 1;

@@ -20,7 +20,7 @@ mod settings;
 mod slow_path;
 mod tls;
 
-use molcajete_protocol::{Instruction, Status};
+use molcajete_protocol::Status;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -30,7 +30,7 @@ use self::settings::Settings;
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
 use crate::send_error;
-use crate::session::{self, ClientEvent, InputDecoder};
+use crate::session::{self, ClientEvent, Input, InputDecoder};
 
 pub use self::settings::ARGS;
 
@@ -63,7 +63,7 @@ pub async fn run(
 
 /// The Guacamole side of the connection while the RDP side is set up.
 struct Client<'a> {
-    inputs: &'a mut mpsc::Receiver<Instruction>,
+    inputs: &'a mut mpsc::Receiver<Input>,
     decoder: InputDecoder,
     writer: &'a mut GuacWriter,
     early: EarlyInput,
@@ -72,7 +72,7 @@ struct Client<'a> {
 impl Client<'_> {
     /// Decodes one instruction. Clipboard and size changes are kept for when
     /// the session starts; other events are returned.
-    fn decode(&mut self, ins: &Instruction) -> Option<ClientEvent> {
+    fn decode(&mut self, ins: &Input) -> Option<ClientEvent> {
         match self.decoder.decode(ins, self.writer.buffer())? {
             ClientEvent::Clipboard(text) => {
                 self.early.clipboard = Some(text);

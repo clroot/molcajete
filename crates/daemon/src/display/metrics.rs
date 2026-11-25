@@ -86,6 +86,7 @@ struct Totals {
     frames: u64,
     frame_bytes: u64,
     ack: Timing,
+    ack_wait: Timing,
     png: Timing,
     png_bytes: u64,
     jpeg: Timing,
@@ -102,6 +103,7 @@ pub(super) struct DisplayMetrics {
     frames: Counter,
     frame_bytes: Histogram,
     client_ack: Histogram,
+    ack_wait: Histogram,
     unacked: Histogram,
     png: ImageMetrics,
     jpeg: ImageMetrics,
@@ -126,6 +128,7 @@ impl DisplayMetrics {
             frames: Counter::noop(),
             frame_bytes: Histogram::noop(),
             client_ack: Histogram::noop(),
+            ack_wait: Histogram::noop(),
             unacked: Histogram::noop(),
             png: image(),
             jpeg: image(),
@@ -156,6 +159,7 @@ impl DisplayMetrics {
             frames: counter!("molcajeted_frames_total", &labels),
             frame_bytes: histogram!("molcajeted_frame_encoded_bytes", &labels),
             client_ack: histogram!("molcajeted_client_ack_seconds", &labels),
+            ack_wait: histogram!("molcajeted_client_ack_wait_seconds", &labels),
             unacked: histogram!("molcajeted_unacked_frames", &labels),
             png: ImageMetrics::new(protocol, "png"),
             jpeg: ImageMetrics::new(protocol, "jpeg"),
@@ -194,11 +198,15 @@ impl DisplayMetrics {
         self.totals.frame_bytes += encoded_bytes as u64;
     }
 
-    /// Time from sending a frame to the client acknowledging it: network
-    /// both ways plus the client's decoding and drawing.
-    pub(super) fn acked(&mut self, elapsed: Duration) {
+    /// `elapsed`: from sending a frame to its acknowledgement arriving
+    /// (network both ways plus the client's decoding and drawing). `waited`:
+    /// how long the acknowledgement then sat unread, because the session
+    /// was busy.
+    pub(super) fn acked(&mut self, elapsed: Duration, waited: Duration) {
         self.client_ack.record(elapsed);
+        self.ack_wait.record(waited);
         self.totals.ack.add(elapsed);
+        self.totals.ack_wait.add(waited);
     }
 
     pub(super) fn image(&mut self, kind: ImageKind, elapsed: Duration, bytes: usize, pixels: u64) {
@@ -255,6 +263,8 @@ impl DisplayMetrics {
             pixels_ms_avg = t.phases[Phase::Pixels as usize].avg_ms(),
             client_ack_ms_avg = t.ack.avg_ms(),
             client_ack_ms_max = t.ack.max_ms(),
+            client_ack_wait_ms_avg = t.ack_wait.avg_ms(),
+            client_ack_wait_ms_max = t.ack_wait.max_ms(),
             png_images = t.png.count,
             png_bytes = t.png_bytes,
             png_ms_avg = t.png.avg_ms(),

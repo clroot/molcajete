@@ -10,7 +10,7 @@ use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb as VteRgb};
-use molcajete_protocol::{Instruction, Status};
+use molcajete_protocol::Status;
 use russh::{ChannelMsg, ChannelReadHalf};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -24,7 +24,7 @@ use super::terminal::{Size, Terminal};
 use crate::display::Display;
 use crate::io::GuacWriter;
 use crate::send_error;
-use crate::session::{self, ClientEvent, InputDecoder};
+use crate::session::{self, ClientEvent, Input, InputDecoder};
 
 /// Frames the client may have in flight (sent, not yet acknowledged);
 /// rendering pauses while this many are pending.
@@ -107,7 +107,7 @@ impl Bridge {
     pub async fn run(
         mut self,
         mut channel: ChannelReadHalf,
-        mut inputs: mpsc::Receiver<Instruction>,
+        mut inputs: mpsc::Receiver<Input>,
         mut decoder: InputDecoder,
     ) -> anyhow::Result<()> {
         let mut keepalive = tokio::time::interval(KEEPALIVE);
@@ -300,7 +300,10 @@ impl Bridge {
             ClientEvent::Mouse { x, y, mask } => self.pointer(x, y, mask),
             ClientEvent::Size { width, height } => self.resize(width, height),
             ClientEvent::Clipboard(text) if !self.settings.disable_paste => self.clipboard = text,
-            ClientEvent::Sync(timestamp) => self.display.ack(timestamp),
+            ClientEvent::Sync {
+                timestamp,
+                received,
+            } => self.display.ack(timestamp, received),
             ClientEvent::Disconnect => return false,
             _ => {}
         }

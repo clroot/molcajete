@@ -230,8 +230,8 @@ pub async fn run(
                     Some(ClientEvent::Ack { stream, status }) => {
                         display.stream_ack(stream, status, writer.buffer());
                     }
-                    Some(ClientEvent::Sync(ts)) => {
-                        display.ack(ts);
+                    Some(ClientEvent::Sync { timestamp, received }) => {
+                        display.ack(timestamp, received);
                         if want_update && display.unacked_frames() <= MAX_UNACKED_FRAMES {
                             want_update = false;
                             request_update(&mut rfb_writer, &display).await?;

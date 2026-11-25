@@ -876,7 +876,7 @@ impl Inner {
                 self.display.enqueue(Op::Sync {
                     timestamp,
                     frames,
-                    received_at: now(),
+                    received_at: scope::performance_now(),
                 });
             }
             S::Mouse { x, y } => self.display.show_software_cursor(x, y),
@@ -1038,6 +1038,7 @@ impl Inner {
     fn decode_image(&mut self, bytes: Vec<u8>, mimetype: &str, slot: ImageSlot) {
         let weak = self.self_ref.clone();
         let mimetype = mimetype.to_owned();
+        let started = scope::performance_now();
         wasm_bindgen_futures::spawn_local(async move {
             *slot.borrow_mut() = match crate::image::decode(bytes, mimetype).await {
                 Ok(image) => ImageState::Ready(image),
@@ -1046,7 +1047,11 @@ impl Inner {
                     ImageState::Failed
                 }
             };
-            with_inner(&weak, |inner| inner.display.process());
+            let elapsed = scope::performance_now() - started;
+            with_inner(&weak, |inner| {
+                inner.display.image_decoded(elapsed);
+                inner.display.process();
+            });
         });
     }
 
@@ -1569,6 +1574,22 @@ impl Inner {
                 ),
                 ("queuedOps", JsValue::from_f64(stats.queued_ops as f64)),
                 ("frameLagMs", JsValue::from_f64(self.last_lag_ms)),
+                ("frameLagMsAvg", JsValue::from_f64(stats.lag.average_ms())),
+                ("frameLagMsMax", JsValue::from_f64(stats.lag.max_ms)),
+                (
+                    "frameReceiveMsAvg",
+                    JsValue::from_f64(stats.receive.average_ms()),
+                ),
+                ("frameReceiveMsMax", JsValue::from_f64(stats.receive.max_ms)),
+                (
+                    "imagesPerSecond",
+                    JsValue::from_f64(stats.decode.count as f64 / elapsed),
+                ),
+                (
+                    "imageDecodeMsAvg",
+                    JsValue::from_f64(stats.decode.average_ms()),
+                ),
+                ("imageDecodeMsMax", JsValue::from_f64(stats.decode.max_ms)),
                 (
                     "rttMs",
                     self.rtt_ms.map_or(JsValue::NULL, JsValue::from_f64),
