@@ -129,8 +129,10 @@ async fn websocket_tunnel(
         proxy::resolve(&headers, Some(peer), &state.config.server.trusted_proxies).display;
     // A one-time session link stands in for the session cookie (and so
     // for the same-origin check that protects it).
-    let (user, connection) = if let Some(ticket) = tickets::from_query(query) {
-        match tickets::redeem(&state, &ticket, &address).await {
+    let ticketed = tickets::from_query(query);
+    let wants_join = request.join.is_some() || request.shadow.is_some();
+    let (user, connection) = if let Some(ticket) = ticketed.as_ref() {
+        match tickets::redeem(&state, ticket, &address).await {
             Ok(redeemed) => {
                 request.connection = Some(redeemed.connection.id.clone());
                 request.overrides.extend(redeemed.parameters);
@@ -147,7 +149,7 @@ async fn websocket_tunnel(
             Ok(user) => user,
             Err(err) => return err.into_response(),
         };
-        let connection = match request.connection.as_deref() {
+        let connection = match request.connection.as_deref().filter(|_| !wants_join) {
             Some(id) => match state.db.connection_for_user(id, &user).await {
                 Ok(c) => Some(c),
                 Err(DbError::NotFound) => None,
@@ -162,6 +164,16 @@ async fn websocket_tunnel(
         id: user.id.clone(),
         username: user.username.clone(),
     });
+    // Joining a live session (a share link, or an administrator watching);
+    // a one-time session link only opens its own connection.
+    let join = (wants_join && ticketed.is_none()).then(|| {
+        sessions::share::resolve(
+            &state,
+            &user,
+            request.join.as_deref(),
+            request.shadow.as_deref(),
+        )
+    });
     // Our own client offers the binary subprotocol next to `guacamole`;
     // the first one listed here that the client offered is selected.
     let protocols: &[&'static str] = if state.config.server.binary_tunnel {
@@ -173,8 +185,13 @@ async fn websocket_tunnel(
     request.binary = ws
         .selected_protocol()
         .is_some_and(|selected| selected.as_bytes() == tunnel::BINARY_SUBPROTOCOL.as_bytes());
-    ws.max_message_size(1 << 20)
-        .on_upgrade(move |socket| tunnel::serve(socket, state, request, connection))
+    let ws = ws.max_message_size(1 << 20);
+    match join {
+        Some(join) => {
+            ws.on_upgrade(move |socket| tunnel::serve_join(socket, state, request, user, join))
+        }
+        None => ws.on_upgrade(move |socket| tunnel::serve(socket, state, request, connection)),
+    }
 }
 
 /// Requests that change state must come from our own origin, unless an
@@ -270,6 +287,16 @@ fn router(state: Arc<AppState>) -> Router {
             get(sessions::api::list).delete(sessions::api::end_all),
         )
         .route("/sessions/{id}", delete(sessions::api::end))
+        .route("/my-sessions/{page}", get(sessions::share::get))
+        .route(
+            "/my-sessions/{page}/links",
+            post(sessions::share::create_link),
+        )
+        .route(
+            "/my-sessions/{page}/links/{id}",
+            delete(sessions::share::revoke_link),
+        )
+        .route("/join/{token}", get(sessions::share::describe_link))
         .route("/history", get(sessions::api::history))
         .route("/settings", get(client_settings))
         .route(
@@ -453,6 +480,8 @@ mod tests {
 
     /// Live sessions and the connection history (src/tests/live_sessions.rs).
     mod live_sessions;
+    /// Share links and administrators watching sessions (src/tests/sharing.rs).
+    mod sharing;
 
     struct TestApp {
         router: Router,

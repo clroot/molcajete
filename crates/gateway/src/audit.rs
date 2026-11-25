@@ -121,6 +121,18 @@ pub mod action {
     pub const TICKET_CREATE: &str = "ticket.create";
     /// A one-time session link opened its connection.
     pub const TICKET_USE: &str = "ticket.use";
+    /// A user created a share link of their live session (`linkId`,
+    /// `readOnly`, `expiresAt`).
+    pub const SESSION_SHARE: &str = "session.share";
+    /// A user revoked a share link of their session (`linkId`); whoever
+    /// joined through it was disconnected.
+    pub const SESSION_UNSHARE: &str = "session.unshare";
+    /// A user joined a live session through a share link (`linkId`,
+    /// `readOnly`, `owner`); the target is the session joined.
+    pub const SESSION_JOIN: &str = "session.join";
+    /// An administrator started watching a live session (`owner`); the
+    /// target is the session watched.
+    pub const SESSION_SHADOW: &str = "session.shadow";
 
     pub const ALL: &[&str] = &[
         LOGIN_SUCCESS,
@@ -161,6 +173,10 @@ pub mod action {
         TOKEN_USE,
         TICKET_CREATE,
         TICKET_USE,
+        SESSION_SHARE,
+        SESSION_UNSHARE,
+        SESSION_JOIN,
+        SESSION_SHADOW,
     ];
 }
 

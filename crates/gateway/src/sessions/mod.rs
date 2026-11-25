@@ -15,16 +15,26 @@
 //! [`LiveSession`] carries what joining needs: the guacd it runs on
 //! ([`LiveSession::guacd`]), guacd's connection id
 //! ([`LiveSession::guacd_id`], selected with `select,<id>` to join) and
-//! the owner ([`LiveSession::user_id`]). Ending a session
-//! ([`Registry::end`]) closes the owner's tunnel only.
+//! the owner ([`LiveSession::user_id`]).
+//!
+//! # Joined sessions
+//!
+//! Someone who opens a share link ([`share`]) or an administrator who
+//! watches a session joins the owner's guacd connection with a tunnel of
+//! their own, which registers too, with [`SessionStart::joined`] saying
+//! whose session it joined and how. Ending a session ([`Registry::end`])
+//! ends everyone who joined it; so does the owner's tunnel closing, and
+//! revoking a link ends those who joined through it.
 
 pub mod api;
 pub mod history;
 pub mod policy;
+pub mod share;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use metrics::counter;
 use molcajete_protocol::Status;
@@ -48,6 +58,10 @@ pub enum EndReason {
     /// membership, a role or a folder changed, or the connection was
     /// deleted).
     AccessRevoked,
+    /// The session this one joined has ended.
+    OwnerLeft,
+    /// The share link this session joined through was revoked.
+    LinkRevoked,
 }
 
 impl EndReason {
@@ -57,18 +71,22 @@ impl EndReason {
             Self::UserDisabled => "user_disabled",
             Self::UserDeleted => "user_deleted",
             Self::AccessRevoked => "access_revoked",
+            Self::OwnerLeft => "owner_left",
+            Self::LinkRevoked => "link_revoked",
         }
     }
 
     /// The Guacamole status the tunnel closes with, which the page turns
-    /// into its message: `SESSION_CLOSED` ("Ended by an administrator") or
-    /// `CLIENT_FORBIDDEN` (the user may no longer use the connection).
+    /// into its message: `SESSION_CLOSED` ("Ended by an administrator"),
+    /// `CLIENT_FORBIDDEN` (the user may no longer use the connection or
+    /// the link) or `SUCCESS` (the shared session ended normally).
     pub fn status(self) -> Status {
         match self {
             Self::Admin => Status::SESSION_CLOSED,
-            Self::UserDisabled | Self::UserDeleted | Self::AccessRevoked => {
+            Self::UserDisabled | Self::UserDeleted | Self::AccessRevoked | Self::LinkRevoked => {
                 Status::CLIENT_FORBIDDEN
             }
+            Self::OwnerLeft => Status::SUCCESS,
         }
     }
 }
@@ -96,6 +114,38 @@ pub struct SessionStart {
     /// guacd's id of the connection (`ready,<id>`).
     pub guacd_id: String,
     pub recording_id: Option<String>,
+    /// The id the page chose for its tunnel (`page=`), by which its user
+    /// manages sharing ([`Registry::by_page`]).
+    pub page_id: Option<String>,
+    /// Set for a session that joined another one.
+    pub joined: Option<Joined>,
+}
+
+/// How a session joined another (its owner's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Joined {
+    /// The tunnel id of the session joined.
+    pub owner: Uuid,
+    pub via: JoinVia,
+    /// The user only watches: guacd drops their mouse and keys.
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinVia {
+    /// A share link, by its id.
+    Link(Uuid),
+    /// An administrator watching (always read-only).
+    Shadow,
+}
+
+impl JoinVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Link(_) => "link",
+            Self::Shadow => "shadow",
+        }
+    }
 }
 
 /// A live session, as listed to administrators.
@@ -121,10 +171,29 @@ pub struct LiveSession {
     pub guacd_id: String,
     #[serde(skip)]
     pub guacd: (String, u16),
+    /// For a session that joined another: the tunnel id of that one.
+    #[serde(serialize_with = "as_optional_string")]
+    pub joined_to: Option<Uuid>,
+    /// `link` or `shadow` for a session that joined another.
+    pub join_kind: Option<&'static str>,
+    /// A joined session that only watches.
+    pub read_only: bool,
+    #[serde(skip)]
+    pub joined: Option<Joined>,
 }
 
 fn as_string<S: serde::Serializer>(id: &Uuid, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.collect_str(id)
+}
+
+fn as_optional_string<S: serde::Serializer>(
+    id: &Option<Uuid>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match id {
+        Some(id) => serializer.collect_str(id),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Bytes relayed by one tunnel so far.
@@ -163,18 +232,72 @@ impl Entry {
             recording_id: s.recording_id.clone(),
             guacd_id: s.guacd_id.clone(),
             guacd: s.guacd.clone(),
+            joined_to: s.joined.map(|j| j.owner),
+            join_kind: s.joined.map(|j| j.via.as_str()),
+            read_only: s.joined.is_some_and(|j| j.read_only),
+            joined: s.joined,
         }
+    }
+
+    /// Ends this session once; `false` when it is already ending.
+    fn end(&self, ending: Ending) -> bool {
+        let reason = ending.reason;
+        let first = self.end.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(ending);
+            true
+        });
+        if first {
+            counter!("molcajete_gateway_sessions_ended_total", "reason" => reason.as_str())
+                .increment(1);
+        }
+        first
     }
 }
 
-/// The sessions open right now. Empty on startup: tunnels do not outlive
-/// the gateway.
+/// A share link of a live session ([`share`]).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Link {
+    #[serde(serialize_with = "as_string")]
+    pub id: Uuid,
+    /// The tunnel id of the session shared.
+    #[serde(skip)]
+    pub session: Uuid,
+    /// SHA-256 of the token, hex; the token itself is only shown once.
+    #[serde(skip)]
+    token_hash: String,
+    /// Who opens it only watches.
+    pub read_only: bool,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+impl Link {
+    fn expired(&self, now: i64) -> bool {
+        now >= self.expires_at
+    }
+}
+
+/// The sessions open right now and their share links. Empty on startup:
+/// tunnels do not outlive the gateway, and links do not outlive their
+/// session.
 #[derive(Default)]
-pub struct Registry(Mutex<HashMap<Uuid, Arc<Entry>>>);
+pub struct Registry {
+    sessions: Mutex<HashMap<Uuid, Arc<Entry>>>,
+    links: Mutex<HashMap<Uuid, Link>>,
+}
 
 impl Registry {
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Arc<Entry>>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn links(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Link>> {
+        self.links.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Registers tunnel `id` until the returned registration is dropped.
@@ -187,7 +310,18 @@ impl Registry {
             rtt_ms: AtomicU64::new(NO_RTT),
             end,
         });
+        let owner = entry.start.joined.map(|j| j.owner);
         self.map().insert(id, entry.clone());
+        // The session joined may have closed meanwhile, in which case
+        // nothing else would end this one.
+        if let Some(owner) = owner
+            && self.get(owner).is_none()
+        {
+            entry.end(Ending {
+                reason: EndReason::OwnerLeft,
+                by: None,
+            });
+        }
         Registration {
             registry: self.clone(),
             id,
@@ -211,34 +345,126 @@ impl Registry {
         self.map().get(&id).map(|entry| entry.snapshot(id))
     }
 
-    /// The session whose guacd connection is `guacd_id`.
+    /// The session whose guacd connection is `guacd_id` (its owner's,
+    /// not one that joined it).
     pub fn by_guacd_id(&self, guacd_id: &str) -> Option<LiveSession> {
         self.map()
             .iter()
-            .find(|(_, entry)| entry.start.guacd_id == guacd_id)
+            .find(|(_, entry)| entry.start.guacd_id == guacd_id && entry.start.joined.is_none())
             .map(|(id, entry)| entry.snapshot(*id))
     }
 
-    /// Asks session `id` to end; its tunnel closes with
-    /// [`EndReason::status`] right away. `false` when there is no such
-    /// session or it is already ending.
+    /// The session `user_id` opened from the page that called its tunnel
+    /// `page_id` (not one they joined).
+    pub fn by_page(&self, user_id: &str, page_id: &str) -> Option<LiveSession> {
+        self.map()
+            .iter()
+            .find(|(_, entry)| {
+                let s = &entry.start;
+                s.user_id == user_id && s.page_id.as_deref() == Some(page_id) && s.joined.is_none()
+            })
+            .map(|(id, entry)| entry.snapshot(*id))
+    }
+
+    /// The sessions that joined session `owner`, oldest first.
+    pub fn joined_to(&self, owner: Uuid) -> Vec<LiveSession> {
+        let mut joined: Vec<LiveSession> = self
+            .map()
+            .iter()
+            .filter(|(_, entry)| entry.start.joined.is_some_and(|j| j.owner == owner))
+            .map(|(id, entry)| entry.snapshot(*id))
+            .collect();
+        joined.sort_by_key(|s| (s.started_at, s.id));
+        joined
+    }
+
+    /// Asks session `id` to end, and every session that joined it; their
+    /// tunnels close with [`EndReason::status`] right away (those that
+    /// joined with [`EndReason::OwnerLeft`]'s). `false` when there is no
+    /// such session or it is already ending.
     pub fn end(&self, id: Uuid, ending: Ending) -> bool {
         let Some(entry) = self.map().get(&id).cloned() else {
             return false;
         };
-        let reason = ending.reason;
-        let first = entry.end.send_if_modified(|current| {
-            if current.is_some() {
-                return false;
-            }
-            *current = Some(ending);
-            true
-        });
+        let first = entry.end(ending);
         if first {
-            counter!("molcajete_gateway_sessions_ended_total", "reason" => reason.as_str())
-                .increment(1);
+            self.end_joined(|joined| joined.owner == id, EndReason::OwnerLeft);
         }
         first
+    }
+
+    /// Ends the sessions that joined another one as `which` selects.
+    fn end_joined(&self, which: impl Fn(&Joined) -> bool, reason: EndReason) {
+        let joined: Vec<Arc<Entry>> = self
+            .map()
+            .values()
+            .filter(|entry| entry.start.joined.as_ref().is_some_and(&which))
+            .cloned()
+            .collect();
+        for entry in joined {
+            entry.end(Ending { reason, by: None });
+        }
+    }
+
+    /// Creates a share link of live session `session` that lasts `valid`;
+    /// returns it with its token, which is not kept.
+    pub fn create_link(&self, session: Uuid, read_only: bool, valid: Duration) -> (Link, String) {
+        let token = crate::auth::new_token();
+        let now = now_millis();
+        let link = Link {
+            id: Uuid::new_v4(),
+            session,
+            token_hash: crate::auth::token_hash(&token),
+            read_only,
+            created_at: now,
+            expires_at: now.saturating_add(valid.as_millis().min(i64::MAX as u128) as i64),
+        };
+        self.links().insert(link.id, link.clone());
+        (link, token)
+    }
+
+    /// The link `token` opens and its session, while both are live and the
+    /// link has not expired.
+    pub fn link_by_token(&self, token: &str) -> Option<(Link, LiveSession)> {
+        let hash = crate::auth::token_hash(token);
+        let now = now_millis();
+        let link = {
+            let mut links = self.links();
+            links.retain(|_, link| !link.expired(now));
+            links.values().find(|link| link.token_hash == hash)?.clone()
+        };
+        let session = self.get(link.session)?;
+        Some((link, session))
+    }
+
+    /// The links of session `session` that have not expired, oldest first.
+    pub fn links_of(&self, session: Uuid) -> Vec<Link> {
+        let now = now_millis();
+        let mut links: Vec<Link> = self
+            .links()
+            .values()
+            .filter(|link| link.session == session && !link.expired(now))
+            .cloned()
+            .collect();
+        links.sort_by_key(|link| (link.created_at, link.id));
+        links
+    }
+
+    /// Revokes link `id` of session `session` and ends the sessions that
+    /// joined through it. `false` when there is no such link.
+    pub fn revoke_link(&self, session: Uuid, id: Uuid) -> bool {
+        {
+            let mut links = self.links();
+            if links.get(&id).is_none_or(|link| link.session != session) {
+                return false;
+            }
+            links.remove(&id);
+        }
+        self.end_joined(
+            |joined| joined.via == JoinVia::Link(id),
+            EndReason::LinkRevoked,
+        );
+        true
     }
 
     /// Records the round trip the page of tunnel `id` measured.
@@ -299,6 +525,14 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         self.registry.map().remove(&self.id);
+        if self.entry.start.joined.is_none() {
+            // Whoever joined leaves with the owner (stock guacd would keep
+            // them), and nobody can join any more.
+            let id = self.id;
+            self.registry
+                .end_joined(|joined| joined.owner == id, EndReason::OwnerLeft);
+            self.registry.links().retain(|_, link| link.session != id);
+        }
     }
 }
 
@@ -317,6 +551,8 @@ mod tests {
             guacd: ("127.0.0.1".into(), 4822),
             guacd_id: guacd_id.into(),
             recording_id: None,
+            page_id: None,
+            joined: None,
         }
     }
 
@@ -357,5 +593,71 @@ mod tests {
         ));
         drop(second);
         assert!(registry.list().is_empty());
+    }
+
+    fn joined(owner: Uuid, via: JoinVia) -> SessionStart {
+        SessionStart {
+            joined: Some(Joined {
+                owner,
+                via,
+                read_only: true,
+            }),
+            ..start("carol", "$a")
+        }
+    }
+
+    #[tokio::test]
+    async fn joined_sessions_end_with_their_owner_or_link() {
+        let registry = Arc::new(Registry::default());
+        let owner = Uuid::new_v4();
+        let owners = registry.register(
+            owner,
+            SessionStart {
+                page_id: Some("tab".into()),
+                ..start("bob", "$a")
+            },
+        );
+        let (link, token) = registry.create_link(owner, true, Duration::from_secs(60));
+        let (found, session) = registry.link_by_token(&token).unwrap();
+        assert_eq!((found.id, session.id), (link.id, owner));
+        assert!(registry.link_by_token("other").is_none());
+
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let through_link = registry.register(a, joined(owner, JoinVia::Link(link.id)));
+        let watching = registry.register(b, joined(owner, JoinVia::Shadow));
+        // The owner's, not those that joined the same guacd connection.
+        assert_eq!(registry.by_guacd_id("$a").unwrap().id, owner);
+        assert_eq!(registry.by_page("id-bob", "tab").unwrap().id, owner);
+        assert!(registry.by_page("id-carol", "tab").is_none());
+        let joined_now: Vec<Uuid> = registry.joined_to(owner).iter().map(|s| s.id).collect();
+        assert_eq!(joined_now.len(), 2);
+        assert!(joined_now.contains(&a) && joined_now.contains(&b));
+        assert_eq!(registry.get(b).unwrap().join_kind, Some("shadow"));
+
+        // Revoking the link ends those who came through it.
+        assert!(!registry.revoke_link(Uuid::new_v4(), link.id));
+        assert!(registry.revoke_link(owner, link.id));
+        assert_eq!(
+            through_link.ending().unwrap().reason,
+            EndReason::LinkRevoked
+        );
+        assert_eq!(watching.ending(), None);
+        assert!(registry.link_by_token(&token).is_none());
+
+        // The owner leaving ends the rest, and its links.
+        let (_, token) = registry.create_link(owner, false, Duration::from_secs(60));
+        drop(owners);
+        assert_eq!(watching.ending().unwrap().reason, EndReason::OwnerLeft);
+        assert!(registry.link_by_token(&token).is_none());
+        // Joining a session that has just closed ends at once.
+        let late = registry.register(Uuid::new_v4(), joined(owner, JoinVia::Shadow));
+        assert_eq!(late.ending().unwrap().reason, EndReason::OwnerLeft);
+
+        // Expired links are not found.
+        let owner = Uuid::new_v4();
+        let _owners = registry.register(owner, start("bob", "$b"));
+        let (_, token) = registry.create_link(owner, true, Duration::ZERO);
+        assert!(registry.link_by_token(&token).is_none());
+        assert!(registry.links_of(owner).is_empty());
     }
 }

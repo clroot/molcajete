@@ -62,6 +62,14 @@ pub struct TunnelRequest {
     /// Opaque id chosen by the browser page (`session=`), used to correlate
     /// the tunnel with the client's performance reports.
     pub session: Option<String>,
+    /// Opaque id the page gives its tunnel (`page=`), by which its user
+    /// shares the session (`sessions::share`).
+    pub page: Option<String>,
+    /// A share link's token (`join=`): the tunnel joins that link's
+    /// session instead of opening a connection.
+    pub join: Option<String>,
+    /// A live session's tunnel id (`shadow=`): an administrator watches it.
+    pub shadow: Option<String>,
     /// Address of the browser, as seen by the gateway or reported by a
     /// trusted reverse proxy (`X-Forwarded-For`).
     pub peer: Option<String>,
@@ -98,6 +106,9 @@ impl TunnelRequest {
             match key.as_ref() {
                 "connection" | "id" | "GUAC_ID" => req.connection = Some(value),
                 "session" => req.session = Some(value.chars().take(64).collect()),
+                "page" => req.page = Some(value.chars().take(64).collect()),
+                "join" => req.join = Some(value.chars().take(128).collect()),
+                "shadow" => req.shadow = Some(value.chars().take(64).collect()),
                 "width" | "GUAC_WIDTH" => {
                     if let Ok(v) = value.parse() {
                         req.info.width = clamp_dimension(v);
@@ -293,6 +304,8 @@ async fn serve_tunnel(
             guacd: (guacd_host.to_owned(), guacd_port),
             guacd_id: session.id.clone(),
             recording_id: recorder.as_ref().map(|r| r.id().to_owned()),
+            page_id: request.page.clone(),
+            joined: None,
         },
     );
     let session_id = request.session.as_deref().filter(|_| state.client_reports);
@@ -350,6 +363,143 @@ async fn serve_tunnel(
         ended_for = ending.as_ref().map(|e| e.reason.as_str()),
         ended_by = ending.as_ref().and_then(|e| e.by.as_deref()),
         "tunnel closed"
+    );
+}
+
+/// Entry point after the WebSocket upgrade for a tunnel that joins a live
+/// session (`sessions::share`): `join` is what [`sessions::share::resolve`]
+/// found, or the status to close with.
+pub async fn serve_join(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    request: TunnelRequest,
+    user: crate::db::User,
+    join: Result<sessions::share::Join, Status>,
+) {
+    let tunnel_id = Uuid::new_v4();
+    let span = info_span!(
+        "tunnel",
+        %tunnel_id,
+        joins = join.as_ref().map_or(String::new(), |j| j.session.id.to_string()),
+        peer = request.peer.as_deref().unwrap_or(""),
+        user = %user.username,
+    );
+    serve_joined(socket, state, request, user, join, tunnel_id)
+        .instrument(span)
+        .await;
+}
+
+async fn serve_joined(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    request: TunnelRequest,
+    user: crate::db::User,
+    join: Result<sessions::share::Join, Status>,
+    tunnel_id: Uuid,
+) {
+    let join = match join {
+        Ok(join) => join,
+        Err(status) => {
+            warn!(%status, "refused to join a session");
+            counter!("molcajete_gateway_tunnels_rejected_total", "reason" => "join").increment(1);
+            let _ = socket.send(close_message(status)).await;
+            return;
+        }
+    };
+    let session = &join.session;
+    let labels = [
+        ("connection", session.connection_id.clone()),
+        ("protocol", session.protocol.clone()),
+    ];
+    // Only `read-only` is the joining user's to set; guacd takes everything
+    // else from the session joined.
+    let parameters = BTreeMap::from([(
+        "read-only".to_owned(),
+        if join.joined.read_only { "true" } else { "" }.to_owned(),
+    )]);
+    let (host, port) = (session.guacd.0.as_str(), session.guacd.1);
+    let handshake_started = Instant::now();
+    let guacd = match guacd::connect(
+        (host, port),
+        &session.guacd_id,
+        &parameters,
+        &request.info,
+        request.binary,
+        Duration::from_secs(state.config.guacd.handshake_timeout),
+    )
+    .await
+    {
+        Ok(guacd) => guacd,
+        Err(err) => {
+            warn!(error = %err, "joining at guacd failed");
+            counter!("molcajete_gateway_handshake_failures_total", &labels).increment(1);
+            let _ = socket.send(close_message(err.status())).await;
+            return;
+        }
+    };
+    let handshake = handshake_started.elapsed();
+    histogram!("molcajete_gateway_handshake_seconds", &labels).record(handshake);
+    info!(
+        guacd_id = %guacd.id,
+        owner = %session.username,
+        via = join.joined.via.as_str(),
+        read_only = join.joined.read_only,
+        framing = Framing::of(request.binary, &guacd).as_str(),
+        handshake_ms = handshake.as_millis() as u64,
+        "joined a session"
+    );
+    let registration = state.sessions.register(
+        tunnel_id,
+        SessionStart {
+            user_id: user.id.clone(),
+            username: user.username.clone(),
+            connection_id: session.connection_id.clone(),
+            connection_name: session.connection_name.clone(),
+            protocol: session.protocol.clone(),
+            peer: request.peer.clone(),
+            guacd: session.guacd.clone(),
+            guacd_id: guacd.id.clone(),
+            recording_id: None,
+            page_id: None,
+            joined: Some(join.joined),
+        },
+    );
+    let address = crate::auth::ClientAddress(request.peer.clone().unwrap_or_default());
+    sessions::share::record_join(&state, &user, &address, &join).await;
+    let active = gauge!("molcajete_gateway_tunnels_active", &labels);
+    active.increment(1.0);
+    let started = Instant::now();
+    let counters = RelayCounters {
+        to_browser: counter!(
+            "molcajete_gateway_relayed_bytes_total",
+            &with(&labels, "direction", "to_browser")
+        ),
+        to_guacd: counter!(
+            "molcajete_gateway_relayed_bytes_total",
+            &with(&labels, "direction", "to_guacd")
+        ),
+    };
+    let stats = relay(
+        socket,
+        guacd,
+        tunnel_id,
+        request.binary,
+        &counters,
+        registration.traffic(),
+        None,
+        async { registration.ended().await.reason.status() },
+    )
+    .await;
+    let ending = registration.ending();
+    drop(registration);
+    active.decrement(1.0);
+    info!(
+        status = %stats.status,
+        duration_s = started.elapsed().as_secs_f64(),
+        bytes_to_browser = stats.to_browser,
+        bytes_to_guacd = stats.to_guacd,
+        ended_for = ending.as_ref().map(|e| e.reason.as_str()),
+        "left the session"
     );
 }
 
