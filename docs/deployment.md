@@ -168,7 +168,7 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | `molcajeted_video_streams_total`, `molcajeted_video_failures_total` | counter | codec | Video mode starts and encoder failures |
 | `molcajeted_frames_total` | counter | protocol | Frames (`sync`) sent |
 | `molcajeted_frame_encoded_bytes` | histogram | protocol | Encoded image bytes per frame |
-| `molcajeted_client_ack_seconds` | histogram | protocol | From sending a frame to the client's ack arriving: network round trip + browser processing |
+| `molcajeted_client_ack_seconds` | histogram | protocol | From sending a frame to the client's ack arriving: network round trip + the time the frame's data takes to arrive (`molcajete_client_frame_receive_seconds`) + browser processing |
 | `molcajeted_client_ack_wait_seconds` | histogram | protocol | How long an ack then waited for the session loop (busy building a frame or handling server data); not part of `client_ack` |
 | `molcajeted_unacked_frames` | histogram | protocol | Frames still unacknowledged when a frame is sent |
 | `molcajeted_socket_write_seconds` | histogram | protocol | Time blocked in `write_all`; grows when the gateway or browser cannot keep up (backpressure) |
@@ -237,8 +237,11 @@ sum by (phase) (rate(molcajeted_flush_phase_seconds_sum[5m]))
 sum by (format) (rate(molcajeted_image_pixels_total[5m])) / 1e6
 sum by (format) (rate(molcajeted_image_bytes_total[5m])) / sum by (format) (rate(molcajeted_image_pixels_total[5m]))
 
-# p95 from send to ack vs the browser's own processing: the gap is roughly the network
+# p95 from send to ack against its parts: tunnel round trip, the frame's
+# data arriving (a large frame takes longer than the ping), browser processing
 histogram_quantile(0.95, sum by (le) (rate(molcajeted_client_ack_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le) (rate(molcajete_client_rtt_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_receive_seconds_bucket[5m])))
 histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_lag_seconds_bucket[5m])))
 
 # socket write waits (backpressure)

@@ -967,8 +967,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Server ack vs browser processing vs RTT (p95)",
-      "description": "ack = network round trip + browser processing. The gap between ack and browser frame lag is roughly network and queueing",
+      "title": "Server ack vs RTT, frame arrival and browser lag (p95)",
+      "description": "ack is roughly tunnel RTT + frame arrival + browser frame lag. The tunnel ping is one small message, so it does not show how long a large frame takes to cross the link: that is frame arrival (first instruction to sync, measured in the browser)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1016,6 +1016,18 @@
           "range": true,
           "instant": false,
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_receive_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "frame arrival (first instruction to sync)",
+          "range": true,
+          "instant": false,
+          "refId": "D"
         }
       ],
       "fieldConfig": {
@@ -1650,5 +1662,5 @@
   "timezone": "browser",
   "title": "Molcajete Performance",
   "uid": "molcajete-performance",
-  "version": 1
+  "version": 2
 }
