@@ -1,11 +1,22 @@
 //! Frame pacing: when the next frame may be sent.
 //!
 //! Every frame ends with a `sync` that the client answers once it has
-//! applied the frame. The time until that answer (network both ways plus
-//! the client's decoding and drawing) is smoothed into the *lag*, and the
-//! next frame waits at least that long, so the frame rate follows what the
-//! link and the client can take. On top of that, a [`Pacing`] profile says
-//! how fast frames may go at best and what happens after a heavy frame:
+//! applied the frame, and the next frame waits as long as the client needs
+//! for one:
+//!
+//! - A molcajete client says how long it took to apply the frame in its
+//!   reply (`molcajete_protocol::apply_time`). The interval is the median
+//!   of the last few of those times, so one slow frame does not hold back
+//!   the frames after it, and times older than a second are forgotten, so a
+//!   pause lets the interval start afresh. The round trip is left to the
+//!   window of unacknowledged frames that the sessions keep
+//!   (`MAX_UNACKED_FRAMES`).
+//! - A stock client reports nothing. Its frames wait for the *lag*: the
+//!   smoothed time until the reply (network both ways plus the client's
+//!   decoding and drawing).
+//!
+//! On top of that, a [`Pacing`] profile says how fast frames may go at best
+//! and what happens after a heavy frame:
 //!
 //! - [`Pacing::DESKTOP`] (RDP, VNC): up to ~60 fps. A heavy frame holds the
 //!   next one back only until the client has acknowledged it, so a link with
@@ -29,6 +40,29 @@ const MAX_LAG_COMPENSATION: Duration = Duration::from_millis(500);
 /// How much of the byte budget may be sent at once, as time at the budget's
 /// rate: a short burst (a window opening, a page appearing) is not held back.
 const BUDGET_BURST: Duration = Duration::from_millis(250);
+/// How many of the client's reported apply times the interval is taken
+/// from (their median).
+const APPLY_SAMPLES: usize = 8;
+/// How long a reported apply time counts. After a pause this long the
+/// interval starts afresh, however slow the frames before it were.
+const APPLY_MEMORY: Duration = Duration::from_secs(1);
+
+/// A client's `sync` reply as it reached us.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncReply {
+    /// When it arrived, which can be well before the session gets to it.
+    pub at: Instant,
+    /// How long the client took to apply the frame, if it said so
+    /// (`molcajete_protocol::apply_time`).
+    pub apply: Option<Duration>,
+}
+
+impl From<Instant> for SyncReply {
+    /// A reply that says nothing more than that the frame was applied.
+    fn from(at: Instant) -> Self {
+        Self { at, apply: None }
+    }
+}
 
 /// How fast frames may follow each other at best.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +104,11 @@ pub(super) struct FrameClock {
     pending: VecDeque<(i64, Instant)>,
     /// Smoothed time the client needs to acknowledge a frame.
     lag: Duration,
+    /// The last apply times the client reported, with when each arrived
+    /// (newest last).
+    applies: VecDeque<(Instant, Duration)>,
+    /// The client reports apply times: they set the interval, not the lag.
+    reports: bool,
     /// When the last frame was sent, and its encoded size.
     last_frame: Option<(Instant, usize)>,
     /// Bytes sent that the budget has not covered yet, as of the last frame.
@@ -83,6 +122,8 @@ impl FrameClock {
             pacing,
             pending: VecDeque::new(),
             lag: Duration::ZERO,
+            applies: VecDeque::with_capacity(APPLY_SAMPLES),
+            reports: false,
             last_frame: None,
             backlog: 0,
         }
@@ -110,10 +151,16 @@ impl FrameClock {
         self.last_frame = Some((now, bytes));
     }
 
-    /// The client's reply to `sync(timestamp)` arrived at `received`.
+    /// The client's reply to `sync(timestamp)` arrived.
     /// Returns the time that frame took to be acknowledged, if it was still
     /// pending. Frames before it count as acknowledged too.
-    pub(super) fn acked(&mut self, timestamp: i64, received: Instant) -> Option<Duration> {
+    pub(super) fn acked(
+        &mut self,
+        timestamp: i64,
+        reply: impl Into<SyncReply>,
+    ) -> Option<Duration> {
+        let reply = reply.into();
+        let received = reply.at;
         let mut acked = None;
         while let Some(&(ts, sent_at)) = self.pending.front() {
             if ts > timestamp {
@@ -124,6 +171,13 @@ impl FrameClock {
                 let elapsed = received.saturating_duration_since(sent_at);
                 self.lag = (self.lag * 3 + elapsed.min(MAX_LAG_COMPENSATION)) / 4;
                 acked = Some(elapsed);
+                if let Some(apply) = reply.apply {
+                    if self.applies.len() == APPLY_SAMPLES {
+                        self.applies.pop_front();
+                    }
+                    self.applies.push_back((received, apply));
+                    self.reports = true;
+                }
             }
         }
         acked
@@ -137,6 +191,27 @@ impl FrameClock {
         self.lag
     }
 
+    /// How long the client needs per frame, as of `at`: the median of the
+    /// apply times it reported within [`APPLY_MEMORY`] before `at` (the
+    /// lower one of an even count), nothing once they are all older, and the
+    /// lag for a client that does not report them.
+    fn client_interval(&self, at: Instant) -> Duration {
+        if !self.reports {
+            return self.lag;
+        }
+        let mut recent: Vec<Duration> = self
+            .applies
+            .iter()
+            .filter(|&&(received, _)| at.saturating_duration_since(received) < APPLY_MEMORY)
+            .map(|&(_, apply)| apply)
+            .collect();
+        if recent.is_empty() {
+            return Duration::ZERO;
+        }
+        recent.sort_unstable();
+        recent[(recent.len() - 1) / 2]
+    }
+
     /// When the next frame may be sent; `None` before the first frame.
     ///
     /// This moves earlier when an acknowledgement arrives (a heavy frame was
@@ -147,7 +222,7 @@ impl FrameClock {
     pub(super) fn next_frame_at(&self, at_least: Duration) -> Option<Instant> {
         let (last, bytes) = self.last_frame?;
         let mut interval = self
-            .lag
+            .client_interval(last)
             .clamp(self.pacing.min_interval.max(at_least), MAX_LAG_COMPENSATION);
         let delivered = self.pacing.heavy_until_acked && self.pending.is_empty();
         if bytes > LARGE_FRAME_BYTES && !delivered {
@@ -183,6 +258,8 @@ mod tests {
         /// Send time of every frame, from the start of the run.
         frames: Vec<Duration>,
         frame_bytes: usize,
+        /// Most frames unacknowledged at once.
+        most_unacked: usize,
     }
 
     impl Run {
@@ -206,9 +283,38 @@ mod tests {
         }
     }
 
+    /// A simulated client. A frame reaches it after half the round trip, it
+    /// applies the frames one after the other, and its reply takes the other
+    /// half of the round trip back.
+    #[derive(Clone, Copy)]
+    struct Client {
+        rtt: Duration,
+        /// Time to apply the n-th frame (counting from 0).
+        apply: fn(usize) -> Duration,
+        /// Whether its replies say how long applying took (molcajete
+        /// client) or not (stock client).
+        reports: bool,
+    }
+
+    impl Client {
+        /// A stock client whose reply arrives `ack_after` each frame.
+        fn acking_after(ack_after: Duration) -> Self {
+            Self {
+                rtt: ack_after,
+                apply: |_| Duration::ZERO,
+                reports: false,
+            }
+        }
+
+        fn reporting(self, reports: bool) -> Self {
+            Self { reports, ..self }
+        }
+    }
+
     /// Sends a frame of `frame_bytes` whenever pacing and the frame window
     /// (`window` unacknowledged frames, as the sessions enforce it) allow,
-    /// for `seconds`, to a client whose reply arrives `ack_after` each frame.
+    /// for `seconds`, to a stock client whose reply arrives `ack_after` each
+    /// frame.
     fn run(
         pacing: Pacing,
         frame_bytes: usize,
@@ -216,15 +322,35 @@ mod tests {
         window: usize,
         seconds: u32,
     ) -> Run {
+        run_client(
+            pacing,
+            frame_bytes,
+            Client::acking_after(ack_after),
+            window,
+            seconds,
+        )
+    }
+
+    /// Like [`run`], for any client.
+    fn run_client(
+        pacing: Pacing,
+        frame_bytes: usize,
+        client: Client,
+        window: usize,
+        seconds: u32,
+    ) -> Run {
         let start = Instant::now();
         let mut clock = FrameClock::new(pacing);
-        let mut acks: VecDeque<(Instant, i64)> = VecDeque::new();
+        let mut acks: VecDeque<(Instant, i64, SyncReply)> = VecDeque::new();
         let mut frames = Vec::new();
+        let mut most_unacked = 0;
+        // When the client is done with the frames it has.
+        let mut client_free = start;
         for tick in 0..seconds * 1000 {
             let now = start + MS * tick;
-            while acks.front().is_some_and(|&(at, _)| at <= now) {
-                let (at, ts) = acks.pop_front().unwrap();
-                clock.acked(ts, at);
+            while acks.front().is_some_and(|&(at, _, _)| at <= now) {
+                let (_, ts, reply) = acks.pop_front().unwrap();
+                clock.acked(ts, reply);
             }
             let due = clock
                 .next_frame_at(Duration::ZERO)
@@ -232,13 +358,20 @@ mod tests {
             if due && clock.unacked() < window {
                 let ts = i64::from(tick);
                 clock.frame_sent(ts, now, frame_bytes);
-                acks.push_back((now + ack_after, ts));
+                most_unacked = most_unacked.max(clock.unacked());
+                let arrived = now + client.rtt / 2;
+                let started = arrived.max(client_free);
+                client_free = started + (client.apply)(frames.len());
+                let at = client_free + (client.rtt - client.rtt / 2);
+                let apply = client.reports.then(|| client_free - started);
+                acks.push_back((at, ts, SyncReply { at, apply }));
                 frames.push(now - start);
             }
         }
         Run {
             frames,
             frame_bytes,
+            most_unacked,
         }
     }
 
@@ -277,6 +410,43 @@ mod tests {
         assert!(due <= sent + 16 * MS);
         let (due, sent) = heavy_frame(Pacing::TERMINAL);
         assert!(due >= sent + 60 * MS);
+    }
+
+    /// The display asks for apply times and paces by the ones it gets.
+    #[test]
+    fn a_display_asks_for_apply_times() {
+        use super::super::{Display, ImageFormats};
+        use crate::io::Output;
+        use molcajete_protocol::{apply_time, parse_all};
+
+        let mut d = Display::new(
+            ImageFormats {
+                jpeg: false,
+                zstd: false,
+            },
+            true,
+        )
+        .with_pacing(Pacing::DESKTOP);
+        let mut out = Output::text();
+        d.sync(&mut out);
+        let sync = &parse_all(&out.to_string()).unwrap()[0];
+        assert_eq!(sync.opcode, "sync");
+        assert!(apply_time::is_request(sync.arg(2)), "{sync}");
+        let sent = Instant::now();
+        d.ack(
+            d.last_sync.unwrap(),
+            SyncReply {
+                at: sent + 300 * MS,
+                apply: Some(40 * MS),
+            },
+        );
+        // Not the 300 ms of the reply (75 ms smoothed): the 40 ms.
+        let due = d.next_frame_at();
+        assert!(
+            due <= sent + 40 * MS && due >= sent + 30 * MS,
+            "{:?}",
+            due - sent
+        );
     }
 
     #[test]
@@ -462,5 +632,224 @@ mod tests {
         assert_eq!(clock.acked(6, t0 + 40 * MS), Some(40 * MS));
         assert_eq!(clock.unacked(), 0);
         assert_eq!(clock.lag(), 10 * MS);
+    }
+
+    /// Needs 16 ms per frame and 496 ms for every 25th, over a round trip
+    /// of 4 ms: its replies take 20 ms, now and then 500 ms.
+    fn stalls_now_and_then(n: usize) -> Duration {
+        if n % 25 == 24 { 496 * MS } else { 16 * MS }
+    }
+
+    /// The clients the pacing is compared on (`table` prints the numbers).
+    /// Each runs once as a stock client (the lag sets the interval, as
+    /// before apply times were reported) and once reporting apply times.
+    const SCENARIOS: [(&str, Pacing, usize, Client, usize); 6] = [
+        (
+            "desktop, fast client (3 ms replies)",
+            Pacing::DESKTOP,
+            20_000,
+            Client {
+                rtt: Duration::from_millis(2),
+                apply: |_| MS,
+                reports: false,
+            },
+            3,
+        ),
+        (
+            "desktop, slow client (20 ms replies, 500 ms every 25th)",
+            Pacing::DESKTOP,
+            5_000,
+            Client {
+                rtt: Duration::from_millis(4),
+                apply: stalls_now_and_then,
+                reports: false,
+            },
+            3,
+        ),
+        (
+            "desktop, long round trip (100 ms + 5 ms to apply)",
+            Pacing::DESKTOP,
+            5_000,
+            Client {
+                rtt: Duration::from_millis(100),
+                apply: |_| 5 * MS,
+                reports: false,
+            },
+            3,
+        ),
+        (
+            "SSH flood, 50 kB frames, 1 ms replies",
+            Pacing::TERMINAL,
+            50_000,
+            Client {
+                rtt: Duration::ZERO,
+                apply: |_| MS,
+                reports: false,
+            },
+            2,
+        ),
+        (
+            "SSH flood, 50 kB frames, 30 ms replies",
+            Pacing::TERMINAL,
+            50_000,
+            Client {
+                rtt: Duration::from_millis(20),
+                apply: |_| 10 * MS,
+                reports: false,
+            },
+            2,
+        ),
+        (
+            "SSH, light frames, 1 ms replies",
+            Pacing::TERMINAL,
+            2_000,
+            Client {
+                rtt: Duration::ZERO,
+                apply: |_| MS,
+                reports: false,
+            },
+            2,
+        ),
+    ];
+
+    const SECONDS: u32 = 8;
+
+    /// The scenario's run with a stock client and with a reporting one.
+    fn compare(name: &str) -> (Run, Run) {
+        let &(_, pacing, bytes, client, window) =
+            SCENARIOS.iter().find(|s| s.0 == name).expect("scenario");
+        let stock = run_client(pacing, bytes, client.reporting(false), window, SECONDS);
+        let reporting = run_client(pacing, bytes, client.reporting(true), window, SECONDS);
+        (stock, reporting)
+    }
+
+    /// Prints the comparison of the scenarios:
+    /// `cargo test -p molcajete-daemon display::pacing::tests::table -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn table() {
+        println!(
+            "| Client ({SECONDS} s of changes) | fps stock / reporting | most unacked | bytes sent |"
+        );
+        println!("|---|---|---|---|");
+        for (name, ..) in SCENARIOS {
+            let (stock, reporting) = compare(name);
+            println!(
+                "| {name} | {:.1} / {:.1} | {} / {} | {:.2} / {:.2} MB |",
+                stock.fps(SECONDS),
+                reporting.fps(SECONDS),
+                stock.most_unacked,
+                reporting.most_unacked,
+                stock.bytes() as f64 / 1e6,
+                reporting.bytes() as f64 / 1e6,
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_that_reports_apply_times_is_paced_by_them_not_by_its_replies() {
+        let (stock, reporting) = compare("desktop, slow client (20 ms replies, 500 ms every 25th)");
+        assert!(
+            reporting.fps(SECONDS) > 1.5 * stock.fps(SECONDS),
+            "{} fps, stock {} fps",
+            reporting.fps(SECONDS),
+            stock.fps(SECONDS)
+        );
+        assert!(reporting.most_unacked <= 3);
+    }
+
+    #[test]
+    fn the_round_trip_is_left_to_the_frame_window() {
+        let (stock, reporting) = compare("desktop, long round trip (100 ms + 5 ms to apply)");
+        // The lag holds a stock client to one frame per round trip.
+        assert!(stock.fps(SECONDS) < 10.5, "{} fps", stock.fps(SECONDS));
+        // Three frames per round trip go out to a reporting client.
+        assert!(
+            reporting.fps(SECONDS) > 25.0,
+            "{} fps",
+            reporting.fps(SECONDS)
+        );
+        assert!(reporting.most_unacked <= 3);
+    }
+
+    #[test]
+    fn a_fast_client_is_not_slowed_down_by_reporting() {
+        let (stock, reporting) = compare("desktop, fast client (3 ms replies)");
+        assert!(reporting.fps(SECONDS) >= stock.fps(SECONDS));
+        assert!(
+            reporting.fps(SECONDS) > 58.0,
+            "{} fps",
+            reporting.fps(SECONDS)
+        );
+    }
+
+    /// The SSH flood case of docs/architecture.md must not send more.
+    #[test]
+    fn reporting_does_not_raise_the_bytes_of_a_terminal_flood() {
+        for name in [
+            "SSH flood, 50 kB frames, 1 ms replies",
+            "SSH flood, 50 kB frames, 30 ms replies",
+        ] {
+            let (stock, reporting) = compare(name);
+            assert!(reporting.bytes() <= stock.bytes(), "{name}");
+            assert!(reporting.frames.len() <= 122, "{name}");
+        }
+        let (_, light) = compare("SSH, light frames, 1 ms replies");
+        assert!(light.fps(SECONDS) < 31.0, "{} fps", light.fps(SECONDS));
+    }
+
+    fn reply(at: Instant, apply: Duration) -> SyncReply {
+        SyncReply {
+            at,
+            apply: Some(apply),
+        }
+    }
+
+    #[test]
+    fn one_slow_frame_does_not_hold_back_the_next() {
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(Pacing::DESKTOP);
+        let mut t = t0;
+        for (ts, apply) in [20, 20, 20, 500].into_iter().enumerate() {
+            clock.frame_sent(ts as i64, t, 2_000);
+            clock.acked(ts as i64, reply(t + (apply + 5) * MS, apply * MS));
+            t += 30 * MS;
+        }
+        // The median of 20, 20, 20 and 500 ms.
+        let last = t - 30 * MS;
+        assert_eq!(clock.next_frame_at(Duration::ZERO), Some(last + 20 * MS));
+        // The stock path would have taken a quarter of the 500 ms.
+        assert!(clock.lag() > 100 * MS);
+    }
+
+    #[test]
+    fn reported_apply_times_are_forgotten_after_a_pause() {
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(Pacing::DESKTOP);
+        for ts in 0..4 {
+            let t = t0 + 400 * MS * ts;
+            clock.frame_sent(i64::from(ts), t, 2_000);
+            clock.acked(i64::from(ts), reply(t + 300 * MS, 300 * MS));
+        }
+        let last = t0 + 1200 * MS;
+        assert_eq!(clock.next_frame_at(Duration::ZERO), Some(last + 300 * MS));
+        // The screen stood still for a while; the next frames are not
+        // spaced by what the client needed before the pause.
+        let t = last + 2 * APPLY_MEMORY;
+        clock.frame_sent(4, t, 2_000);
+        assert_eq!(clock.next_frame_at(Duration::ZERO), Some(t + 16 * MS));
+    }
+
+    #[test]
+    fn heavy_frames_still_wait_for_their_acknowledgement() {
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(Pacing::DESKTOP);
+        clock.frame_sent(1, t0, 2_000);
+        clock.acked(1, reply(t0 + 10 * MS, MS));
+        clock.frame_sent(2, t0 + 16 * MS, 100_000);
+        assert_eq!(
+            clock.next_frame_at(Duration::ZERO),
+            Some(t0 + 16 * MS + LARGE_FRAME_INTERVAL)
+        );
     }
 }

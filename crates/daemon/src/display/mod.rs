@@ -27,14 +27,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use molcajete_protocol::InstructionBuilder;
-use molcajete_protocol::zimage;
+use molcajete_protocol::{apply_time, zimage};
 
 use crate::io::Output;
 
 use encode::Region;
 use metrics::{DisplayMetrics, ImageKind, Phase, timed};
 use pacing::FrameClock;
-pub use pacing::Pacing;
+pub use pacing::{Pacing, SyncReply};
 
 /// Granularity of change tracking and of the heat map.
 const TILE: u32 = 64;
@@ -1666,18 +1666,23 @@ impl Display {
         let bytes = std::mem::take(&mut self.frame_bytes);
         self.clock.frame_sent(ts, now, bytes);
         self.metrics.frame(bytes, self.clock.unacked());
-        *out += &InstructionBuilder::new("sync").arg(ts).arg(1).finish();
+        // Asks a molcajete client how long it takes to apply the frame;
+        // stock clients ignore the extra argument.
+        *out += &apply_time::sync_request(ts, 1);
     }
 
-    /// Handles a `sync` reply from the client, which arrived at `received`.
+    /// Handles a `sync` reply from the client, which arrived at
+    /// `received.at`.
     ///
     /// The frame's lag is counted up to that moment, not up to now: the
     /// reply may have waited while this session built the next frame, and
     /// that wait says nothing about the client or the network. Counting it
     /// would slow the frame rate down by our own CPU time.
-    pub fn ack(&mut self, timestamp: i64, received: Instant) {
+    pub fn ack(&mut self, timestamp: i64, received: impl Into<SyncReply>) {
+        let received = received.into();
         if let Some(elapsed) = self.clock.acked(timestamp, received) {
-            self.metrics.acked(elapsed, received.elapsed());
+            self.metrics
+                .acked(elapsed, received.at.elapsed(), received.apply);
         }
     }
 

@@ -107,6 +107,7 @@ pub(super) struct DisplayMetrics {
     frames: Counter,
     frame_bytes: Histogram,
     client_ack: Histogram,
+    client_apply: Histogram,
     ack_wait: Histogram,
     unacked: Histogram,
     png: ImageMetrics,
@@ -133,6 +134,7 @@ impl DisplayMetrics {
             frames: Counter::noop(),
             frame_bytes: Histogram::noop(),
             client_ack: Histogram::noop(),
+            client_apply: Histogram::noop(),
             ack_wait: Histogram::noop(),
             unacked: Histogram::noop(),
             png: image(),
@@ -165,6 +167,7 @@ impl DisplayMetrics {
             frames: counter!("molcajeted_frames_total", &labels),
             frame_bytes: histogram!("molcajeted_frame_encoded_bytes", &labels),
             client_ack: histogram!("molcajeted_client_ack_seconds", &labels),
+            client_apply: histogram!("molcajeted_client_apply_seconds", &labels),
             ack_wait: histogram!("molcajeted_client_ack_wait_seconds", &labels),
             unacked: histogram!("molcajeted_unacked_frames", &labels),
             png: ImageMetrics::new(protocol, "png"),
@@ -216,8 +219,12 @@ impl DisplayMetrics {
     /// `elapsed`: from sending a frame to its acknowledgement arriving
     /// (network both ways plus the client's decoding and drawing). `waited`:
     /// how long the acknowledgement then sat unread, because the session
-    /// was busy.
-    pub(super) fn acked(&mut self, elapsed: Duration, waited: Duration) {
+    /// was busy. `apply`: how long the client said it took to apply the
+    /// frame, if it reports that.
+    pub(super) fn acked(&mut self, elapsed: Duration, waited: Duration, apply: Option<Duration>) {
+        if let Some(apply) = apply {
+            self.client_apply.record(apply);
+        }
         self.client_ack.record(elapsed);
         self.ack_wait.record(waited);
         self.totals.ack.add(elapsed);
