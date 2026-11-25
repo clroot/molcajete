@@ -25,6 +25,7 @@ use tracing::{Instrument as _, debug, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::db::ConnectionRecord;
 use crate::guacd::{self, ClientInfo, GuacdSession};
 
 /// Upper bound for a single outgoing WebSocket message.
@@ -44,6 +45,8 @@ pub struct TunnelRequest {
     /// Address of the browser, as seen by the gateway or reported by a
     /// trusted reverse proxy (`X-Forwarded-For`).
     pub peer: Option<String>,
+    /// The signed-in user opening the tunnel. Only used for logs.
+    pub user: Option<String>,
     pub info: ClientInfo,
 }
 
@@ -101,7 +104,12 @@ fn close_message(status: Status) -> Message {
 }
 
 /// Entry point after the WebSocket upgrade.
-pub async fn serve(socket: WebSocket, state: Arc<AppState>, request: TunnelRequest) {
+pub async fn serve(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    request: TunnelRequest,
+    connection: Option<ConnectionRecord>,
+) {
     let tunnel_id = Uuid::new_v4();
     let span = info_span!(
         "tunnel",
@@ -109,8 +117,9 @@ pub async fn serve(socket: WebSocket, state: Arc<AppState>, request: TunnelReque
         connection = request.connection.as_deref().unwrap_or(""),
         session = request.session.as_deref().unwrap_or(""),
         peer = request.peer.as_deref().unwrap_or(""),
+        user = request.user.as_deref().unwrap_or(""),
     );
-    serve_tunnel(socket, state, request, tunnel_id)
+    serve_tunnel(socket, state, request, connection, tunnel_id)
         .instrument(span)
         .await;
 }
@@ -119,14 +128,11 @@ async fn serve_tunnel(
     mut socket: WebSocket,
     state: Arc<AppState>,
     request: TunnelRequest,
+    connection: Option<ConnectionRecord>,
     tunnel_id: Uuid,
 ) {
-    let Some(connection) = request
-        .connection
-        .as_deref()
-        .and_then(|id| state.config.connection(id))
-    else {
-        warn!(connection = ?request.connection, "tunnel requested for unknown connection");
+    let Some(connection) = connection else {
+        warn!(connection = ?request.connection, "tunnel requested for unknown or forbidden connection");
         counter!("molcajete_gateway_tunnels_rejected_total", "reason" => "unknown_connection")
             .increment(1);
         let _ = socket.send(close_message(Status::RESOURCE_NOT_FOUND)).await;
@@ -137,7 +143,9 @@ async fn serve_tunnel(
         ("protocol", connection.protocol.clone()),
     ];
 
-    let guacd_cfg = connection.guacd.as_ref().unwrap_or(&state.config.guacd);
+    let defaults = &state.config.guacd;
+    let guacd_host = connection.guacd_host.as_deref().unwrap_or(&defaults.host);
+    let guacd_port = connection.guacd_port.unwrap_or(defaults.port);
     let parameters: &BTreeMap<String, String> = &connection.parameters;
     info!(
         connection = %connection.id,
@@ -149,11 +157,11 @@ async fn serve_tunnel(
 
     let handshake_started = Instant::now();
     let session = match guacd::connect(
-        (guacd_cfg.host.as_str(), guacd_cfg.port),
+        (guacd_host, guacd_port),
         &connection.protocol,
         parameters,
         &request.info,
-        Duration::from_secs(guacd_cfg.handshake_timeout),
+        Duration::from_secs(defaults.handshake_timeout),
     )
     .await
     {

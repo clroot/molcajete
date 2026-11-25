@@ -79,10 +79,15 @@ pub async fn receive(
     if !state.client_reports {
         return StatusCode::NOT_FOUND;
     }
-    // Only configured connections become label values.
-    let Some(connection) = state.config.connection(&report.connection) else {
+    // Only existing connections become label values.
+    if !state
+        .db
+        .connection_exists(&report.connection)
+        .await
+        .unwrap_or(false)
+    {
         return StatusCode::BAD_REQUEST;
-    };
+    }
     if report.samples.is_empty() || report.samples.len() > MAX_SAMPLES {
         return StatusCode::BAD_REQUEST;
     }
@@ -97,7 +102,7 @@ pub async fn receive(
         .take(64)
         .collect();
     let labels = [
-        ("connection", connection.id.clone()),
+        ("connection", report.connection.clone()),
         ("mode", mode.to_owned()),
     ];
 
@@ -123,7 +128,7 @@ pub async fn receive(
     info!(
         target: "molcajete::client_report",
         session = %session,
-        connection = %connection.id,
+        connection = %report.connection,
         mode,
         samples = report.samples.len(),
         fps_avg = sum.fps / n,

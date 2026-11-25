@@ -14,12 +14,62 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub guacd: GuacdConfig,
-    /// Users allowed to log in with HTTP Basic authentication. When empty,
-    /// authentication is disabled (only sensible on a loopback address).
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Administrators created in the database on startup when no user with
+    /// that name exists yet. Existing users and passwords are left alone.
     #[serde(default)]
     pub users: Vec<UserConfig>,
+    /// Connections imported into the database on startup when no
+    /// connection with that id exists yet.
     #[serde(default)]
     pub connections: Vec<ConnectionConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// `postgres://…`, `mysql://…` (or `mariadb://…`) or `sqlite://…`.
+    /// Without one, `<server.data_dir>/molcajete.db` (SQLite) is used.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            max_connections: default_max_connections(),
+        }
+    }
+}
+
+fn default_max_connections() -> u32 {
+    10
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Lifetime of a login session.
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            session_ttl_hours: default_session_ttl_hours(),
+        }
+    }
+}
+
+fn default_session_ttl_hours() -> u64 {
+    12
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,9 +77,12 @@ pub struct Config {
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
-    /// Directory holding `index.html` and the built wasm package.
+    /// Directory holding the built web client (`index.html`, wasm package).
     #[serde(default = "default_static_dir")]
     pub static_dir: PathBuf,
+    /// Where the default SQLite database lives.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
 }
 
 impl Default for ServerConfig {
@@ -37,6 +90,7 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             static_dir: default_static_dir(),
+            data_dir: default_data_dir(),
         }
     }
 }
@@ -46,7 +100,11 @@ fn default_listen() -> SocketAddr {
 }
 
 fn default_static_dir() -> PathBuf {
-    PathBuf::from("web")
+    PathBuf::from("web/dist")
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from(".")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,10 +190,6 @@ impl Config {
         }
         Ok(())
     }
-
-    pub fn connection(&self, id: &str) -> Option<&ConnectionConfig> {
-        self.connections.iter().find(|c| c.id == id)
-    }
 }
 
 #[cfg(test)]
@@ -166,7 +220,9 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.server.listen.port(), 9000);
         assert_eq!(config.guacd.port, 4822);
-        let c = config.connection("desktop").unwrap();
-        assert_eq!(c.parameters["hostname"], "10.0.0.5");
+        assert_eq!(config.connections[0].parameters["hostname"], "10.0.0.5");
+        assert_eq!(config.server.static_dir, PathBuf::from("web/dist"));
+        assert_eq!(config.database.url, None);
+        assert_eq!(config.auth.session_ttl_hours, 12);
     }
 }
