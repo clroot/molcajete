@@ -36,6 +36,10 @@ port = 4822
 # [audit]
 # retention_days = 365                          # 0 keeps entries forever
 
+# Closed sessions (Connection history in the web UI).
+# [history]
+# retention_days = 365                          # 0 keeps them forever
+
 # Created as an administrator on startup if the username does not exist
 # yet; afterwards, manage users (and passwords) in the web UI. Without any
 # user, an "admin" account with a random password is created and logged.

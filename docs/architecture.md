@@ -347,7 +347,7 @@ Measurements are in section 7.7.
 
 ## 5. Gateway (`molcajete-gateway`)
 
-The gateway is an axum server. It serves the web UI (`web/dist`), the JSON API under `/api` (authentication, connections, folders, users, groups, recordings, audit log, settings, client reports), the tunnel at `/websocket-tunnel` and `/healthz`. Its own configuration is a TOML file (`gateway.example.toml`); everything managed through the UI is in the database. Configuration keys are listed in [deployment.md](deployment.md).
+The gateway is an axum server. It serves the web UI (`web/dist`), the JSON API under `/api` (authentication, connections, folders, users, groups, live sessions and history, recordings, audit log, settings, client reports), the tunnel at `/websocket-tunnel` and `/healthz`. Its own configuration is a TOML file (`gateway.example.toml`); everything managed through the UI is in the database. Configuration keys are listed in [deployment.md](deployment.md).
 
 ### 5.1 Tunnel (`tunnel.rs`, `guacd.rs`)
 
@@ -356,7 +356,8 @@ The tunnel follows the stock contract of section 1.2, so guacamole-common-js wor
 1. The upgrade request must come from the gateway's own origin and carry a valid session; the query string (`TunnelRequest::from_query`) accepts the short names of the molcajete client (`connection`, `width`, `image`, ...) and the stock `GUAC_*` names.
 2. The connection is looked up for the user (section 5.3). An unknown or forbidden connection closes the socket with `RESOURCE_NOT_FOUND`.
 3. The connection's stored credentials are decrypted (section 5.5), and the gateway performs the handshake with the connection's guacd (its own host and port, or the default) (`guacd::connect`), answering the highest common protocol version. A failed handshake closes the WebSocket with the mapped status code in the close reason, like the Java web app.
-4. `relay` pumps both directions until either side ends:
+4. The established tunnel registers in the live-session registry (section 5.9), which can end it.
+5. `relay` pumps both directions until either side ends or the session is ended:
    - daemon → browser: whole instructions (or records) are batched into one message of up to 64 KiB, sent as soon as the next read would block. Three framings exist (`Framing`), see section 5.2.
    - browser → daemon: text only, parsed with `Limits::STRICT` and forwarded verbatim. Internal pings are answered by the gateway and never reach the daemon.
 
@@ -445,6 +446,7 @@ One code path serves SQLite, PostgreSQL and MySQL/MariaDB through sqlx's `Any` d
 | `20261126000100_recordings` | connection attributes, the recording index |
 | `20261126000200_oidc` | identities at providers, pending sign-ins |
 | `20261127000000_audit_log` | the audit log |
+| `20261127000200_connection_history` | the connection history |
 
 Connection attributes (`molcajete_connection_attribute`) hold molcajete's own per-connection switches (`record-sessions`, `record-keys`, `record-exclude-mouse`, `record-molcajete-formats`); unlike parameters they never reach the daemon. Upgrading is described in [deployment.md](deployment.md#upgrading).
 
@@ -499,6 +501,18 @@ Action names are part of the interface (filters, SIEM rules); new ones go into `
 ### 5.8 Client reports
 
 The page posts the client's once-per-second `stats` to `/api/telemetry/client` (`client_report.rs`) when reports are enabled. The gateway records them in histograms labelled by connection, client mode and kind of client, and logs a summary per batch naming the tunnel and molcajeted's connection id. This is the only view into the browser side of the pipeline; see [observability.md](observability.md).
+
+### 5.9 Live sessions and history (`sessions/`, `db/history.rs`)
+
+Every established tunnel registers in `sessions::Registry` (in `AppState`), in memory, for as long as it relays. `Registry::register` returns a `Registration` that removes the entry when dropped, so a tunnel cannot leave a stale entry however it ends. An entry holds what the tunnel knew at the end of the handshake (`SessionStart`: user, connection, protocol, peer, the guacd host and port, guacd's connection id from `ready`, the recording id), its start time, byte counters the relay adds to (`Traffic`, atomics) and the latest round trip from the page's client reports.
+
+**Ending.** Each entry has a `watch` channel. `Registry::end(id, Ending)` sets it once; `relay` selects on `Registration::ended()` next to both directions, so the tunnel closes at once with `EndReason::status()` (`SESSION_CLOSED` for an administrator, `CLIENT_FORBIDDEN` for policy) and the guacd socket is dropped. The page maps those two statuses, when they arrive as the tunnel's close reason, to *Ended by an administrator* and *Access removed*.
+
+**Policy.** `sessions::policy::enforce` runs after every handler that can take a connection away (users, groups, access, moves and deletes, single sign-on). It re-checks every live session with `connection_for_user` (section 5.4) and ends those that fail, recording `session.end` in the audit log. Checking all live sessions is simpler and safer than deriving who a change affects through groups and folders, and there are few. A tunnel still in its handshake during the change is not registered yet and is not checked.
+
+**History.** When the relay returns, `sessions::history::record` writes the session to `molcajete_connection_history` (status, reason, who ended it, bytes), and a task deletes rows older than `[history] retention_days` at start and every hour. Startup needs no repair: no tunnel outlives the process.
+
+**Joining a live session (for #48).** Sharing and shadowing look a session up with `Registry::get(tunnel_id)` or `Registry::by_guacd_id(id)`. The returned `LiveSession` has the owner (`user_id`, `username`), the connection, `guacd` (host and port of the daemon serving it) and `guacd_id`, which a new guacd connection selects with `select,<guacd_id>` to join. Ending through the registry closes the owner's tunnel; joined viewers will need their own registrations (and a way to list them as such) when #48 adds them.
 
 ## 6. molcajeted (`molcajete-daemon`)
 
@@ -825,7 +839,6 @@ This is the worst case: the screen changes 20 times a second for the whole hour.
 Tracked as issues:
 
 - Sharing a running session through links, and administrators shadowing sessions (#48); joining with `select,$id` is refused by molcajeted today
-- Active sessions and connection history for administrators, ending sessions (#49)
 - File transfer: SFTP in SSH sessions and drive redirection in RDP (#53); the protocol's `file`/`pipe`/`filesystem` objects are not handled yet
 - Read-only and clipboard restrictions in the connection form (#54)
 - API tokens for automation and one-time links for embedded sessions (#57)

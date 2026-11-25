@@ -1,6 +1,6 @@
 # Administration
 
-Who can sign in, what they can open, what is recorded, and who changed what. Everything here is done in the gateway's web UI (*Connections*, *Users*, *Groups*, *Recordings*, *Audit log*) or its JSON API, and stored in the gateway's database. The settings in `gateway.toml` that these features read are listed in the [configuration reference](deployment.md#configuration-reference).
+Who can sign in, what they can open, who is connected now, what is recorded, and who changed what. Everything here is done in the gateway's web UI (*Connections*, *Users*, *Groups*, *Active sessions*, *Connection history*, *Recordings*, *Audit log*) or its JSON API, and stored in the gateway's database. The settings in `gateway.toml` that these features read are listed in the [configuration reference](deployment.md#configuration-reference).
 
 ## Users and passwords
 
@@ -22,7 +22,7 @@ password = "change-me"
 Administrators manage users under *Users*: username, password, role, groups, direct grants (see [connections and who can open them](#connections-and-who-can-open-them)) and *Disabled*.
 
 - Passwords need at least 8 characters. They are stored as Argon2id hashes.
-- Setting a new password, or disabling a user, signs that user out of every browser. A disabled user cannot sign in, whichever way they try.
+- Setting a new password, or disabling a user, signs that user out of every browser. Disabling or deleting a user also ends their open remote desktop sessions ([Sessions that end by themselves](#sessions-that-end-by-themselves)). A disabled user cannot sign in, whichever way they try.
 - Everyone can change their own password with *Change password* in the side menu; this signs them out everywhere too.
 - Administrators cannot remove their own administrator role, disable themselves or delete their own account, and at least one enabled administrator always remains: a change that would leave none is refused.
 - With [single sign-on](#single-sign-on-openid-connect) configured, a user can be created without a password; such a user signs in only through the identity provider.
@@ -287,6 +287,43 @@ Recordings are kept until an administrator deletes them, unless `[recordings]` s
 
 Retention runs when the gateway starts and every ten minutes. Sessions still being recorded are never deleted. Files are named `YYYYMMDD-HHMMSS_<connection>_<id>.guac` (UTC start time) in the recordings directory; keep that directory on persistent storage, see the [configuration reference](deployment.md#recordings).
 
+## Active sessions and connection history
+
+The gateway knows every session it relays. Administrators see the open ones under *Active sessions* and the closed ones under *Connection history*, and can end any open session.
+
+### Active sessions
+
+*Active sessions* lists every open session: the user and the address they connect from, the connection and its protocol, when it started and for how long it has run, the bytes received and sent so far, the latest round trip the user's page measured (only with [client reports](observability.md#browser-reports) on) and a link to its recording when it is recorded. The list refreshes every three seconds while the page is open. A session appears once its remote desktop has answered (after the handshake) and disappears when its tunnel closes.
+
+Sessions are kept in the gateway's memory, not in the database: a restarted gateway has none (their tunnels were closed with it). With more than one gateway replica, each lists and ends only its own sessions.
+
+### Ending sessions
+
+*End* on a row ends that session after a confirmation; *End all* ends every open session except the administrator's own. The tunnel closes at once with the Guacamole status `SESSION_CLOSED` (523), and the user's page says **Ended by an administrator**. They can connect again; to keep someone out, disable the user or take the connection away (below).
+
+### Sessions that end by themselves
+
+A session runs only as long as its user may open its connection. After every change that can take a connection away, the gateway checks each open session again, the way it checked when the session opened, and ends those that would no longer open:
+
+- a user disabled or deleted;
+- grants changed on a user or a group, a user removed from a group, a role lowered (a connection manager or administrator opens every connection);
+- who is granted a connection or folder changed, a connection or folder moved or deleted;
+- groups or role changed by the [identity provider](#roles-and-groups-from-the-provider) when the user signs in again.
+
+These sessions close with `CLIENT_FORBIDDEN` (771), and the user's page says **Access removed**. Every session ended, by an administrator or by these rules, is in the [audit log](#actions) as `session.end` with a `reason`: `admin`, `user_disabled`, `user_deleted` or `access_revoked`, and the administrator whose action ended it as the actor.
+
+### Connection history
+
+Every session is stored in the database (`molcajete_connection_history`) when it closes: the user and the connection as they were named then, the protocol, the user's address, when it started and ended, the status it closed with, who ended it and why (when someone did), the bytes relayed each way and its recording. Sessions whose handshake failed never started and are not in it; the gateway's log and `molcajete_gateway_handshake_failures_total` have those.
+
+*Connection history* lists sessions most recently started first, with their duration and how they ended: *Closed*, an error (such as *Remote desktop error (515)*), or ended by an administrator, because the user was disabled or deleted, or because their access was removed, with the administrator's name. Filter by user (username or id), connection (name or id) and start date. *Export CSV* downloads every session that matches (up to 100 000) with the columns `started_at` and `ended_at` (UTC), `duration_seconds`, `user`, `user_id`, `connection`, `connection_id`, `protocol`, `peer_address`, `outcome` (`closed`, `admin`, `user_disabled`, `user_deleted`, `access_revoked` or the error's name such as `UPSTREAM_ERROR`), `status` (the numeric Guacamole status), `ended_by`, `bytes_to_browser`, `bytes_to_guacd` and `recording_id`.
+
+Both pages and their API are for administrators only.
+
+### Retention
+
+Sessions that ended more than `[history] retention_days` ago (365 by default) are deleted when the gateway starts and every hour after that; `0` keeps them forever. The history is kept apart from the audit log's retention because it grows with every session rather than with administration. See the [configuration reference](deployment.md#history).
+
 ## Audit log
 
 The gateway keeps a record of every administrative change and every sign-in in its database (`molcajete_audit_log`): who did it, from which address, what they did, to what, and which fields changed. It answers questions such as "who changed the password of connection X last week" or "who made user Y an administrator". Administrators read it under *Audit log*.
@@ -299,7 +336,7 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | Actor | The user who did it: their id and their username at the time. A failed sign-in has the username that was typed, and no id when no such user exists. Changes made from the configuration file, at first start or with `set-password` have no actor; the page shows them as *Gateway*. |
 | Source address | The browser's address as the gateway logs it: behind a [trusted proxy](deployment.md#reverse-proxy) the address the proxy reports, followed by the proxy (`203.0.113.9 (via 10.0.0.2)`), otherwise the TCP peer; `configuration file`, `first start` or `command line` for changes not made in a browser. |
 | Action | What happened; see below. |
-| Target | The user, group, connection, folder or recording, with its id and its name at the time. |
+| Target | The user, group, connection, folder, recording or session, with its id and its name at the time. |
 | Changes | Each changed field with its value before and after; lists (groups, members, grants) as what was added and removed. Details such as why a sign-in failed are here too. |
 
 **Secrets are never stored.** Passwords, private keys, passphrases and secrets show only that they were set or changed, as `[redacted]`, never their value. This covers the user's password and the connection parameters `password`, `passphrase`, `private-key`, `client-key` and their variants (`sftp-password`, `gateway-password`, `sftp-private-key`, ...). Grants, members and folders are shown by name rather than id, as they were named at the time.
@@ -321,6 +358,7 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | `folder.create`, `folder.rename`, `folder.move`, `folder.delete` | Folders. |
 | `recording.download`, `recording.delete` | Recordings downloaded (playing one back in the page is not recorded) or deleted. |
 | `secrets.encrypt`, `secrets.rotate` | Stored credentials encrypted at start because they were in plain text (`count`), and re-encrypted by `rotate-key` (`count`, `keyId`). No actor. |
+| `session.end` | An open session was ended, by an administrator or because its user was disabled, deleted or lost access ([Sessions that end by themselves](#sessions-that-end-by-themselves)). The target is the session (its tunnel id, named after the connection); `reason`, `user`, `connection` and `startedAt` are in the changes. |
 
 The names are stable, so filters and alert rules can rely on them; `GET /api/audit/actions` lists them.
 
@@ -363,8 +401,11 @@ curl -b cookies -OJ 'https://molcajete.example.com/api/recordings/<id>/file?down
 | `/api/recordings/{id}/file` | `GET` (range requests; `?download=true` to save) | administrators |
 | `/api/audit` | `GET` (filters below; `?format=csv` for a CSV download) | administrators |
 | `/api/audit/actions` | `GET` (every action name) | administrators |
+| `/api/sessions` | `GET` (open sessions), `DELETE` (end all but your own; `?user=<username or id>` ends all of that user's) | administrators |
+| `/api/sessions/{id}` | `DELETE` (end the session) | administrators |
+| `/api/history` | `GET` (filters below; `?format=csv` for a CSV download) | administrators |
 
-`GET /api/audit` returns `{"entries": […], "hasMore": true|false}`, newest first. Its query parameters, all optional: `actor` (username or user id), `action` (an action, or a prefix of whole parts such as `user` or `oidc.user`), `targetType` (`user`, `group`, `connection`, `folder`, `recording`), `target` (id or name), `from` and `to` (Unix milliseconds; `to` excluded), `limit` (default 100, at most 1000) and `offset`.
+`GET /api/audit` returns `{"entries": […], "hasMore": true|false}`, newest first. Its query parameters, all optional: `actor` (username or user id), `action` (an action, or a prefix of whole parts such as `user` or `oidc.user`), `targetType` (`user`, `group`, `connection`, `folder`, `recording`, `session`), `target` (id or name), `from` and `to` (Unix milliseconds; `to` excluded), `limit` (default 100, at most 1000) and `offset`.
 
 ```sh
 curl -b cookies 'https://molcajete.example.com/api/audit?action=login.failure&limit=20'
@@ -372,5 +413,15 @@ curl -b cookies -OJ 'https://molcajete.example.com/api/audit?target=office-pc&fo
 ```
 
 A connection read from `/api/connections/{id}` leaves its [credentials](#stored-credentials) out of `parameters` and names the stored ones in `storedSecrets`. Sending a connection back without a credential keeps the stored value, so a script can read, change and write a connection without knowing its password; a new value in `parameters` replaces it, and `"clearSecrets": ["password"]` removes it.
+
+`GET /api/sessions` returns the open sessions, oldest first, each with `id` (the tunnel id), `userId`, `username`, `connectionId`, `connectionName`, `protocol`, `peer`, `startedAt` (Unix milliseconds), `bytesToBrowser`, `bytesToGuacd`, `rttMs` (or `null`), `recordingId` (or `null`) and `guacdId` (the daemon's id of the connection). `DELETE /api/sessions` returns `{"ended": n}`.
+
+`GET /api/history` returns `{"entries": […], "hasMore": true|false}`, most recently started first. Its query parameters, all optional: `user` (username or user id), `connection` (id or name), `from` and `to` (start time in Unix milliseconds; `to` excluded), `limit` (default 100, at most 1000) and `offset`. An entry has `id`, `userId`, `username`, `connectionId`, `connectionName`, `protocol`, `peerAddress`, `startedAt`, `endedAt`, `endStatus` (Guacamole status; 0 when it closed normally), `endReason` and `endedBy` (`null` unless someone else ended it), `bytesToBrowser`, `bytesToGuacd` and `recordingId`.
+
+```sh
+curl -b cookies https://molcajete.example.com/api/sessions
+curl -b cookies -X DELETE 'https://molcajete.example.com/api/sessions?user=bob'
+curl -b cookies -OJ 'https://molcajete.example.com/api/history?connection=office-pc&format=csv'
+```
 
 Users carry `role` and, for scripts written before roles, `isAdmin` (true for an effective role of administrator). Requests that create or change a user accept either; `role` wins when both are given. Leaving a field out of a `PUT` keeps its current value, including lists of members, groups and grants.
