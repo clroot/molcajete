@@ -210,6 +210,19 @@ describe('jump hosts', () => {
     expect(toConnection(vnc)).toMatchObject({ok: true, connection: {parameters: ssh.parameters}});
   });
 
+  test('file transfer parameters are fields of the protocols that have them, extras elsewhere', () => {
+    const sftp = {
+      ...ssh,
+      parameters: {hostname: 'db', 'enable-sftp': 'true', 'sftp-disable-upload': 'true'},
+    };
+    const form = toConnectionForm(sftp);
+    expect(form.fields['enable-sftp']).toBe('true');
+    expect(form.extras).toEqual([]);
+    const vnc = changeProtocol(form, 'vnc');
+    expect(vnc.extras.map(e => e.name).sort()).toEqual(['enable-sftp', 'sftp-disable-upload']);
+    expect(toConnection(vnc)).toMatchObject({ok: true, connection: {parameters: sftp.parameters}});
+  });
+
   test('prompts get readable labels', () => {
     expect(requiredLabel('jump-host-password')).toBe('Jump host password');
     expect(requiredLabel('jump-host-2-password')).toBe('Jump host 2 password');

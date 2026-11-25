@@ -31,6 +31,11 @@ import {newPageId, useSharedSession, type Participant} from './sharing';
 import {unlockAudio} from './audio';
 import {hasLinks, isTerminal} from './terminal';
 import {useCopyFeedback} from './useCopyFeedback';
+import {transferStatus, useFiles} from './files';
+import FilesDrawer from './FilesDrawer';
+import {ActiveTransfers} from './TransferList';
+import DropOverlay from './DropOverlay';
+import {useFileDrop} from './useFileDrop';
 
 const styles = stylex.create({
   display: {position: 'fixed', inset: 0, backgroundColor: 'black', overflow: 'hidden'},
@@ -56,6 +61,9 @@ type Props = {
 export default function SessionPage({connectionId, ticket}: Props) {
   const displayRef = useRef<HTMLDivElement>(null);
   const [session, dispatch] = useSessionEvents();
+  const [files, dispatchFiles] = useFiles();
+  const showToast = useToast();
+  const [isFilesOpen, setIsFilesOpen] = useState(false);
   const {
     name: connectionName,
     protocol,
@@ -79,10 +87,18 @@ export default function SessionPage({connectionId, ticket}: Props) {
   const onEvent = useCallback(
     (event: SessionEvent) => {
       dispatch(event);
+      dispatchFiles(event);
+      if (event.type === 'transfer' && (event.detail.state === 'done' || event.detail.state === 'failed')) {
+        const t = event.detail;
+        showToast({
+          body: `${t.name}: ${transferStatus(t)}`,
+          type: t.state === 'failed' ? 'error' : undefined,
+        });
+      }
       // Copies on the remote side land in the local clipboard as well.
       onCopyEvent(event);
     },
-    [dispatch, onCopyEvent],
+    [dispatch, dispatchFiles, onCopyEvent, showToast],
   );
   const onStartFailed = useCallback(
     (detail: string) => dispatch({type: 'failed', title: 'The client could not start', detail}),
@@ -163,6 +179,16 @@ export default function SessionPage({connectionId, ticket}: Props) {
   const participants = shared?.participants;
   useJoinToasts(participants);
   const administrators = (participants ?? []).filter(p => p.kind === 'shadow').map(p => p.username);
+
+  // Files dropped on the session go to the server's upload folder.
+  const dropTarget = isConnected ? files.filesystems.find(f => f.canUpload) : undefined;
+  const isDraggingFiles = useFileDrop(dropTarget !== undefined, dropped => {
+    for (const file of dropped) client()?.upload(file);
+  });
+  const openFiles = () => {
+    setMenuOpen(false);
+    setIsFilesOpen(true);
+  };
   return (
     <>
       <div ref={displayRef} {...stylex.props(styles.display)} />
@@ -186,6 +212,12 @@ export default function SessionPage({connectionId, ticket}: Props) {
           others={participants.length}
           isSecond={isConnected && restrictions.readOnly}
         />
+      )}
+      {!isFilesOpen && (
+        <ActiveTransfers transfers={files.transfers} onCancel={id => client()?.cancel_transfer(id)} />
+      )}
+      {isDraggingFiles && dropTarget && (
+        <DropOverlay target={protocol === 'ssh' ? 'your home folder' : `the ${dropTarget.name} drive`} />
       )}
 
       {isConnected && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
@@ -246,6 +278,18 @@ export default function SessionPage({connectionId, ticket}: Props) {
             : leave
         }
         sharing={shared && <SharingSection pageId={pageId} shared={shared} onChange={reloadShared} />}
+        onOpenFiles={files.filesystems.length > 0 ? openFiles : null}
+      />
+
+      <FilesDrawer
+        isOpen={isFilesOpen}
+        onOpenChange={open => {
+          setIsFilesOpen(open);
+          if (!open) client()?.focus();
+        }}
+        filesystems={files.filesystems}
+        transfers={files.transfers}
+        client={client}
       />
     </>
   );

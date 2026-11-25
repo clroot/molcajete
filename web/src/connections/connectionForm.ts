@@ -3,6 +3,7 @@
 import {ATTRIBUTES, type Connection} from '../api';
 import {protocolInfo} from './protocols';
 import {JUMP_HOST_PARAMETERS} from './jumpHosts';
+import {fileTransferFields} from './fileTransfer';
 
 export type ExtraParameter = {key: number; name: string; value: string};
 
@@ -60,7 +61,10 @@ export function keepSecret(form: ConnectionForm, name: string): ConnectionForm {
 
 /** Stored credentials without a field of their own, such as `sftp-password`. */
 export function otherStoredSecrets(form: ConnectionForm): string[] {
-  const known = new Set(protocolInfo(form.protocol).fields.map(f => f.name));
+  const known = new Set([
+    ...protocolInfo(form.protocol).fields.map(f => f.name),
+    ...fileTransferFields(form.protocol).map(f => f.name),
+  ]);
   return form.storedSecrets.filter(name => !known.has(name) && !JUMP_HOST_PARAMETERS.has(name));
 }
 
@@ -100,9 +104,13 @@ function toAttributes(r: RecordingChoices): Record<string, string> {
 let nextExtraKey = 1;
 export const extraParameter = (name = '', value = ''): ExtraParameter => ({key: nextExtraKey++, name, value});
 
-/** Splits parameters into the protocol's own fields (and the jump host fields) and free extras. */
+/** Splits parameters into the protocol's own fields (with jump host and file transfer fields) and free extras. */
 function splitParameters(protocol: string, parameters: Record<string, string>) {
-  const known = new Set([...protocolInfo(protocol).fields.map(f => f.name), ...JUMP_HOST_PARAMETERS]);
+  const known = new Set([
+    ...protocolInfo(protocol).fields.map(f => f.name),
+    ...JUMP_HOST_PARAMETERS,
+    ...fileTransferFields(protocol).map(f => f.name),
+  ]);
   const fields: Record<string, string> = {};
   const extras: ExtraParameter[] = [];
   for (const [name, value] of Object.entries(parameters)) {

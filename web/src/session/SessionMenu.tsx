@@ -13,6 +13,7 @@ import {AUTOMATIC_SCALE_LABEL, scaleOptionsWith} from './displayScale';
 import type {RemoteScale} from './displaySettings';
 import {terminalKeys} from './terminal';
 import type {Restrictions} from './useConnection';
+import {FolderIcon} from '@heroicons/react/24/outline';
 
 export type ScaleMode = 'fit' | 'native';
 
@@ -54,6 +55,8 @@ type Props = {
   onDisconnect: () => void;
   /** Who joined and the share links, when the gateway knows the session. */
   sharing?: ReactNode;
+  /** Opens the file panel; `null` when the connection shares no files. */
+  onOpenFiles: (() => void) | null;
 };
 
 const CLIPBOARD_HELP = {
@@ -111,7 +114,7 @@ function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Pro
   );
 }
 
-/** The Ctrl+Alt+Shift menu: clipboard, display, input, stats, sharing and keys. */
+/** The Ctrl+Alt+Shift menu: files, clipboard, display, input, stats, sharing and keys. */
 export default function SessionMenu(props: Props) {
   const {isOpen, onOpenChange, connectionName, remoteDisplay} = props;
   const isDisplayFixed = remoteDisplay !== null && !remoteDisplay.canChange;
@@ -135,6 +138,13 @@ export default function SessionMenu(props: Props) {
         content={
           <LayoutContent>
             <VStack gap={5}>
+              {props.onOpenFiles && (
+                <Button
+                  label="Files"
+                  icon={<FolderIcon width={16} height={16} />}
+                  onClick={props.onOpenFiles}
+                />
+              )}
               <Clipboard {...props} />
               <VStack gap={4}>
                 <Heading level={3}>Display</Heading>
