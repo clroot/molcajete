@@ -14,12 +14,53 @@ export type ConnectionForm = {
   guacdPort: string;
   /** Folder id, '' for the top level; only used when creating. */
   parentId: string;
-  /** Values of the fields the current protocol shows, and of the jump host fields. */
+  /**
+   * Values of the fields the current protocol shows, of the jump host
+   * fields, and new values of other stored credentials.
+   */
   fields: Record<string, string>;
   /** Every other guacd parameter, edited as free name/value pairs. */
   extras: ExtraParameter[];
   recording: RecordingChoices;
+  /**
+   * Credentials the gateway has stored. Their values never reach the form:
+   * a value typed into `fields` replaces one, and saving without keeps it.
+   */
+  storedSecrets: string[];
+  /** Stored credentials to remove when saving. */
+  clearedSecrets: string[];
 };
+
+/** What a credential field shows instead of the stored value. */
+export type SecretState = 'none' | 'stored' | 'cleared';
+
+export function secretState(form: ConnectionForm, name: string): SecretState {
+  if (!form.storedSecrets.includes(name)) return 'none';
+  return form.clearedSecrets.includes(name) ? 'cleared' : 'stored';
+}
+
+/** Marks a stored credential for removal, dropping anything typed into it. */
+export function clearSecret(form: ConnectionForm, name: string): ConnectionForm {
+  const fields = {...form.fields};
+  delete fields[name];
+  return {
+    ...form,
+    fields,
+    extras: form.extras.filter(e => e.name.trim() !== name),
+    clearedSecrets: [...form.clearedSecrets.filter(n => n !== name), name],
+  };
+}
+
+/** Keeps a stored credential that was marked for removal. */
+export function keepSecret(form: ConnectionForm, name: string): ConnectionForm {
+  return {...form, clearedSecrets: form.clearedSecrets.filter(n => n !== name)};
+}
+
+/** Stored credentials without a field of their own, such as `sftp-password`. */
+export function otherStoredSecrets(form: ConnectionForm): string[] {
+  const known = new Set(protocolInfo(form.protocol).fields.map(f => f.name));
+  return form.storedSecrets.filter(name => !known.has(name) && !JUMP_HOST_PARAMETERS.has(name));
+}
 
 /** Whether and how sessions are recorded (connection attributes, not guacd parameters). */
 export type RecordingChoices = {
@@ -92,6 +133,8 @@ export function emptyConnectionForm(parentId: string | null = null): ConnectionF
     fields: {},
     extras: [],
     recording: NO_RECORDING,
+    storedSecrets: [],
+    clearedSecrets: [],
   };
 }
 
@@ -105,6 +148,8 @@ export function toConnectionForm(c: Connection): ConnectionForm {
     parentId: c.parentId ?? '',
     ...splitParameters(c.protocol, c.parameters),
     recording: toRecordingChoices(c.attributes),
+    storedSecrets: c.storedSecrets ?? [],
+    clearedSecrets: [],
   };
 }
 
@@ -148,6 +193,9 @@ export function toConnection(form: ConnectionForm): FormResult {
   if (!isGuacdPortValid(form)) return {ok: false, reason: 'The guacd port must be a number.'};
   const guacdHost = form.guacdHost.trim();
   const guacdPort = form.guacdPort.trim();
+  const parameters = joinParameters(form);
+  // A value typed after clearing replaces the stored one anyway.
+  const clearSecrets = form.clearedSecrets.filter(name => !(name in parameters));
   return {
     ok: true,
     connection: {
@@ -156,7 +204,8 @@ export function toConnection(form: ConnectionForm): FormResult {
       protocol: form.protocol,
       guacdHost: guacdHost || null,
       guacdPort: guacdHost && guacdPort ? Number(guacdPort) : null,
-      parameters: joinParameters(form),
+      parameters,
+      ...(clearSecrets.length > 0 ? {clearSecrets} : {}),
       ...(form.parentId ? {parentId: form.parentId} : {}),
       attributes: toAttributes(form.recording),
     },

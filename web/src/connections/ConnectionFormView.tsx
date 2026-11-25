@@ -8,8 +8,16 @@ import {Heading} from '@astryxdesign/core/Heading';
 import {api, errorMessage, type Connection, type Folder} from '../api';
 import {FormActions, FormDrawerLayout} from '../shell/FormDrawer';
 import {PROTOCOLS, protocolInfo} from './protocols';
-import {changeProtocol, slugify, toConnection, type ConnectionForm} from './connectionForm';
-import ParameterInput from './ParameterInput';
+import {
+  changeProtocol,
+  clearSecret,
+  keepSecret,
+  secretState,
+  slugify,
+  toConnection,
+  type ConnectionForm,
+} from './connectionForm';
+import ParameterInput, {type StoredSecret} from './ParameterInput';
 import AdvancedSettings from './AdvancedSettings';
 import {folderOptions} from './tree';
 import RecordingSettings from './RecordingSettings';
@@ -35,6 +43,15 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
   // A new connection's id follows its name until the id is edited by hand.
   const changeName = (name: string) => update(isNew && !isIdEdited ? {name, id: slugify(name)} : {name});
   const protocol = protocolInfo(form.protocol);
+  const storedSecret = (name: string): StoredSecret | undefined => {
+    const state = secretState(form, name);
+    if (state === 'none') return undefined;
+    return {
+      state,
+      onClear: () => setForm(f => clearSecret(f, name)),
+      onKeep: () => setForm(f => keepSecret(f, name)),
+    };
+  };
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -116,6 +133,7 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
                 field={field}
                 value={form.fields[field.name] ?? ''}
                 onChange={value => update({fields: {...form.fields, [field.name]: value}})}
+                secret={storedSecret(field.name)}
               />
             ))}
           </VStack>
@@ -125,6 +143,7 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
           <JumpHostSettings
             fields={form.fields}
             onChange={(name, value) => update({fields: {...form.fields, [name]: value}})}
+            storedSecret={storedSecret}
           />
 
           <Divider />
@@ -133,7 +152,7 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
 
           <Divider />
 
-          <AdvancedSettings form={form} onChange={update} />
+          <AdvancedSettings form={form} onChange={update} storedSecret={storedSecret} />
         </VStack>
       </form>
     </FormDrawerLayout>

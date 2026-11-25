@@ -1,6 +1,10 @@
 import {describe, expect, test} from 'bun:test';
 import {
   changeProtocol,
+  clearSecret,
+  keepSecret,
+  otherStoredSecrets,
+  secretState,
   emptyConnectionForm,
   extraParameter,
   slugify,
@@ -99,6 +103,35 @@ describe('connection form', () => {
       mouse: true,
       molcajeteFormats: false,
     });
+  });
+
+  test('stored credentials are kept unless replaced or cleared', () => {
+    const stored = {...rdp, storedSecrets: ['password', 'sftp-password']};
+    const form = toConnectionForm(stored);
+    expect(secretState(form, 'password')).toBe('stored');
+    expect(secretState(form, 'username')).toBe('none');
+    expect(otherStoredSecrets(form)).toEqual(['sftp-password']);
+    // Saved untouched: nothing about them is sent, so the gateway keeps them.
+    expect(toConnection(form)).toEqual({ok: true, connection: rdp});
+
+    // A typed value replaces one; clearing removes one.
+    const replaced = {...form, fields: {...form.fields, password: 'new'}};
+    expect(toConnection(replaced)).toMatchObject({ok: true, connection: {parameters: {password: 'new'}}});
+    const cleared = clearSecret(replaced, 'sftp-password');
+    expect(secretState(cleared, 'sftp-password')).toBe('cleared');
+    expect(toConnection(cleared)).toMatchObject({ok: true, connection: {clearSecrets: ['sftp-password']}});
+    expect(toConnection(keepSecret(cleared, 'sftp-password'))).not.toMatchObject({
+      connection: {clearSecrets: expect.anything()},
+    });
+
+    // Clearing drops what was typed; typing again after clearing replaces.
+    const clearedPassword = clearSecret(replaced, 'password');
+    expect(clearedPassword.fields.password).toBeUndefined();
+    expect(toConnection(clearedPassword)).toMatchObject({ok: true, connection: {clearSecrets: ['password']}});
+    const retyped = {...clearedPassword, fields: {...clearedPassword.fields, password: 'again'}};
+    const result = toConnection(retyped);
+    expect(result).toMatchObject({ok: true, connection: {parameters: {password: 'again'}}});
+    expect(result.ok && result.connection.clearSecrets).toBeFalsy();
   });
 
   test('suggests URL-safe ids', () => {
