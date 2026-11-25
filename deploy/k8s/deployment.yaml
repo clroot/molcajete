@@ -48,6 +48,9 @@ spec:
             - name: config
               mountPath: /etc/molcajete
               readOnly: true
+            # The CPU profiler (--profiling) buffers samples in a temp file.
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             httpGet:
               path: /healthz
@@ -87,12 +90,16 @@ spec:
             - name: telemetry
               containerPort: 9101
           volumeMounts:
-            # ffmpeg (video encoders) may write temporary files.
+            # ffmpeg (video encoders) and the CPU profiler write temporary files.
             - name: tmp
               mountPath: /tmp
+          # 4822 listens on 127.0.0.1 only (the Guacamole protocol has no
+          # authentication), so the kubelet cannot reach it; probe the
+          # telemetry listener instead.
           readinessProbe:
-            tcpSocket:
-              port: 4822
+            httpGet:
+              path: /healthz
+              port: telemetry
             periodSeconds: 10
           securityContext:
             allowPrivilegeEscalation: false

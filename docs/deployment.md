@@ -74,7 +74,7 @@ curl -s http://127.0.0.1:9101/metrics | head      # molcajeted
 `deploy/nas-nginx.conf`와 `deploy/nas-nginx.upstream.inc`를 NAS의 `conf.d/`에 복사하고 도메인, Tailnet IP와 호스트명을 채운다. zot 설정과 다른 점은 다음과 같다.
 
 - `/websocket-tunnel`은 WebSocket upgrade 헤더를 넘기고, 버퍼링을 끄고, 1시간 idle timeout을 둔다.
-- `X-Forwarded-For`는 덧붙이지 않고 `$remote_addr`로 덮어쓴다. gateway는 첫 hop을 로그에 남긴다.
+- `X-Real-IP`와 `X-Forwarded-For`는 덧붙이지 않고 `$remote_addr`로 덮어쓴다. 중간의 Tailscale ingress는 `X-Forwarded-For`를 자기 peer 주소로 바꾸므로 gateway는 `X-Real-IP`를 먼저 로그에 남긴다.
 - 인증은 gateway의 `[[users]]`(Basic)가 맡는다. 외부에 공개하면 원격 데스크톱 전체가 이 비밀번호 하나에 달리므로, 긴 비밀번호를 쓰고 NAS에서 접근 IP를 제한하거나 앞단에 SSO를 두는 편이 안전하다.
 
 ## 관측 설정

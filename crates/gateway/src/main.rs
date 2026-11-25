@@ -125,15 +125,23 @@ async fn basic_auth(State(state): State<Arc<AppState>>, request: Request, next: 
     }
 }
 
-/// The browser's address: the first `X-Forwarded-For` hop when the gateway
-/// sits behind a reverse proxy, otherwise the TCP peer. Only used for logs.
+/// The browser's address as reported by a reverse proxy, otherwise the TCP
+/// peer. Only used for logs.
+///
+/// `X-Real-IP` (set by the edge proxy) wins over `X-Forwarded-For`: proxies
+/// in between, such as the Tailscale ingress, replace `X-Forwarded-For` with
+/// their own peer address but pass `X-Real-IP` through.
 fn client_address(headers: &HeaderMap, peer: SocketAddr) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    header("x-real-ip")
+        .or_else(|| header("x-forwarded-for"))
         .map_or_else(
             || peer.ip().to_string(),
             |v| format!("{v} (via {})", peer.ip()),
@@ -250,6 +258,17 @@ mod tests {
         assert_eq!(status(&app, "/").await, StatusCode::OK);
         assert_eq!(status(&app, "/healthz").await, StatusCode::OK);
         assert_eq!(status(&app, "/api/settings").await, StatusCode::OK);
+    }
+
+    #[test]
+    fn client_address_prefers_the_edge_proxy_header() {
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_address(&headers, peer), "10.0.0.2");
+        headers.insert("x-forwarded-for", "100.96.0.1, 10.0.0.1".parse().unwrap());
+        assert_eq!(client_address(&headers, peer), "100.96.0.1 (via 10.0.0.2)");
+        headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(client_address(&headers, peer), "203.0.113.7 (via 10.0.0.2)");
     }
 
     #[tokio::test]
