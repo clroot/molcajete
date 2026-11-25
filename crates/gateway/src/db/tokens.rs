@@ -36,6 +36,25 @@ pub struct NewApiToken<'a> {
     pub expires_at: i64,
 }
 
+/// A ticket taken by [`Database::redeem_ticket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTicket {
+    pub user_id: String,
+    pub connection_id: String,
+    /// JSON object of display parameters, if any.
+    pub parameters: Option<String>,
+    pub expires_at: i64,
+}
+
+pub struct NewSessionTicket<'a> {
+    pub ticket_hash: &'a str,
+    pub user_id: &'a str,
+    pub connection_id: &'a str,
+    pub token_id: Option<&'a str>,
+    pub parameters: Option<&'a str>,
+    pub expires_at: i64,
+}
+
 const COLUMNS: &str = "t.token_id, t.name, t.token_prefix, t.user_id, u.username, \
                        t.allowed_ips, t.created_at, t.expires_at, t.last_used_at, \
                        t.last_used_from";
@@ -178,6 +197,71 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+
+    pub async fn create_session_ticket(&self, new: NewSessionTicket<'_>) -> DbResult<()> {
+        let now = now_millis();
+        query!(
+            self,
+            "DELETE FROM molcajete_session_ticket WHERE expires_at <= ?"
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        query!(
+            self,
+            "INSERT INTO molcajete_session_ticket (ticket_hash, user_id, connection_id, token_id, \
+             parameters, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(new.ticket_hash)
+        .bind(new.user_id)
+        .bind(new.connection_id)
+        .bind(new.token_id)
+        .bind(new.parameters)
+        .bind(now)
+        .bind(new.expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(DbError::from_sqlx)?;
+        Ok(())
+    }
+
+    /// The unused, unexpired ticket with this hash, leaving it in place.
+    pub async fn session_ticket(&self, ticket_hash: &str) -> DbResult<SessionTicket> {
+        let row = query!(
+            self,
+            "SELECT user_id, connection_id, parameters, expires_at \
+             FROM molcajete_session_ticket WHERE ticket_hash = ? AND expires_at > ?"
+        )
+        .bind(ticket_hash)
+        .bind(now_millis())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(DbError::from_sqlx)?;
+        Ok(SessionTicket {
+            user_id: row.try_get("user_id")?,
+            connection_id: row.try_get("connection_id")?,
+            parameters: row.try_get("parameters")?,
+            expires_at: row.try_get("expires_at")?,
+        })
+    }
+
+    /// Takes the ticket: it is deleted, so only one caller (on any
+    /// replica) gets it. [`DbError::NotFound`] when it is unknown, used or
+    /// expired.
+    pub async fn redeem_ticket(&self, ticket_hash: &str) -> DbResult<SessionTicket> {
+        let ticket = self.session_ticket(ticket_hash).await?;
+        let deleted = query!(
+            self,
+            "DELETE FROM molcajete_session_ticket WHERE ticket_hash = ?"
+        )
+        .bind(ticket_hash)
+        .execute(&self.pool)
+        .await?;
+        if deleted.rows_affected() != 1 || ticket.expires_at <= now_millis() {
+            return Err(DbError::NotFound);
+        }
+        Ok(ticket)
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +271,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn tokens_follow_their_owner() {
+    async fn tokens_follow_their_owner_and_tickets_are_used_once() {
         for (db, _dir) in every_backend().await {
             let name = db.dialect().name();
             let user = db
@@ -243,7 +327,55 @@ mod tests {
             assert_eq!(touched.last_used_at, Some(7), "{name}");
             assert_eq!(touched.last_used_from.as_deref(), Some("c"), "{name}");
 
+            db.create_connection(&super::super::ConnectionRecord {
+                id: "desk".into(),
+                name: "Desk".into(),
+                protocol: "vnc".into(),
+                guacd_host: None,
+                guacd_port: None,
+                guacd_handshake_timeout: None,
+                parameters: Default::default(),
+                stored_secrets: Default::default(),
+                clear_secrets: Default::default(),
+                parent_id: None,
+                attributes: Default::default(),
+            })
+            .await
+            .unwrap();
+            fn ticket<'a>(
+                hash: &'a str,
+                user_id: &'a str,
+                token_id: Option<&'a str>,
+                expires_at: i64,
+            ) -> NewSessionTicket<'a> {
+                NewSessionTicket {
+                    ticket_hash: hash,
+                    user_id,
+                    connection_id: "desk",
+                    token_id,
+                    parameters: Some(r#"{"dpi":"96"}"#),
+                    expires_at,
+                }
+            }
+            db.create_session_ticket(ticket("once", &user.id, None, far))
+                .await
+                .unwrap();
+            db.create_session_ticket(ticket("stale", &user.id, None, now_millis() - 1))
+                .await
+                .unwrap();
+            db.create_session_ticket(ticket("by-token", &user.id, Some(&token.id), far))
+                .await
+                .unwrap();
+            let taken = db.redeem_ticket("once").await.unwrap();
+            assert_eq!(taken.connection_id, "desk", "{name}");
+            assert_eq!(taken.parameters.as_deref(), Some(r#"{"dpi":"96"}"#));
+            assert!(db.redeem_ticket("once").await.is_err(), "{name}");
+            assert!(db.redeem_ticket("stale").await.is_err(), "{name}");
+            assert!(db.session_ticket("by-token").await.is_ok(), "{name}");
+
+            // Revoking the token takes its tickets with it.
             db.delete_api_token(&token.id).await.unwrap();
+            assert!(db.redeem_ticket("by-token").await.is_err(), "{name}");
             assert!(
                 matches!(db.delete_api_token(&token.id).await, Err(DbError::NotFound)),
                 "{name}"

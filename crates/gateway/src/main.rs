@@ -20,6 +20,7 @@ mod secrets;
 mod sensitive;
 mod sessions;
 mod throttle;
+mod tickets;
 #[cfg(test)]
 mod token_flow_tests;
 mod tokens;
@@ -122,29 +123,45 @@ async fn websocket_tunnel(
     RawQuery(query): RawQuery,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !auth::same_origin(&headers) {
-        return ApiError::new(StatusCode::FORBIDDEN, "Cross-origin tunnel refused.")
-            .into_response();
-    }
-    let user = match auth::user_from_headers(&state, &headers).await {
-        Ok(user) => user,
-        Err(err) => return err.into_response(),
+    let query = query.as_deref().unwrap_or("");
+    let mut request = tunnel::TunnelRequest::from_query(query);
+    let address =
+        proxy::resolve(&headers, Some(peer), &state.config.server.trusted_proxies).display;
+    // A one-time session link stands in for the session cookie (and so
+    // for the same-origin check that protects it).
+    let (user, connection) = if let Some(ticket) = tickets::from_query(query) {
+        match tickets::redeem(&state, &ticket, &address).await {
+            Ok(redeemed) => {
+                request.connection = Some(redeemed.connection.id.clone());
+                request.overrides.extend(redeemed.parameters);
+                (redeemed.user, Some(redeemed.connection))
+            }
+            Err(err) => return err.into_response(),
+        }
+    } else {
+        if !auth::same_origin(&headers) {
+            return ApiError::new(StatusCode::FORBIDDEN, "Cross-origin tunnel refused.")
+                .into_response();
+        }
+        let user = match auth::user_from_headers(&state, &headers).await {
+            Ok(user) => user,
+            Err(err) => return err.into_response(),
+        };
+        let connection = match request.connection.as_deref() {
+            Some(id) => match state.db.connection_for_user(id, &user).await {
+                Ok(c) => Some(c),
+                Err(DbError::NotFound) => None,
+                Err(err) => return ApiError::from(err).into_response(),
+            },
+            None => None,
+        };
+        (user, connection)
     };
-    let mut request = tunnel::TunnelRequest::from_query(query.as_deref().unwrap_or(""));
-    let client = proxy::resolve(&headers, Some(peer), &state.config.server.trusted_proxies);
-    request.peer = Some(client.display);
+    request.peer = Some(address);
     request.user = Some(recording::RecordedUser {
         id: user.id.clone(),
         username: user.username.clone(),
     });
-    let connection = match request.connection.as_deref() {
-        Some(id) => match state.db.connection_for_user(id, &user).await {
-            Ok(c) => Some(c),
-            Err(DbError::NotFound) => None,
-            Err(err) => return ApiError::from(err).into_response(),
-        },
-        None => None,
-    };
     // Our own client offers the binary subprotocol next to `guacamole`;
     // the first one listed here that the client offered is selected.
     let protocols: &[&'static str] = if state.config.server.binary_tunnel {
@@ -208,6 +225,8 @@ fn router(state: Arc<AppState>) -> Router {
                 .delete(api::delete_connection),
         )
         .route("/connections/{id}/parent", put(api::move_connection))
+        .route("/connections/{id}/tickets", post(tickets::create))
+        .route("/tickets/{ticket}", get(tickets::info))
         .route("/tokens", get(tokens::list).post(tokens::create))
         .route("/tokens/{id}", delete(tokens::revoke))
         .route(

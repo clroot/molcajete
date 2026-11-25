@@ -39,7 +39,7 @@ pub use groups::{Group, GroupUpdate};
 pub use history::{HistoryEntry, HistoryFilter};
 pub use oidc::PendingLogin;
 pub use recordings::Recording;
-pub use tokens::{ApiToken, NewApiToken};
+pub use tokens::{ApiToken, NewApiToken, NewSessionTicket};
 pub use users::{NewUser, Role, User, UserUpdate};
 
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("migrations/sqlite");

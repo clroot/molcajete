@@ -79,7 +79,7 @@ pub struct TunnelRequest {
 /// Whether a browser may set parameter `name` to `value` for its own
 /// session. Only how the remote desktop follows the window can be set,
 /// which the session menu changes during a session anyway.
-fn valid_override(name: &str, value: &str) -> bool {
+pub fn valid_override(name: &str, value: &str) -> bool {
     match name {
         "dpi" => value.is_empty() || value.parse::<u32>().is_ok_and(|d| (24..=1200).contains(&d)),
         "resize-method" => matches!(value, "" | "display-update"),

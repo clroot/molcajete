@@ -7,8 +7,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::Response;
+use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -173,6 +174,15 @@ impl App {
         let (status, body) = self.call(Method::GET, &path, As::Cookie(admin), None).await;
         assert_eq!(status, StatusCode::OK);
         body["entries"].as_array().unwrap().clone()
+    }
+
+    async fn serve(&self) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service =
+            router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, service).await });
+        addr
     }
 }
 
@@ -463,4 +473,178 @@ async fn tokens_follow_their_owner_and_allowlist() {
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A guacd that answers the handshake and reports the `connect`
+/// instruction it got.
+async fn fake_guacd() -> (u16, tokio::sync::mpsc::Receiver<Vec<String>>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut parser = molcajete_protocol::Parser::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    while let Some(ins) = parser.next_instruction().unwrap() {
+                        match ins.opcode.as_str() {
+                            "select" => sock
+                                .write_all(b"4.args,13.VERSION_1_5_0,8.hostname,3.dpi;")
+                                .await
+                                .unwrap(),
+                            "connect" => {
+                                sock.write_all(b"5.ready,5.$abcd;").await.unwrap();
+                                tx.send(ins.args.clone()).await.unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => parser.feed(&buf[..n]),
+                    }
+                }
+            });
+        }
+    });
+    (port, rx)
+}
+
+#[tokio::test]
+async fn ticket_links_open_a_session_once() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let (guacd_port, mut connects) = fake_guacd().await;
+    let app = app(guacd_port).await;
+    let admin = app.login("admin", "admin-password").await;
+    let bob = app.login("bob", "bob-password").await;
+    let (token, _) = app.token(&bob, "portal", &[]).await;
+    let bearer = As::Token(&token);
+
+    let tickets = "/api/connections/granted/tickets";
+    let (status, _) = app
+        .call(
+            Method::POST,
+            "/api/connections/secret/tickets",
+            bearer,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = app
+        .call(
+            Method::POST,
+            tickets,
+            bearer,
+            Some(json!({ "parameters": { "password": "x" } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, created) = app
+        .call_with(
+            Method::POST,
+            tickets,
+            bearer,
+            Some(json!({ "parameters": { "dpi": "120" } })),
+            &[("host", "gw.test"), ("x-forwarded-proto", "https")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let ticket = created["ticket"].as_str().unwrap().to_owned();
+    assert_eq!(created["url"], format!("https://gw.test/#/ticket/{ticket}"));
+    assert!(created["expiresAt"].as_i64().unwrap() <= now_millis() + 60_000);
+
+    // The page learns what it opens without signing in.
+    let (status, info) = app
+        .call(
+            Method::GET,
+            &format!("/api/tickets/{ticket}"),
+            As::Cookie(""),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["name"], "Granted desk");
+    assert_eq!(info["protocol"], "rdp");
+    assert_eq!(info["dpi"], "120");
+
+    let addr = app.serve().await;
+    let open = |ticket: &str| {
+        let mut request = format!("ws://{addr}/websocket-tunnel?connection=secret&ticket={ticket}")
+            .into_client_request()
+            .unwrap();
+        let headers: &mut HeaderMap = request.headers_mut();
+        headers.insert("sec-websocket-protocol", "guacamole".parse().unwrap());
+        // Embedded in another site's page, without a cookie.
+        headers.insert("origin", "https://portal.test".parse().unwrap());
+        tokio_tungstenite::connect_async(request)
+    };
+    let (mut socket, _) = open(&ticket).await.unwrap();
+    let connect = tokio::time::timeout(std::time::Duration::from_secs(10), connects.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // The ticket's connection (not the one in the URL) with its display
+    // parameters.
+    assert_eq!(connect[2], "120", "{connect:?}");
+    let first = socket.next().await.unwrap().unwrap();
+    assert!(first.to_text().unwrap().starts_with("0.,36."), "{first:?}");
+    drop(socket);
+
+    // Once only.
+    match open(&ticket).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        other => panic!("expected 404, got {other:?}"),
+    }
+    let (status, _) = app
+        .call(
+            Method::GET,
+            &format!("/api/tickets/{ticket}"),
+            As::Cookie(""),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Expired.
+    let stale = "stale-ticket";
+    let bob_id = app.audit(&admin, "ticket.create").await[0]["actorId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    app.state
+        .db
+        .create_session_ticket(db::NewSessionTicket {
+            ticket_hash: &auth::token_hash(stale),
+            user_id: &bob_id,
+            connection_id: "granted",
+            token_id: None,
+            parameters: None,
+            expires_at: now_millis() - 1,
+        })
+        .await
+        .unwrap();
+    assert!(open(stale).await.is_err());
+
+    // Without a ticket, the tunnel still wants a session and our origin.
+    assert!(open("").await.is_err());
+
+    // With a session, the page can make one too.
+    let (status, _) = app
+        .call(Method::POST, tickets, As::Cookie(&bob), Some(json!({})))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let created = app.audit(&admin, "ticket.create").await;
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[1]["targetId"], "granted");
+    let used = app.audit(&admin, "ticket.use").await;
+    assert_eq!(used.len(), 1);
+    assert_eq!(used[0]["actorName"], "bob");
 }
