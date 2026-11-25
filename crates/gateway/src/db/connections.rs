@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
 use sqlx::any::AnyRow;
 
-use super::{Database, DbError, DbResult, now_millis, query};
+use super::grants::REACHABLE;
+use super::{Database, DbError, DbResult, User, now_millis, query};
 
 /// A connection with all of its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,6 +25,11 @@ pub struct ConnectionRecord {
     /// Protocol parameters sent in the `connect` instruction.
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+    /// The folder it is in; `None` at the top level. Set when creating;
+    /// [`Database::update_connection`] leaves it alone (see
+    /// [`Database::move_connection`]).
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 /// What the connection list shows; no secrets.
@@ -37,6 +43,8 @@ pub struct ConnectionSummary {
     pub port: Option<String>,
     pub guacd_host: Option<String>,
     pub guacd_port: Option<u16>,
+    /// The folder it is in; `None` at the top level.
+    pub parent_id: Option<String>,
     /// Display parameters the session page starts from (RDP).
     pub dpi: Option<String>,
     pub resize_method: Option<String>,
@@ -49,14 +57,11 @@ fn guacd_port(row: &AnyRow) -> Result<Option<u16>, sqlx::Error> {
 }
 
 impl Database {
-    /// Connections visible to a user: all of them for administrators,
-    /// otherwise those granted to `user_id`.
-    pub async fn connection_summaries(
-        &self,
-        user_id: &str,
-        is_admin: bool,
-    ) -> DbResult<Vec<ConnectionSummary>> {
+    /// Connections visible to a user: all of them for connection managers
+    /// and administrators, otherwise those reachable through grants.
+    pub async fn connection_summaries(&self, user: &User) -> DbResult<Vec<ConnectionSummary>> {
         let select = "SELECT c.connection_id, c.name, c.protocol, c.guacd_host, c.guacd_port, \
+                      c.parent_id, \
                       h.parameter_value AS hostname, p.parameter_value AS port, \
                       d.parameter_value AS dpi, r.parameter_value AS resize_method \
                       FROM molcajete_connection c \
@@ -69,17 +74,19 @@ impl Database {
                       LEFT JOIN molcajete_connection_parameter r \
                         ON r.connection_id = c.connection_id \
                         AND r.parameter_name = 'resize-method'";
-        let rows = if is_admin {
+        let rows = if user.effective_role.can_manage_connections() {
             let sql = format!("{select} ORDER BY c.name, c.connection_id");
             query!(self, &sql).fetch_all(&self.pool).await?
         } else {
             let sql = format!(
-                "{select} JOIN molcajete_connection_permission m \
-                   ON m.connection_id = c.connection_id AND m.user_id = ? \
+                "{REACHABLE} {select} \
+                 WHERE c.connection_id IN (SELECT connection_id FROM reachable) \
                  ORDER BY c.name, c.connection_id"
             );
             query!(self, &sql)
-                .bind(user_id)
+                .bind(&user.id)
+                .bind(&user.id)
+                .bind(&user.id)
                 .fetch_all(&self.pool)
                 .await?
         };
@@ -93,6 +100,7 @@ impl Database {
                     port: row.try_get("port")?,
                     guacd_host: row.try_get("guacd_host")?,
                     guacd_port: guacd_port(row)?,
+                    parent_id: row.try_get("parent_id")?,
                     dpi: row.try_get("dpi")?,
                     resize_method: row.try_get("resize_method")?,
                 })
@@ -104,7 +112,7 @@ impl Database {
     pub async fn connection(&self, id: &str) -> DbResult<ConnectionRecord> {
         let row = query!(
             self,
-            "SELECT connection_id, name, protocol, guacd_host, guacd_port \
+            "SELECT connection_id, name, protocol, guacd_host, guacd_port, parent_id \
              FROM molcajete_connection WHERE connection_id = ?"
         )
         .bind(id)
@@ -129,26 +137,24 @@ impl Database {
                 .iter()
                 .map(|r| Ok((r.try_get("parameter_name")?, r.try_get("parameter_value")?)))
                 .collect::<Result<_, sqlx::Error>>()?,
+            parent_id: row.try_get("parent_id")?,
         })
     }
 
-    /// The connection, if the user may open it.
-    pub async fn connection_for_user(
-        &self,
-        id: &str,
-        user_id: &str,
-        is_admin: bool,
-    ) -> DbResult<ConnectionRecord> {
-        if !is_admin {
-            let row = query!(
-                self,
-                "SELECT COUNT(*) AS n FROM molcajete_connection_permission \
-                 WHERE user_id = ? AND connection_id = ?"
-            )
-            .bind(user_id)
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
+    /// The connection, if the user may open it: connection managers and
+    /// administrators open every connection, other users those reachable
+    /// through a grant. [`DbError::NotFound`] otherwise.
+    pub async fn connection_for_user(&self, id: &str, user: &User) -> DbResult<ConnectionRecord> {
+        if !user.effective_role.can_manage_connections() {
+            let sql =
+                format!("{REACHABLE} SELECT COUNT(*) AS n FROM reachable WHERE connection_id = ?");
+            let row = query!(self, &sql)
+                .bind(&user.id)
+                .bind(&user.id)
+                .bind(&user.id)
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
             if row.try_get::<i64, _>("n")? == 0 {
                 return Err(DbError::NotFound);
             }
@@ -167,20 +173,26 @@ impl Database {
         Ok(row.try_get::<i64, _>("n")? > 0)
     }
 
+    /// Fails with [`DbError::Invalid`] when `c.parent_id` does not exist.
     pub async fn create_connection(&self, c: &ConnectionRecord) -> DbResult<ConnectionRecord> {
+        if let Some(parent) = &c.parent_id {
+            self.require_folder(parent).await?;
+        }
         let now = now_millis();
         let mut tx = self.pool.begin().await?;
         query!(
             self,
             "INSERT INTO molcajete_connection \
-             (connection_id, name, protocol, guacd_host, guacd_port, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+             (connection_id, name, protocol, guacd_host, guacd_port, parent_id, \
+              created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&c.id)
         .bind(&c.name)
         .bind(&c.protocol)
         .bind(c.guacd_host.as_deref())
         .bind(c.guacd_port.map(i64::from))
+        .bind(c.parent_id.as_deref())
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -192,7 +204,8 @@ impl Database {
         self.connection(&c.id).await
     }
 
-    /// Replaces the connection's fields and parameters. The id cannot change.
+    /// Replaces the connection's fields and parameters. The id and the
+    /// folder do not change.
     pub async fn update_connection(&self, c: &ConnectionRecord) -> DbResult<ConnectionRecord> {
         let mut tx = self.pool.begin().await?;
         let result = query!(
@@ -263,8 +276,8 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::super::NewUser;
     use super::super::tests::every_backend;
+    use super::super::{NewUser, Role};
     use super::*;
 
     fn record(id: &str, name: &str) -> ConnectionRecord {
@@ -279,6 +292,7 @@ mod tests {
                 ("port".into(), "5900".into()),
                 ("password".into(), "secret".into()),
             ]),
+            parent_id: None,
         }
     }
 
@@ -327,19 +341,25 @@ mod tests {
                 .create_user(NewUser {
                     username: "u",
                     password_hash: "h",
-                    is_admin: false,
+                    role: Role::User,
+                    disabled: false,
+                })
+                .await
+                .unwrap();
+            let manager = db
+                .create_user(NewUser {
+                    username: "m",
+                    password_hash: "h",
+                    role: Role::ConnectionManager,
                     disabled: false,
                 })
                 .await
                 .unwrap();
             assert!(
-                db.connection_summaries(&user.id, false)
-                    .await
-                    .unwrap()
-                    .is_empty(),
+                db.connection_summaries(&user).await.unwrap().is_empty(),
                 "{name}"
             );
-            let summaries = db.connection_summaries(&user.id, true).await.unwrap();
+            let summaries = db.connection_summaries(&manager).await.unwrap();
             assert_eq!(summaries.len(), 2, "{name}");
             assert_eq!(
                 (
@@ -369,28 +389,24 @@ mod tests {
                 ["desktop"],
                 "{name}"
             );
-            let list = db.connection_summaries(&user.id, false).await.unwrap();
+            let list = db.connection_summaries(&user).await.unwrap();
             assert_eq!(list.len(), 1, "{name}");
             assert_eq!(list[0].hostname.as_deref(), Some("10.0.0.5"), "{name}");
             assert_eq!(list[0].port.as_deref(), Some("5900"), "{name}");
             assert_eq!(list[0].guacd_port, Some(4823), "{name}");
             assert!(
-                db.connection_for_user("desktop", &user.id, false)
-                    .await
-                    .is_ok(),
+                db.connection_for_user("desktop", &user).await.is_ok(),
                 "{name}"
             );
             assert!(
                 matches!(
-                    db.connection_for_user("another", &user.id, false).await,
+                    db.connection_for_user("another", &user).await,
                     Err(DbError::NotFound)
                 ),
                 "{name}"
             );
             assert!(
-                db.connection_for_user("another", &user.id, true)
-                    .await
-                    .is_ok(),
+                db.connection_for_user("another", &manager).await.is_ok(),
                 "{name}"
             );
 

@@ -101,11 +101,7 @@ async fn websocket_tunnel(
     request.peer = Some(client_address(&headers, peer));
     request.user = Some(user.username.clone());
     let connection = match request.connection.as_deref() {
-        Some(id) => match state
-            .db
-            .connection_for_user(id, &user.id, user.is_admin)
-            .await
-        {
+        Some(id) => match state.db.connection_for_user(id, &user).await {
             Ok(c) => Some(c),
             Err(DbError::NotFound) => None,
             Err(err) => return ApiError::from(err).into_response(),
@@ -193,12 +189,34 @@ fn router(state: Arc<AppState>) -> Router {
                 .put(api::update_connection)
                 .delete(api::delete_connection),
         )
+        .route("/connections/{id}/parent", put(api::move_connection))
+        .route(
+            "/connections/{id}/access",
+            get(api::get_connection_access).put(api::set_connection_access),
+        )
+        .route("/folders", get(api::list_folders).post(api::create_folder))
+        .route(
+            "/folders/{id}",
+            put(api::rename_folder).delete(api::delete_folder),
+        )
+        .route("/folders/{id}/parent", put(api::move_folder))
+        .route(
+            "/folders/{id}/access",
+            get(api::get_folder_access).put(api::set_folder_access),
+        )
         .route("/users", get(api::list_users).post(api::create_user))
         .route(
             "/users/{id}",
             get(api::get_user)
                 .put(api::update_user)
                 .delete(api::delete_user),
+        )
+        .route("/groups", get(api::list_groups).post(api::create_group))
+        .route(
+            "/groups/{id}",
+            get(api::get_group)
+                .put(api::update_group)
+                .delete(api::delete_group),
         )
         .route("/settings", get(client_settings))
         .route(
@@ -348,7 +366,7 @@ mod tests {
             .create_user(db::NewUser {
                 username: "bob",
                 password_hash: &auth::hash_password("bob-password").unwrap(),
-                is_admin: false,
+                role: db::Role::User,
                 disabled: false,
             })
             .await
@@ -695,6 +713,396 @@ mod tests {
             panic!("expected close, got {message:?}");
         };
         assert_eq!(frame.reason.as_str(), "516");
+    }
+
+    impl TestApp {
+        /// Sends `body` as admin and returns the JSON answer, asserting the
+        /// status.
+        async fn call(
+            &self,
+            cookie: &str,
+            method: Method,
+            path: &str,
+            body: serde_json::Value,
+            expected: StatusCode,
+        ) -> serde_json::Value {
+            let response = self.json(method.clone(), path, Some(cookie), body).await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                expected,
+                "{method} {path}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        }
+
+        /// Ids of the connections `cookie`'s user sees, sorted.
+        async fn visible(&self, cookie: &str) -> Vec<String> {
+            let list = body_json(self.get("/api/connections", Some(cookie)).await).await;
+            let mut ids: Vec<String> = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        /// Serves the gateway on a local port for WebSocket tests.
+        async fn serve(&self) -> SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let service =
+                router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+            tokio::spawn(async move { axum::serve(listener, service).await });
+            addr
+        }
+    }
+
+    /// The status the tunnel to `connection` closes with, as `cookie`.
+    async fn tunnel_close_status(addr: SocketAddr, connection: &str, cookie: &str) -> String {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let mut request = format!("ws://{addr}/websocket-tunnel?connection={connection}")
+            .into_client_request()
+            .unwrap();
+        let headers = request.headers_mut();
+        headers.insert("sec-websocket-protocol", "guacamole".parse().unwrap());
+        headers.insert("cookie", cookie.parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        loop {
+            match socket.next().await.unwrap().unwrap() {
+                tokio_tungstenite::tungstenite::Message::Close(Some(frame)) => {
+                    return frame.reason.to_string();
+                }
+                tokio_tungstenite::tungstenite::Message::Text(_) => continue,
+                other => panic!("expected close, got {other:?}"),
+            }
+        }
+    }
+
+    const NOT_FOUND: &str = "516";
+    /// Allowed, but the test's guacd port is closed.
+    const ALLOWED: &str = "519";
+
+    #[tokio::test]
+    async fn groups_and_folders_grant_connections() {
+        // Port 1: nothing listens, so an allowed tunnel fails upstream.
+        let app = app_with("[guacd]\nhost = \"127.0.0.1\"\nport = 1\n").await;
+        let admin = app.login("admin", "admin-password").await;
+        let (post, put) = (Method::POST, Method::PUT);
+
+        let databases = app
+            .call(
+                &admin,
+                post.clone(),
+                "/api/folders",
+                serde_json::json!({ "name": "Databases" }),
+                StatusCode::CREATED,
+            )
+            .await;
+        let databases = databases["id"].as_str().unwrap().to_owned();
+        let prod = app
+            .call(
+                &admin,
+                post.clone(),
+                "/api/folders",
+                serde_json::json!({ "name": "Prod", "parentId": databases }),
+                StatusCode::CREATED,
+            )
+            .await;
+        let prod = prod["id"].as_str().unwrap().to_owned();
+        for (id, parent) in [
+            ("pg", Some(&databases)),
+            ("mysql", Some(&prod)),
+            ("loose", None),
+        ] {
+            app.call(
+                &admin,
+                post.clone(),
+                "/api/connections",
+                serde_json::json!({ "id": id, "name": id, "protocol": "vnc", "parentId": parent }),
+                StatusCode::CREATED,
+            )
+            .await;
+        }
+
+        // carol may open `granted` herself; her group gets Databases.
+        let carol = app
+            .call(
+                &admin,
+                post.clone(),
+                "/api/users",
+                serde_json::json!({
+                    "username": "carol", "password": "carol-password", "connections": ["granted"]
+                }),
+                StatusCode::CREATED,
+            )
+            .await;
+        let carol_id = carol["id"].as_str().unwrap().to_owned();
+        let group = app
+            .call(
+                &admin,
+                post.clone(),
+                "/api/groups",
+                serde_json::json!({
+                    "name": "db-team", "members": [carol_id], "folders": [databases]
+                }),
+                StatusCode::CREATED,
+            )
+            .await;
+        assert_eq!(group["memberCount"], 1);
+        let group_path = format!("/api/groups/{}", group["id"].as_str().unwrap());
+
+        let cookie = app.login("carol", "carol-password").await;
+        assert_eq!(app.visible(&cookie).await, ["granted", "mysql", "pg"]);
+        let folders = body_json(app.get("/api/folders", Some(&cookie)).await).await;
+        assert_eq!(folders.as_array().unwrap().len(), 2);
+
+        let addr = app.serve().await;
+        assert_eq!(tunnel_close_status(addr, "mysql", &cookie).await, ALLOWED);
+        assert_eq!(tunnel_close_status(addr, "granted", &cookie).await, ALLOWED);
+        for refused in ["secret", "loose", "missing"] {
+            assert_eq!(tunnel_close_status(addr, refused, &cookie).await, NOT_FOUND);
+        }
+
+        // Moving a connection into a granted folder gives access; moving
+        // it out takes it away.
+        let into_prod = serde_json::json!({ "parentId": prod });
+        app.call(
+            &admin,
+            put.clone(),
+            "/api/connections/loose/parent",
+            into_prod,
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+        assert!(app.visible(&cookie).await.contains(&"loose".to_owned()));
+        assert_eq!(tunnel_close_status(addr, "loose", &cookie).await, ALLOWED);
+        let to_top = serde_json::json!({ "parentId": null });
+        app.call(
+            &admin,
+            put.clone(),
+            "/api/connections/loose/parent",
+            to_top,
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+        assert!(!app.visible(&cookie).await.contains(&"loose".to_owned()));
+        assert_eq!(tunnel_close_status(addr, "loose", &cookie).await, NOT_FOUND);
+
+        // Granting from the connection's side.
+        let access = "/api/connections/secret/access";
+        let granted = app
+            .call(
+                &admin,
+                put.clone(),
+                access,
+                serde_json::json!({ "users": [], "groups": [group["id"]] }),
+                StatusCode::OK,
+            )
+            .await;
+        assert_eq!(granted["groups"], serde_json::json!([group["id"]]));
+        assert!(app.visible(&cookie).await.contains(&"secret".to_owned()));
+        app.call(
+            &admin,
+            put.clone(),
+            access,
+            serde_json::json!({ "users": [], "groups": [] }),
+            StatusCode::OK,
+        )
+        .await;
+
+        // Leaving the group takes its connections away, not carol's own.
+        app.call(
+            &admin,
+            put.clone(),
+            &group_path,
+            serde_json::json!({ "members": [] }),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(app.visible(&cookie).await, ["granted"]);
+        assert_eq!(tunnel_close_status(addr, "mysql", &cookie).await, NOT_FOUND);
+        let detail = body_json(
+            app.get(&format!("/api/users/{carol_id}"), Some(&admin))
+                .await,
+        )
+        .await;
+        assert_eq!(detail["connections"], serde_json::json!(["granted"]));
+        assert_eq!(detail["groups"], serde_json::json!([]));
+        assert!(
+            body_json(app.get("/api/folders", Some(&cookie)).await)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn roles_limit_what_users_manage() {
+        let app = app().await;
+        let admin = app.login("admin", "admin-password").await;
+        let (post, put) = (Method::POST, Method::PUT);
+        let manager = app
+            .call(
+                &admin,
+                post.clone(),
+                "/api/users",
+                serde_json::json!({
+                    "username": "manny", "password": "manny-password", "role": "connection_manager"
+                }),
+                StatusCode::CREATED,
+            )
+            .await;
+        assert_eq!(
+            (manager["role"].as_str(), manager["isAdmin"].as_bool()),
+            (Some("connection_manager"), Some(false))
+        );
+        let bob_id = app.state.db.user_credentials("bob").await.unwrap().0.id;
+        let manny = app.login("manny", "manny-password").await;
+
+        // A connection manager sees every connection, manages connections
+        // and folders and grants them ...
+        assert_eq!(app.visible(&manny).await, ["granted", "secret"]);
+        let folder = app
+            .call(
+                &manny,
+                post.clone(),
+                "/api/folders",
+                serde_json::json!({ "name": "Team" }),
+                StatusCode::CREATED,
+            )
+            .await;
+        let folder_path = format!("/api/folders/{}", folder["id"].as_str().unwrap());
+        app.call(
+            &manny,
+            put.clone(),
+            &folder_path,
+            serde_json::json!({ "name": "Team 2" }),
+            StatusCode::OK,
+        )
+        .await;
+        app.call(
+            &manny,
+            put.clone(),
+            "/api/connections/secret/parent",
+            serde_json::json!({ "parentId": folder["id"] }),
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+        app.call(
+            &manny,
+            put.clone(),
+            &format!("{folder_path}/access"),
+            serde_json::json!({ "users": [bob_id], "groups": [] }),
+            StatusCode::OK,
+        )
+        .await;
+        let bob = app.login("bob", "bob-password").await;
+        assert_eq!(app.visible(&bob).await, ["granted", "secret"]);
+        assert_eq!(
+            app.get("/api/users", Some(&manny)).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.get("/api/groups", Some(&manny)).await.status(),
+            StatusCode::OK
+        );
+        // ... but not users, groups or roles.
+        let path = format!("/api/users/{bob_id}");
+        assert_eq!(
+            app.get(&path, Some(&manny)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        app.call(
+            &manny,
+            put.clone(),
+            &path,
+            serde_json::json!({ "role": "admin" }),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        app.call(
+            &manny,
+            post.clone(),
+            "/api/groups",
+            serde_json::json!({ "name": "x" }),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        // Users manage nothing.
+        app.call(
+            &bob,
+            post.clone(),
+            "/api/folders",
+            serde_json::json!({ "name": "x" }),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        assert_eq!(
+            app.get("/api/users", Some(&bob)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // A folder cannot go into itself.
+        app.call(
+            &manny,
+            put.clone(),
+            &format!("{folder_path}/parent"),
+            serde_json::json!({ "parentId": folder["id"] }),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+
+        // A group's role applies to its members.
+        let admins = app
+            .call(
+                &admin,
+                post.clone(),
+                "/api/groups",
+                serde_json::json!({ "name": "admins", "role": "admin", "members": [bob_id] }),
+                StatusCode::CREATED,
+            )
+            .await;
+        let me = body_json(app.get("/api/auth/me", Some(&bob)).await).await;
+        assert_eq!(
+            (
+                me["role"].as_str(),
+                me["effectiveRole"].as_str(),
+                me["isAdmin"].as_bool()
+            ),
+            (Some("user"), Some("admin"), Some(true))
+        );
+        assert_eq!(app.get(&path, Some(&bob)).await.status(), StatusCode::OK);
+
+        // Removing bob's group leaves admin as the only administrator, who
+        // cannot then remove their own role.
+        let admins_path = format!("/api/groups/{}", admins["id"].as_str().unwrap());
+        let delete = Request::delete(&admins_path)
+            .header(header::COOKIE, &admin)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.send(delete).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            app.get(&path, Some(&bob)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let me = body_json(app.get("/api/auth/me", Some(&admin)).await).await;
+        app.call(
+            &admin,
+            put.clone(),
+            &format!("/api/users/{}", me["id"].as_str().unwrap()),
+            serde_json::json!({ "role": "connection_manager" }),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
     }
 
     /// What a fake guacd saw: the `connect` instruction and everything the

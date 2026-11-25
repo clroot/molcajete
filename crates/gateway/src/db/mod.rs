@@ -1,5 +1,5 @@
-//! Storage for users, connections, permissions and login sessions, in the
-//! spirit of Guacamole's JDBC authentication extensions.
+//! Storage for users, groups, connections, folders, grants and login
+//! sessions, in the spirit of Guacamole's JDBC authentication extensions.
 //!
 //! One code path serves PostgreSQL, MySQL/MariaDB and SQLite through sqlx's
 //! `Any` driver. Queries are written with `?` placeholders and rewritten for
@@ -7,6 +7,9 @@
 //! are strings, so rows decode the same way on every backend.
 
 mod connections;
+mod folders;
+mod grants;
+mod groups;
 mod sessions;
 mod users;
 
@@ -20,11 +23,22 @@ use sqlx::any::AnyPoolOptions;
 use sqlx::migrate::Migrator;
 
 pub use connections::ConnectionRecord;
-pub use users::{NewUser, User, UserUpdate};
+pub use folders::Folder;
+pub use grants::{Access, Principal, Target};
+pub use groups::{Group, GroupUpdate};
+pub use users::{NewUser, Role, User, UserUpdate};
 
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("migrations/sqlite");
 static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("migrations/postgres");
 static MYSQL_MIGRATIONS: Migrator = sqlx::migrate!("migrations/mysql");
+
+fn migrator(dialect: Dialect) -> &'static Migrator {
+    match dialect {
+        Dialect::Sqlite => &SQLITE_MIGRATIONS,
+        Dialect::Postgres => &POSTGRES_MIGRATIONS,
+        Dialect::Mysql => &MYSQL_MIGRATIONS,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
@@ -62,6 +76,12 @@ pub enum DbError {
     NotFound,
     #[error("already exists")]
     Conflict,
+    /// The change would leave no enabled administrator; nothing changed.
+    #[error("the last administrator would be removed")]
+    LastAdmin,
+    /// The request does not make sense, e.g. a folder moved into itself.
+    #[error("{0}")]
+    Invalid(String),
     #[error(transparent)]
     Other(#[from] sqlx::Error),
 }
@@ -95,12 +115,7 @@ impl Database {
             .await
             .with_context(|| format!("connecting to the {} database", dialect.name()))?;
         let db = Self { pool, dialect };
-        let migrator = match dialect {
-            Dialect::Sqlite => &SQLITE_MIGRATIONS,
-            Dialect::Postgres => &POSTGRES_MIGRATIONS,
-            Dialect::Mysql => &MYSQL_MIGRATIONS,
-        };
-        migrator
+        migrator(dialect)
             .run(&db.pool)
             .await
             .context("applying database migrations")?;
@@ -180,11 +195,21 @@ pub(crate) mod tests {
     }
 
     async fn reset(db: &Database) {
+        query!(db, "UPDATE molcajete_connection_group SET parent_id = NULL")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         for table in [
             "molcajete_session",
             "molcajete_connection_permission",
+            "molcajete_connection_group_permission",
+            "molcajete_group_connection_permission",
+            "molcajete_group_connection_group_permission",
+            "molcajete_group_member",
+            "molcajete_group",
             "molcajete_connection_parameter",
             "molcajete_connection",
+            "molcajete_connection_group",
             "molcajete_user",
         ] {
             query!(db, &format!("DELETE FROM {table}"))
@@ -211,5 +236,124 @@ pub(crate) mod tests {
         assert_eq!(db.sql("a = ? AND b = ?"), "a = ? AND b = ?");
         db.dialect = Dialect::Postgres;
         assert_eq!(db.sql("a = ? AND b = ?"), "a = $1 AND b = $2");
+    }
+
+    /// Every table, children first.
+    const TABLES: &[&str] = &[
+        "molcajete_session",
+        "molcajete_connection_permission",
+        "molcajete_connection_group_permission",
+        "molcajete_group_connection_permission",
+        "molcajete_group_connection_group_permission",
+        "molcajete_group_member",
+        "molcajete_group",
+        "molcajete_connection_parameter",
+        "molcajete_connection",
+        "molcajete_connection_group",
+        "molcajete_user",
+        "_sqlx_migrations",
+    ];
+
+    /// The schema before roles, groups and folders.
+    const BEFORE_GROUPS: i64 = 20261125000000;
+
+    /// Data written by the first schema survives the later migrations:
+    /// administrators keep administering and grants keep granting.
+    #[tokio::test]
+    async fn migrates_existing_data() {
+        sqlx::any::install_default_drivers();
+        let dir = tempfile::tempdir().unwrap();
+        let mut urls = vec![Database::sqlite_url(&dir.path().join("old.db"))];
+        for var in ["MOLCAJETE_TEST_POSTGRES_URL", "MOLCAJETE_TEST_MYSQL_URL"] {
+            urls.extend(std::env::var(var).ok());
+        }
+        for url in urls {
+            let dialect = Dialect::from_url(&url).unwrap();
+            let name = dialect.name();
+            let pool = AnyPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap();
+            let old = Database {
+                pool: pool.clone(),
+                dialect,
+            };
+            if dialect == Dialect::Mysql {
+                query!(old, "SET FOREIGN_KEY_CHECKS = 0")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            for table in TABLES {
+                query!(old, &format!("DROP TABLE IF EXISTS {table}"))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            if dialect == Dialect::Mysql {
+                query!(old, "SET FOREIGN_KEY_CHECKS = 1")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            migrator(dialect)
+                .run_to(BEFORE_GROUPS, &pool)
+                .await
+                .unwrap();
+            for (id, username, is_admin) in [("u1", "root", 1), ("u2", "bob", 0)] {
+                query!(
+                    old,
+                    "INSERT INTO molcajete_user (user_id, username, password_hash, is_admin, \
+                     disabled, created_at, updated_at) VALUES (?, ?, 'h', ?, 0, 1, 1)"
+                )
+                .bind(id)
+                .bind(username)
+                .bind(is_admin as i64)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            for id in ["c1", "c2"] {
+                query!(
+                    old,
+                    "INSERT INTO molcajete_connection (connection_id, name, protocol, \
+                     created_at, updated_at) VALUES (?, ?, 'vnc', 1, 1)"
+                )
+                .bind(id)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            query!(
+                old,
+                "INSERT INTO molcajete_connection_permission (user_id, connection_id) \
+                 VALUES ('u2', 'c1')"
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+
+            let db = Database::open(&url, 2).await.unwrap();
+            let root = db.user("u1").await.unwrap();
+            let bob = db.user("u2").await.unwrap();
+            assert_eq!((root.role, root.is_admin), (Role::Admin, true), "{name}");
+            assert_eq!((bob.role, bob.is_admin), (Role::User, false), "{name}");
+            assert_eq!(
+                db.user_connection_ids("u2").await.unwrap(),
+                ["c1"],
+                "{name}"
+            );
+            assert_eq!(
+                db.reachable_connection_ids("u2").await.unwrap(),
+                ["c1"],
+                "{name}"
+            );
+            assert_eq!(db.connection("c2").await.unwrap().parent_id, None, "{name}");
+            assert!(db.list_groups().await.unwrap().is_empty(), "{name}");
+            assert!(db.list_folders().await.unwrap().is_empty(), "{name}");
+        }
     }
 }

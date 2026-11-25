@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use crate::auth;
 use crate::config::{Config, ConnectionConfig};
-use crate::db::{ConnectionRecord, Database, DbError, NewUser, UserUpdate};
+use crate::db::{ConnectionRecord, Database, DbError, NewUser, Role, UserUpdate};
 
 impl ConnectionConfig {
     pub fn to_record(&self) -> ConnectionRecord {
@@ -16,6 +16,7 @@ impl ConnectionConfig {
             guacd_host: self.guacd.as_ref().map(|g| g.host.clone()),
             guacd_port: self.guacd.as_ref().map(|g| g.port),
             parameters: self.parameters.clone(),
+            parent_id: None,
         }
     }
 }
@@ -33,7 +34,7 @@ pub async fn seed(db: &Database, config: &Config) -> anyhow::Result<()> {
         db.create_user(NewUser {
             username: &user.username,
             password_hash: &hash,
-            is_admin: true,
+            role: Role::Admin,
             disabled: false,
         })
         .await?;
@@ -54,7 +55,7 @@ pub async fn seed(db: &Database, config: &Config) -> anyhow::Result<()> {
         db.create_user(NewUser {
             username: "admin",
             password_hash: &hash,
-            is_admin: true,
+            role: Role::Admin,
             disabled: false,
         })
         .await?;
@@ -83,7 +84,7 @@ pub async fn set_password(db: &Database, username: &str, password: &str) -> anyh
                 &user.id,
                 UserUpdate {
                     password_hash: Some(&hash),
-                    is_admin: Some(true),
+                    role: Some(Role::Admin),
                     disabled: Some(false),
                     ..Default::default()
                 },
@@ -94,7 +95,7 @@ pub async fn set_password(db: &Database, username: &str, password: &str) -> anyh
             db.create_user(NewUser {
                 username,
                 password_hash: &hash,
-                is_admin: true,
+                role: Role::Admin,
                 disabled: false,
             })
             .await?;
