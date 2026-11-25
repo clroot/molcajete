@@ -12,13 +12,14 @@ written in Rust and compiled to WebAssembly.
 | Component | Replaces | Status |
 |---|---|---|
 | `molcajete-protocol` | protocol code in libguac / guacamole-common / guacamole-common-js | complete: streaming parser, encoder, typed instructions, video framing |
-| `molcajete-client` (wasm) | `guacamole-common-js` (`Guacamole.Client`, `Display`, `Keyboard`, `Mouse`, …) | WebGL2 renderer, WebCodecs video, input, clipboard, audio |
-| `molcajete-gateway` | the Java web application's tunnel (`guacamole-common`) | WebSocket tunnel, web UI, users/connections/permissions in PostgreSQL, MySQL or SQLite |
+| `molcajete-client` (wasm) | `guacamole-common-js` (`Guacamole.Client`, `Display`, `Keyboard`, `Mouse`, …) | WebGL2 renderer, WebCodecs video, input, clipboard, audio, recording playback |
+| `molcajete-gateway` | the Guacamole web application (`guacamole-common`, JDBC authentication, session recording) | WebSocket tunnel, web UI, users, groups, connections and grants in PostgreSQL, MySQL or SQLite, single sign-on, session recordings |
 | `molcajete-daemon` (`molcajeted`) | `guacd` + libguac + protocol plugins | VNC, SSH, RDP (incl. audio); video mode (AV1/H.265/H.264) for busy areas |
 
 The gateway is wire-compatible with the stock `guacd`, and accepts the same
 tunnel parameters as the stock JavaScript client, so the pieces can be mixed
-with an existing Guacamole deployment.
+with an existing Guacamole deployment: the gateway can serve some connections
+through stock guacd and others through molcajeted.
 
 ## Why a new client?
 
@@ -45,8 +46,36 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
   `VideoDecoder`, typically in hardware: 1/6–1/15 of the bandwidth of sending
   them as images. Once the area calms down it is refreshed losslessly.
 
-See [docs/architecture.md](docs/architecture.md) for the analysis of Apache
-Guacamole and the design of each component.
+## Features
+
+- **Remote desktops and terminals.** VNC, RDP and SSH through molcajeted or
+  stock guacd; Telnet and Kubernetes through stock guacd. RDP desktops can
+  follow the size of the browser window and take a display scale. The SSH
+  terminal is drawn by molcajeted with bundled DejaVu Sans Mono and a
+  NanumGothicCoding fallback, so Korean/CJK text works without fonts
+  installed (more with the `font-path` parameter), and has copy and paste
+  shortcuts and clickable links.
+- **Video mode.** molcajeted sends busy, colourful areas (video playback,
+  animations, 3D) as a video stream, encoded by hardware encoders through
+  `ffmpeg` (NVENC, QSV, VA-API, AMF), VideoToolbox on macOS, or software
+  encoders. Clients that cannot decode video, and lossless or SSH sessions,
+  get images.
+- **Leaner transport.** Between our client, the gateway and molcajeted,
+  image, video and audio data travel as raw bytes instead of base64 (about
+  25% fewer bytes), and lossless updates as zstd images the client decodes
+  in wasm. Each is negotiated, so stock clients and stock guacd keep working.
+- **Users, roles, groups and folders.** Users and user groups with three
+  roles (user, connection manager, administrator); connections in folders,
+  granted to users or groups, directly or by folder.
+- **Single sign-on** through any OpenID Connect provider (Keycloak,
+  Authentik, Entra ID, …), with roles and group memberships that can follow
+  the provider's groups.
+- **Session recordings** in Guacamole's format, for stock guacd and
+  molcajeted alike, played back in the browser with seeking, or turned into
+  video with `guacenc`.
+- **Observability.** JSON logs, Prometheus metrics for every stage of the
+  frame pipeline, CPU profiles for Pyroscope, performance reports from the
+  browser, and a Grafana dashboard.
 
 ## Quick start
 
@@ -69,125 +98,32 @@ cargo run -p molcajete-gateway -- --config gateway.toml
 # open http://127.0.0.1:8080 and sign in as admin / change-me
 ```
 
-### Users and connections
+The gateway keeps its users and connections in SQLite in the current
+directory unless `[database]` says otherwise. The connections in
+`gateway.example.toml` are imported on the first start; after that, manage
+them in the web UI.
 
-Like Guacamole's JDBC authentication, the gateway keeps users, groups,
-connections, folders, their parameters and permissions in a database,
-managed from the web UI (*Connections*, *Users* and *Groups*).
-
-- **Roles.** Each user and each group has one of three roles; a user's
-  role is the highest of their own and their groups':
-  - *User* opens the connections granted to them.
-  - *Connection manager* also opens every connection, creates, edits,
-    moves and deletes connections and folders, and grants them to users
-    and groups. Users, groups and roles are out of reach.
-  - *Administrator* does everything, including users, groups and roles.
-    At least one enabled administrator always remains.
-- **Groups.** Connections and folders can be granted to a group instead of
-  to each member. Removing someone from a group takes away what the group
-  gave them and leaves their own grants.
-- **Folders.** Connections live in a tree of folders. A grant on a folder
-  covers every connection below it, in subfolders too, so moving a
-  connection into or out of a folder changes who can open it. Deleting a
-  folder moves what it holds up one level.
-
-A user can open the union of the connections granted to them, to their
-groups, and below the folders granted to either; the tunnel refuses any
-other connection as unknown. Grants are set from the user or group drawer,
-or from a connection's or folder's *Access…* action.
-
-```toml
-[database]
-url = "postgres://molcajete:secret@db/molcajete"   # or mysql://… / mariadb://…
-```
-
-Without `[database]` (or `MOLCAJETE_DATABASE_URL`) the gateway uses SQLite in
-`server.data_dir` (`MOLCAJETE_DATA_DIR`, `/var/lib/molcajete` in the image).
-The schema is created and migrated on startup.
-
-`[[users]]` and `[[connections]]` in `gateway.toml` are imported once, when
-the name or id is not in the database yet. With no user at all, an `admin`
-account is created and its random password is logged. To recover access:
+To serve a connection with molcajeted instead of the stock guacd, run it and
+point the connection at it (*Advanced → guacd host / port* in the web UI, or
+`guacd = …` in `gateway.toml`):
 
 ```sh
-echo 'new-password' | molcajete-gateway --config gateway.toml set-password admin
+cargo run -p molcajete-daemon -- -l 4823
 ```
 
-People can also sign in through an OpenID Connect identity provider
-(Keycloak, Authentik, Entra ID, …) with an `[oidc]` section: users are created
-on their first sign-in, their roles and user groups can follow the provider's
-groups, and the password form can be turned off. See [single sign-on](docs/deployment.md#single-sign-on-openid-connect).
+`gateway.example.toml` defines `vnc-rs`, `ssh-rs` and `rdp-rs` this way, next
+to the stock-guacd `vnc`, `ssh` and `rdp` connections.
 
-### Session recordings
+For containers, Kubernetes and running molcajeted natively on macOS, see
+[docs/deployment.md](docs/deployment.md).
 
-Turn on *Record sessions* in a connection's settings and the gateway writes
-every session of it to a file in Guacamole's recording format, for stock
-guacd and molcajeted alike. Administrators find them under *Recordings*,
-where they can play them back in the browser (pause, 1×–8×, and seeking
-anywhere), download or delete them. Everyone else gets 403.
+## In a session
 
-- The mouse is recorded unless *Record the mouse* is off. Key presses are
-  recorded only with *Record key presses*, which records passwords typed
-  during the session too; the form warns about it and the list marks such
-  recordings.
-- Recorded sessions do not get molcajeted's zstd images and video streams,
-  so that the stock player and `guacenc` can play every recording; this
-  costs the bandwidth those formats save. *Keep molcajete's image and video
-  formats* lifts that for a connection whose recordings only molcajete
-  plays back.
-- `[recordings]` in `gateway.toml` sets the directory and the retention
-  (age and total size); see [deployment](docs/deployment.md#session-recordings).
-
-The web UI (`web/`) is React with the [Astryx](https://astryx.atmeta.com)
-design system. For UI work, run `SKIP_UI=1 scripts/build-web.sh` once and
-`bun run dev` in `web/`; it proxies the API and the tunnel to a gateway on
-127.0.0.1:8080. `bun run check` in `web/` runs the type check, ESLint,
-Prettier and the unit tests (`bun run format` fixes formatting).
-
-To use the Rust daemon instead of the stock guacd for a connection, run
-`cargo run -p molcajete-daemon -- -l 4823` and point the connection at it:
-
-```toml
-[[connections]]
-id = "vnc-rs"
-name = "VNC via molcajeted"
-protocol = "vnc"
-guacd = { host = "127.0.0.1", port = 4823 }
-[connections.parameters]
-hostname = "127.0.0.1"
-port = "5900"
-password = "secret"
-```
-
-`gateway.example.toml` also defines `ssh-rs` and `rdp-rs` (molcajeted) next to
-the stock-guacd `ssh` and `rdp` connections. The SSH terminal is rendered by
-molcajeted itself with bundled DejaVu Sans Mono and a built-in NanumGothicCoding
-fallback, so Korean/CJK text works without any fonts installed; more fonts
-can be supplied with the `font-path` parameter.
-
-### Video mode
-
-molcajeted sends busy, colourful areas (video playback, animations, 3D) as a
-video stream into a separate layer, using the first codec of `--video`
-(default `av1,h265,h264`) that both the browser can decode and the server can
-encode. Encoders come from `ffmpeg` (found in `PATH`, or `--ffmpeg <path>`),
-which runs as a child process: hardware encoders (NVENC, QSV, VA-API, AMF)
-when a trial encode works, otherwise libsvtav1, libx265 and libx264.
-Nothing is linked, so GPL encoders are fine. On macOS, H.265 and H.264 are
-encoded in hardware with VideoToolbox, called directly rather than through
-ffmpeg. Areas too large for software
-AV1 in real time fall back to H.265/H.264. `--features openh264` adds a
-built-in H.264 encoder (needs a C++ compiler). `--video none` always sends
-images. Lossless (`force-lossless`) and SSH sessions never use video, and
-neither do clients that don't announce `video/av1`, `video/h265` or
-`video/h264` (such as the stock JavaScript client).
-
-In a session, press **Ctrl+Alt+Shift** for the menu (clipboard, scaling,
-Ctrl+Alt+Del, performance statistics, disconnect). Append `?main` to the URL
-to run the client on the main thread instead of a worker, `?text` to keep
-the tunnel on the Guacamole text protocol (base64) instead of raw image, video
-and audio data, and `?png` to receive lossless updates as PNG instead of
-zstd images.
+Press **Ctrl+Alt+Shift** for the menu (clipboard, scaling, Ctrl+Alt+Del,
+performance statistics, disconnect). Append `?main` to the URL to run the
+client on the main thread instead of a worker, `?text` to keep the tunnel on
+the Guacamole text protocol (base64), and `?png` to receive lossless updates
+as PNG instead of zstd images.
 
 Embedding the client in another page:
 
@@ -198,24 +134,32 @@ session.set_event_handler((type, detail) => console.log(type, detail));
 session.connect(session.tunnel_url("wss://example.com/websocket-tunnel", "vnc"));
 ```
 
-## Deployment and observability
+## Documentation
 
-`Dockerfile` builds two images: `--target gateway` (with the wasm client)
-and `--target daemon` (molcajeted with ffmpeg). `deploy/` has a Docker
-Compose file, Kubernetes manifests, a reverse-proxy example and a Grafana
-Alloy configuration.
+- [docs/administration.md](docs/administration.md): users and passwords,
+  roles, groups, connections, folders and grants, single sign-on, session
+  recordings, the JSON API.
+- [docs/deployment.md](docs/deployment.md): images, Docker Compose,
+  Kubernetes, molcajeted on macOS, the configuration reference, reverse
+  proxies, upgrading.
+- [docs/observability.md](docs/observability.md): logs, metrics, profiles,
+  browser reports and finding bottlenecks.
+- [docs/architecture.md](docs/architecture.md): Apache Guacamole's design
+  and molcajete's, component by component, with measurements.
 
-Both binaries can write JSON logs (`--log-format json`). With
-`--telemetry-listen`, they also serve Prometheus metrics for every stage of
-the frame pipeline, and `--profiling` adds pprof CPU profiles for Pyroscope.
-The gateway can also collect performance reports from the browser
-(`--client-reports`). See [docs/deployment.md](docs/deployment.md).
+## Development
+
+The web UI (`web/`) is React with the [Astryx](https://astryx.atmeta.com)
+design system. For UI work, run `SKIP_UI=1 scripts/build-web.sh` once and
+`bun run dev` in `web/`; it proxies the API and the tunnel to a gateway on
+127.0.0.1:8080. `bun run check` in `web/` runs the type check, ESLint,
+Prettier and the unit tests (`bun run format` fixes formatting).
 
 ## Tests
 
 ```sh
 cargo test --workspace                       # unit tests (protocol, gateway, guacd, client logic)
-scripts/build-web.sh                         # then: renderer pixel, keyboard/IME and binary tunnel tests
+scripts/build-web.sh                         # then: renderer pixel, keyboard/IME, binary tunnel and playback tests
 (cd tests/browser && npm install && npm test)
 (cd tests/browser && node video.test.mjs)    # video decoding (needs ffmpeg with libx264/libsvtav1)
 ```
@@ -224,18 +168,18 @@ The browser tests feed Guacamole instructions directly into the wasm client in
 headless Chromium and compare layer/canvas pixels with what the HTML canvas
 reference implementation produces (composite modes including the "unbounded"
 ones, raster operations, overlapping copies, PNG alpha, clipping, paths,
-patterns, layer trees and frame atomicity).
+patterns, layer trees and frame atomicity). `playback.test.mjs` plays a
+recording with known frames and checks seeking and playing.
 
-`tests/browser/playback.test.mjs` (part of `npm test`) plays a recording with
-known frames and checks seeking and playing; `tests/browser/seek-bench.mjs
-<file.guac> [repeat]` repeats a real recording into an hour and times seeking
-through it.
+Benchmarks in `tests/browser`:
 
-`tests/browser/replay-bench.mjs` replays a recorded session into the stock
-guacamole-common-js client and into molcajete-client (main thread and worker) with
-identical timing and reports main-thread cost; set `GUAC_COMMON_JS` to the
-`guacamole-common-js/src/main/webapp/modules` directory of an Apache Guacamole
-checkout.
+- `replay-bench.mjs` replays a recorded session into the stock
+  guacamole-common-js client and into molcajete-client (main thread and
+  worker) with identical timing and reports main-thread cost; set
+  `GUAC_COMMON_JS` to the `guacamole-common-js/src/main/webapp/modules`
+  directory of an Apache Guacamole checkout.
+- `seek-bench.mjs <file.guac> [repeat]` repeats a real recording into an
+  hour and times seeking through it.
 
 ## License
 

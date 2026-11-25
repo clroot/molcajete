@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   molcajeted as a launchd agent, so it can use VideoToolbox (see
-  docs/deployment.md, "molcajeted on macOS"). Replace /Users/USER and copy to
+  docs/deployment.md, "molcajeted natively on macOS"). Replace /Users/USER and copy to
   ~/Library/LaunchAgents/, then:
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.molcajete.molcajeted.plist
 -->

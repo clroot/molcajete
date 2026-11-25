@@ -1,8 +1,8 @@
 //! GPU-accelerated Guacamole client for the browser.
 //!
 //! The protocol is parsed in WebAssembly, images are decoded off the main
-//! thread with `createImageBitmap`, and every layer lives in GPU memory as a
-//! WebGL2 texture. See `docs/architecture.md` for the overall design.
+//! thread with WebCodecs `ImageDecoder` (zstd images in wasm), and every
+//! layer lives in GPU memory as a WebGL2 texture. See `docs/architecture.md` for the overall design.
 
 pub mod audio;
 pub mod display;

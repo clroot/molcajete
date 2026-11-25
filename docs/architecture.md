@@ -1,6 +1,13 @@
 # molcajete: analysis and design
 
-This document analyses the structure of Apache Guacamole (server `guacamole-server`, client `guacamole-client`, main branch as of 2026-11) and describes how each molcajete component was designed from that analysis.
+This document analyses the structure of Apache Guacamole (server `guacamole-server`, client `guacamole-client`, main branch as of 2026-11) and describes the design of each molcajete component as it is now: what it does, why it is built that way, and what was measured.
+
+Operational detail lives elsewhere:
+
+- [README](../README.md): what molcajete is and a quick start
+- [deployment.md](deployment.md): running the components, the configuration reference, upgrading and how mixed versions behave
+- [administration.md](administration.md): users, roles, groups, folders, single sign-on and recordings from an administrator's point of view
+- [observability.md](observability.md): metrics, logs, profiling and finding bottlenecks
 
 ## 1. Apache Guacamole
 
@@ -21,7 +28,7 @@ browser ── HTTP/WebSocket ──▶ web application (Java) ── TCP 4822 �
 
 - Format: `LENGTH.VALUE` elements joined by `,` and terminated by `;`. Example: `4.size,1.0,4.1024,3.768;`
 - `LENGTH` counts **Unicode code points**, not bytes, in all three implementations (libguac, Java, JS).
-- Limits: 8192 per instruction, 128 elements, 5 digits of length (libguac `parser-constants.h`, Java `GuacamoleParser`). One blob carries at most 6048 bytes of raw data.
+- Limits: 8192 code points per instruction, 128 elements, 5 digits of length (libguac `parser-constants.h`, Java `GuacamoleParser`). One `blob` carries at most 6048 bytes of raw data.
 - Versions: `VERSION_1_0_0`, `1_1_0` (timezone, handshake in any order), `1_3_0` (`required`), `1_5_0` (`name`, `msg`). guacd 1.6 also uses `VERSION_1_5_0`.
 
 Handshake (web app ↔ guacd):
@@ -45,7 +52,7 @@ Main instruction groups:
 
 - Subprotocol `guacamole`, text messages only. Each message holds complete instructions only.
 - The first message is `0.,36.<tunnel UUID>;` (an internal instruction with an empty opcode).
-- The client sends `0.,4.ping,<ts>;` every 500 ms and the server echoes it; it never reaches guacd.
+- The client sends `0.,4.ping,<ts>;` and the server echoes it; it never reaches guacd.
 - On termination the WebSocket close reason carries the Guacamole status code (decimal).
 
 ### 1.3 Rendering in the stock JS client, and its limits
@@ -65,138 +72,77 @@ Known bug: setting a cursor of the same size draws it over the previous one (`se
 
 Going through the whole guacd source, screen updates consist almost entirely of `img` (PNG/JPEG/WebP) + `copy` + `rect`/`cfill` + `size`/`move`/`shade`/`dispose` + `cursor` + `sync`. Path instructions (`arc`/`curve`/`clip`/`cstroke`, ...) exist in the protocol but no guacd plugin uses them. The composite modes in use are OVER, SRC (cursor, terminal selection), ROUT (clearing transparent layers) and RATOP (emptying buffers with a transparent colour).
 
-## 2. molcajete
+## 2. molcajete at a glance
+
+```
+browser                                  gateway (Rust, axum)                     molcajeted (Rust, tokio)
+┌───────────────────────────────┐        ┌──────────────────────────────┐        ┌─────────────────────────────┐
+│ web UI (React + Astryx)       │  HTTP  │ JSON API, static files       │        │ handshake, one task per     │
+│ molcajete.js  ── page side    │◀──────▶│ auth: sessions, OIDC         │        │ connection                  │
+│ molcajete-worker.js           │        │ authorization: roles, grants │  TCP   │ server-side display, diff,  │
+│   molcajete-client (wasm):    │  WS    │ tunnel relay ────────────────┼───────▶│ encoding, pacing, video     │──▶ VNC / SSH / RDP
+│   tunnel, parser, WebGL2,     │◀──────▶│ recording, retention         │  4822  │                             │
+│   WebCodecs, input            │        │ SQLite / PostgreSQL / MySQL  │        │ (or stock guacd)            │
+└───────────────────────────────┘        └──────────────────────────────┘        └─────────────────────────────┘
+```
 
 ```
 crates/
-  molcajete-protocol   shared protocol (platform independent): streaming parser, encoder, status codes, typed instructions, video framing, binary tunnel framing, zstd image format
-  molcajete-client     wasm client: WebGL2 renderer, WebCodecs video, input, audio, clipboard, WebSocket tunnel
-  molcajete-gateway    Rust web gateway: static files, connection list API, WebSocket ↔ guacd relay
-  molcajete-daemon     Rust guacd (molcajeted): handshake, server-side display/encoding, video mode, VNC·SSH·RDP (+audio)
-  molcajete-telemetry  logging, Prometheus metrics and CPU profiling for the gateway and molcajeted
-web/              React + Astryx UI (login, connections, users, session view, Ctrl+Alt+Shift menu);
-                  public/ holds the wasm client glue (molcajete.js, worker, pkg/)
-tests/browser/    headless Chromium pixel tests
-docker/           test targets (guacd 1.6, X11+VNC, OpenSSH, xrdp+XFCE on 127.0.0.1:3390)
-deploy/           container deployment (Compose, Kubernetes, reverse proxy, Grafana), see deployment.md
+  protocol    molcajete-protocol: parser, encoder, status codes, typed instructions, video framing,
+              binary record framing, zstd image format, apply-time reports (no platform dependencies)
+  client      molcajete-client: the wasm client (WebGL2 renderer, WebCodecs, input, audio, tunnel, playback)
+  gateway     molcajete-gateway: web server, API, authentication, WebSocket ↔ guacd relay, recording
+  daemon      molcajete-daemon, binary molcajeted: a guacd replacement for VNC, SSH and RDP
+  telemetry   molcajete-telemetry: logging, Prometheus metrics, CPU profiling (gateway and molcajeted)
+web/          React + Astryx UI; web/public holds the client glue (molcajete.js, molcajete-worker.js,
+              molcajete-player.js) next to the built wasm package (pkg/)
+tests/browser headless Chromium tests and benchmarks
+docker/       test targets (guacd 1.6, X11 over VNC, OpenSSH, xrdp on 127.0.0.1:3390, Keycloak)
+deploy/       Compose, Kubernetes, launchd and reverse proxy files (see deployment.md)
 ```
 
-Possible combinations:
+Every component speaks the Guacamole protocol to its neighbours, so each can be replaced by its stock counterpart:
 
 | Browser | Gateway | Daemon |
 |---|---|---|
 | molcajete-client (wasm) | molcajete-gateway | stock guacd or molcajeted |
-| stock guacamole-common-js | molcajete-gateway (accepts the `GUAC_*` parameters) | stock guacd or molcajeted |
-| stock web app | Java web app | molcajeted (compatible handshake) |
+| stock guacamole-common-js | molcajete-gateway (accepts the `GUAC_*` tunnel parameters) | stock guacd or molcajeted |
+| stock web app | Java web app | molcajeted (compatible handshake and parameter names) |
 
-Between molcajete components, stream data (images, video, audio) travels as raw bytes instead of base64 (section 2.6); every combination with a stock component uses the text protocol on that leg. When the browser runs molcajete-client and the daemon is molcajeted, lossless images are zstd images instead of PNG (section 2.7), and frames are paced by the time the client reports it needs to apply them (section 2.9), whatever the gateway.
+Between molcajete components a few extensions are used. Each is offered in a way a stock peer ignores, and each falls back to plain Guacamole when the other side does not take it:
 
-### 2.1 molcajete-protocol
+| Extension | How it is offered | Who acts on it | Without it |
+|---|---|---|---|
+| Binary tunnel (section 3.3, 5.3) | WebSocket subprotocol `molcajete-binary-v1`; connection parameter `molcajete-binary` listed last in `args` | gateway, molcajeted | base64 `blob` instructions in text messages |
+| zstd images (section 3.5) | mimetype `image/x-molcajete-zstd-v1` in the handshake's `image` | molcajeted | PNG |
+| Video streams (section 6.5) | `video/av1`, `video/h265`, `video/h264` in the handshake's `video` | molcajeted | images only |
+| Apply-time reports (section 3.6) | `apply-us` as an extra argument of `sync` | molcajete client | pacing by round trip |
+| `display-control` (section 4.8) | instruction sent by molcajeted's RDP sessions | molcajete web UI | menu items stay enabled; changes apply at the next connection |
+| `link`, `selection` (section 4.7) | instructions sent by molcajeted's SSH terminal | molcajete web UI | no link opening; copy shortcut uses the last selection |
+| Per-browser display parameters (section 4.8) | `param.dpi`, `param.resize-method` in the tunnel URL | gateway | the connection's own values |
 
-- Incremental byte-level parser. It copes with TCP/WebSocket boundaries in the middle of an instruction or a UTF-8 sequence, and keeps its state so that each byte is looked at once. ASCII runs are skipped in bulk (blobs are mostly base64, so this is fast).
-- `RawInstruction`: a zero-copy view borrowing the parser buffer. The gateway only uses it to find instruction boundaries and forwards the bytes unchanged.
-- `ServerInstruction<'a>`: typed decoding of server → client instructions (string arguments are borrowed).
-- Limits: `Limits::STRICT` (same as guacd, for untrusted input) and `Limits::LENIENT`.
-- `video`: framing of `video` streams (section 2.5). The server's `encode_frame` and the client's `FrameReader` (reassembles frames regardless of blob boundaries) share this code.
-- `binary`: the record framing of the binary tunnel (section 2.6): `RecordWriter` (molcajeted, and the gateway when it decodes for a stock guacd), `RecordReader` (the gateway's TCP side, any split of the byte stream) and the constants the client parses a message with.
-- `zimage`: the zstd image type (section 2.7): its mimetype, the header molcajeted writes, and the decoder, which the wasm client and the daemon's client simulator share. The decoder is pure Rust (`ruzstd`), so the crate still builds for `wasm32-unknown-unknown`; the encoder needs libzstd and lives in molcajeted.
-- `apply_time`: apply-time reports (section 2.9): the argument with which molcajeted's `sync` asks for the time a frame took to apply, and the client's reply carrying it.
+How each extension behaves across component versions is tabulated in [Mixed versions](deployment.md#mixed-versions) in deployment.md.
 
-### 2.2 molcajete-gateway
+## 3. Protocol crate (`molcajete-protocol`)
 
-- Built on axum. Serves the JSON API (`/api/auth/*`, `/api/connections`, `/api/folders`, `/api/users`, `/api/groups`, `/api/recordings`), `/websocket-tunnel` and the static files (`web/dist`).
-- After the WebSocket upgrade it performs the guacd handshake; on failure it closes with the status code in the close reason (like the Java web app).
-- guacd → browser: the bytes read are cut into instructions by the parser and batched into one message of up to 64 KiB, sent immediately when the next read would block. For a client on the binary subprotocol the messages are binary and made of records instead (section 2.6): records from molcajeted are batched as they are, without looking inside; instructions from a stock guacd are parsed as before and their `blob` data is decoded from base64 on the way.
-- browser → guacd: validated with `Limits::STRICT` and forwarded verbatim. Internal pings are answered directly.
-- Configuration: TOML (`gateway.example.toml`) for the server itself. Users, groups and their roles, connections (each may name its own guacd) in a tree of folders, parameters, grants of connections and folders to users and groups, and login sessions are stored in PostgreSQL, MySQL/MariaDB or SQLite through sqlx's `Any` driver, with per-dialect migrations in `crates/gateway/migrations/`, like Guacamole's JDBC authentication extensions. Roles are fixed (`user`, `connection_manager`, `admin`) and checked by request extractors (`AdminUser`, `ConnectionManager`); the connections a user may open are found with one recursive query over direct, group and folder grants. Passwords are Argon2id hashes; sessions are cookies whose SHA-256 is stored.
+The crate is shared by the daemon, the gateway and the wasm client, so it has no platform-specific dependencies and builds for `wasm32-unknown-unknown`.
 
-### 2.3 molcajete-client: GPU renderer design
+### 3.1 Parser and encoder
 
-**Threads.** By default the whole client (WebSocket tunnel, parser, image decoding, WebGL2 rendering, compositing) runs inside a Web Worker. The visible canvas is an `OffscreenCanvas` handed to the worker with `transferControlToOffscreen()`. Only three things stay on the main thread:
+- `Parser` is incremental and byte-oriented. Data may arrive split anywhere (a TCP read, a WebSocket message), even inside a UTF-8 sequence; the parser keeps its scanning state so that each byte is looked at once. ASCII runs are skipped in bulk, which keeps base64 blobs cheap.
+- `Parser::feed` appends bytes; `Parser::feed_with` lets the caller write straight into the parser's buffer (the wasm client copies a binary message's instruction text this way, section 4.6).
+- `RawInstruction` is a zero-copy view into the parser buffer (`opcode`, `arg`, `as_bytes`). The gateway uses it to find instruction boundaries and forwards the bytes unchanged.
+- `Limits::STRICT` matches libguac (8192 code points, here as 32768 bytes; 128 elements; 5 length digits) and is used for untrusted input: what the browser sends to the gateway, and what a client sends to molcajeted. `Limits::LENIENT` (16 MiB, 4096 elements) is for data from a trusted server.
+- `Instruction` / `InstructionBuilder` encode instructions, counting element lengths in code points (`element_length`).
+- `Status` holds the Guacamole status codes; `ProtocolVersion` the handshake versions.
 
-- receiving pointer/wheel/keyboard/IME events and forwarding them to the worker
-- applying the worker's `layout` (canvas CSS size) and `cursor` (RGBA → CSS cursor) events to the DOM
-- handling UI events
+### 3.2 Typed instructions
 
-`web/public/molcajete.js` (`MolcajeteSession`) and `web/public/molcajete-worker.js` split these roles. Browsers without OffscreenCanvas run the same wasm client on the main thread (`?main` forces this). The reason for the split is the measurement in section 3.1.
+`server::ServerInstruction<'a>` decodes server → client instructions into an enum, borrowing string arguments (a base64 blob is never copied). It covers the drawing, image, stream and control instructions of section 1.1 plus molcajete's own `display-control`, `link` and `selection`. Decoding failures are `DecodeError` values naming the opcode and argument.
 
-**Layers are textures.** Each layer and buffer is an RGBA8 texture (premultiplied alpha) with its own FBO. Allocations are rounded up to 64 px like the original, and resizing moves the old contents with `blitFramebuffer`. Textures are stored top row first, so inside an FBO `gl_FragCoord.xy` is the layer pixel coordinate, and the Y axis is flipped only once, when compositing into the canvas.
+### 3.3 Binary record framing (`binary`)
 
-**Instructions → GPU operations**
-
-| Instruction | Implementation |
-|---|---|
-| `rect`+`cfill` | Non-overlapping rectangles are drawn as quads with vertex colours in a single draw call (fast path). |
-| Channel masks | 11 `blendFunc` setups (premultiplied Porter–Duff) |
-| Unbounded modes (SRC/IN/OUT/RIN/RATOP) | For a single rectangle, the outside is cleared with at most 4 scissor+clear calls. Otherwise a coverage mask drives a "clear outside" pass followed by a "draw inside" pass. |
-| `copy` | Between layers the source texture is sampled directly. Within a layer (scrolling) the region is first copied into a scratch texture with `copyTexSubImage2D`. |
-| `transfer` | ROP shader: applies the 4-bit truth table with integer bit operations to un-premultiplied 8-bit values. SRC uses `blitFramebuffer` (ignores clip and composite mode, like putImageData). |
-| `img` (zstd image) | Kept as received until its frame is drawn, then decoded in wasm into a pixel buffer that is reused from image to image, and uploaded with `texSubImage2D` from a view of the wasm memory: straight into the layer texture, or into the upload texture when a transform, a clip or a composite mode other than SRC and OVER applies. No decoder object, no promise, no staging canvas (section 2.7). |
-| `img` (PNG, JPEG, WebP) | The encoded image goes to the decoder as a `Uint8Array`: on the binary tunnel a view of the received message when the image arrived in one blob (no copy, and no pass through wasm memory), otherwise one joined array. Decoded with WebCodecs `ImageDecoder` (no colour-space conversion) into a `VideoFrame`; without `ImageDecoder`, Blob + `createImageBitmap`. PNG (IHDR colour type, tRNS) and WebP (VP8/VP8L/VP8X) headers tell whether the image is opaque; opaque images without transform or clip are uploaded straight into the layer texture, the rest go through a reused upload texture and are blended. Uploads are first drawn into a 2D `OffscreenCanvas` (deferred to the GPU process) and that canvas is copied with `texSubImage2D`. |
-| `video` | Unpacks molcajete framing (a 9-byte header per frame + H.264/H.265 Annex B or AV1 OBUs, `molcajete_protocol::video`) into a WebCodecs `VideoDecoder` (`optimizeForLatency`, hardware decoding where available). Each frame takes an image slot in the frame queue, like `img`, filled by the decoder output (`VideoFrame`), so video follows `sync` order and the other drawing instructions. Decoded frames are uploaded to the texture as they are, on the GPU. Decoder errors are reported to the server with an `ack` error and the server falls back to images. |
-| Paths (`arc`/`curve`/`line`/`clip`/`cstroke`/`lfill`) | Arcs and curves are flattened into polylines; fills (nonzero) and strokes are tessellated with lyon. Coverage is drawn into an R8 mask that a shader samples while compositing. |
-| `clip` | Scissor for axis-aligned rectangles, otherwise a per-layer R8 clip mask (intersections by multiplicative blending) |
-| `lfill`/`lstroke` | Pattern shader (repeats with `mod` over the logical size) |
-| `push`/`pop`/`reset`/`transform` | Per-layer drawing state stack (CTM, clip, composite mode, miter limit) |
-| `move`/`shade`/`distort`/`dispose` | Layer tree properties, applied when compositing |
-| `cursor` | Copied into a cursor texture and read back **asynchronously** with a PBO + fence, so the GPU pipeline never stalls. The CSS cursor (data URL) is updated only when the pixels actually changed, so the local pointer has no lag; when the source layer did not change, the readback is skipped entirely. The server's `mouse` position is drawn as a software cursor. |
-
-**Frames.** Instructions are queued as `Op`s, and once a whole frame up to `sync` is ready (images decoded) it runs at once. A zstd image is ready as soon as its `end` has arrived, so a frame made of them waits for nothing; it takes its place in the queue like any other image, which keeps the drawing order when PNG, JPEG or video frames are mixed in. When the frame has run, `sync` is sent back (with the time the frame took to apply, if the server asked for it, section 2.9) and the next `requestAnimationFrame` composites once. Intermediate states never reach the screen.
-
-**Compositing.** The layer tree is walked and each layer drawn with its transform (`translate`, then `distort` about its centre), opacity and the parent's clip (scissor). A translucent layer with children is first rendered as a subtree offscreen and blended with the group opacity, like CSS `opacity`. The canvas is created with `desynchronized: true` (low latency), and linear filtering is used only for non-integer scale factors.
-
-**Input.**
-- Keyboard: the keysym is derived from `KeyboardEvent.key`/`code`/`location` (ported tables). The keysym sent on press is remembered per physical key (`code`) and sent again on release, so releasing Shift first does not leave an `A` pressed.
-- IME (Korean etc.): composition is left to the browser, and the `compositionend` result is sent as Unicode keysyms (`0x01000000 | code point`) pressed and released.
-- Remote composition (session menu, RDP and VNC, remembered per connection in the browser): the remote host's IME composes instead, as with native RDP and VNC clients. The input field becomes read-only so that the browser starts no composition, and a key the local input source claims (`key` is `Process` or a Hangul jamo) is sent as the US-layout character of its physical position (`code`, with Shift), so every key press reaches the remote side at once. `Lang1`/`HangulMode` are sent as `Hangul` (0xFF31); on macOS, which switches input sources with Caps Lock, a Caps Lock press that does not change the lock state is sent as `Hangul` too. molcajeted sends `Hangul` and `Hangul_Hanja` over RDP as scancodes 0x72 and 0x71, and `server-layout=ko-kr-qwerty` sets the session's input language to Korean (0x412). SSH has no remote IME and always composes in the browser.
-- Mouse: Pointer Events with pointer capture. Wheel deltas accumulate in 53 px steps (same as the original).
-
-**Other.** Clipboard (both directions, UTF-8, 3 KiB blobs), `required` requests (credential prompt → `argv` streams), `nop` every 5 s, a tunnel ping every second (RTT), disconnect after 15 s of silence, remote resize requests (`size`) when the container resizes and the desktop follows the window (section 2.8), and performance statistics events. Raw PCM audio (`audio/L8`, `audio/L16`) is played with Web Audio. Web Audio is not available in workers, so in worker mode the worker hands PCM to the page (`audio-start`/`audio-data`/`audio-end` events, ArrayBuffers transferred without copying) and the page's `PcmPlayer` schedules it with 50–300 ms of latency. The audio context resumes on the first pointer or key input (autoplay policy). While connected, the client keeps itself alive, so the session survives the JS handle being garbage-collected (wasm-bindgen FinalizationRegistry).
-
-### 2.4 molcajeted
-
-- Built on tokio, one task per connection (the original forks a process). The handshake matches the original (`args` advertises `VERSION_1_5_0`; argument names match the original VNC plugin), with one more name at the end of `args`, `molcajete-binary`, through which a molcajete gateway asks for raw stream data (section 2.6).
-- Everything sent to the client goes through one `Output` (`io.rs`): instructions are appended as text, stream data with `Output::blob`, which writes base64 `blob` instructions of at most 6048 bytes for a stock client and blob records for a molcajete gateway. The protocol code (display, video, audio, clipboard) is the same for both.
-- The server-side display (`display/`) keeps two buffers:
-  - `pixels`: the actual screen as reported by the remote protocol
-  - `sent`: a copy of the client's layer, built by replaying every instruction we send (fills, images, copies)
-- At flush time only the 64×64 tiles touched in this frame are compared between the two, and only once: the touched tiles are merged into regions, and the changed column range of every row of a region (first and last differing pixel) is found with one comparison of the two buffers. The steps below read those ranges instead of comparing the buffers again: scroll detection skips unchanged rows, move detection skips unchanged blocks, and the pixel step cuts bands and column runs from them, comparing only inside a row's range where it needs to know more. A `copy` from the first two steps is checked against the screen before it is sent, so afterwards its rows can only still differ in the columns outside it, and only those are compared again.
-  1. **Scroll detection**: row hashes find vertical moves, sent as `copy`.
-  2. **Move detection in any direction** (dragged windows, ...): hashes of the changed 64×64 cells are looked up while a 64×64 window slides one pixel at a time over the client copy, using a 2D rolling hash (two odd multipliers, subtracting the rows and columns that leave the window). Cells that moved by the same offset are merged into large rectangles and sent as single `copy` instructions, front of the movement first. guacd 1.6 slides with multiplier 62 and no subtraction, which leaves the upper-left half of the block out of the hash and produces many false matches, so that approach was not used.
-  3. **Remaining differences**: cut into changed row bands and changed column runs within them, then encoded. Unchanged pixels re-sent by the server cost nothing. A client is slowed by the number of images in a frame rather than by their size, so the resulting rectangles are joined into their bounding box wherever one image is estimated to be cheaper than two: an image is taken to cost 1 KB (PNG headers and palette, the `img`/`blob`/`end` instructions, and a decode on the client), the unchanged pixels a join adds 1 byte per 8 pixels, or per 128 pixels in rows that are one colour or repeat the row above. Lines of text that changed over the same columns therefore share an image, since the leading between them is flat, while changes side by side over unchanged text stay separate. Joined images stay below one megapixel so that a large update is still decoded as several images in parallel.
-  4. **Encoding**: solid colours as `rect`+`cfill`, up to 256 colours as palette PNG (1/2/4/8 bit), everything else as RGB PNG (DEFLATE level 4 + Adaptive filter). A client that announces the zstd image type gets it in place of PNG for every opaque region that is not a photograph (section 2.7). Large, colourful areas that change often are sent as JPEG when the client supports it, and those tiles are re-sent losslessly once they calm down (lossless refinement).
-     The rectangles of a frame are encoded side by side, on a pool of threads shared by all sessions (`display/pool.rs`; half the available cores, at most 8, set with `--encode-threads`). Encoding only reads the framebuffer; the instructions are then written and the copy updated one rectangle after the other in the original order, so the output is the same as encoding them one by one. Every pool thread keeps its own zstd context. The pool is shared and bounded so that one busy session cannot take every core. The frame is still built on the connection's task (inside `block_in_place`), so input, audio and remote updates wait until it is done, but for a shorter time.
-- Because the instructions we send are replayed on the copy, wrong guesses correct themselves: a bad `copy` shows up as a difference in the next comparison and is re-sent as pixels. VNC CopyRect only needs the same `copy` applied to the copy, with no need to flush the source area first. This property is checked by a client simulator that replays the instructions and by randomized fuzz tests (1,000 seeds).
-- Frame pacing: the next frame goes out after `max(floor, what the client needs per frame)` (at most 500 ms, the same idea as guacd), where the floor is 16 ms for RDP and VNC and 33 ms for SSH. A molcajete client reports how long it took to apply each frame, and the median of its recent reports is what it needs (section 2.9); the round trip is left to the window of unacknowledged frames. For any other client the send time of every `sync` is recorded, and the exponentially smoothed time until its reply (the processing lag) stands in for it. Remote updates keep arriving meanwhile and accumulate as differences from the copy, so short-lived intermediate states are never sent. The first change after a quiet period is sent immediately, so input stays responsive.
-- Large frames (more than 32 KiB encoded) are paced by one of two profiles (`display/pacing.rs`, chosen with `Display::with_pacing`; all three protocols ask `Display::next_frame_at`):
-  - **Terminal (SSH):** at least 66 ms (about 15 fps) pass after a large frame, however fast the client acknowledged it. This bounds bandwidth under continuous floods of output, where more frames show nothing more (section 3.2).
-  - **Desktop (RDP, VNC):** the 66 ms only last until the client has acknowledged the large frame, which shows that the link delivered it and the client applied it. On a 4K or 5K screen nearly every frame of scrolling or dragging is larger than 32 KiB, and the fixed pause held those to 15 fps on links and clients that take 60. A link that needs longer than 66 ms per frame is paced as before, by the pause and then by the lag (for a client that reports apply times, by the pause and the window of unacknowledged frames). So that a fast link is not filled just because it can be, a byte budget of 8 MiB/s applies: a quarter of a second's worth may go out at once, beyond that frames are spaced evenly at the budget's rate (never more than 500 ms apart). While a video stream is active (section 2.5) the floor is 33 ms, the frame rate its rate control was set up for.
-- Flow control: with more than 2 frames unacknowledged, no update requests are sent to the remote server (they resume when replies arrive, or forcibly after 5 s).
-- VNC: RFB 3.3/3.7/3.8, None/VNC authentication, Raw/CopyRect/Hextile/ZRLE, Cursor/DesktopSize/ExtendedDesktopSize/LastRect pseudo-encodings, clipboard in both directions, remote resize.
-- SSH (`ssh/`): connects with russh (password, private key + passphrase, keyboard-interactive, asking with `required` when a value is missing, `host-key` pinning) and keeps an xterm-compatible screen with alacritty_terminal (256 colours/true colour, alternate screen, scrollback, bracketed paste, SGR mouse). Cells are rendered on the server with ab_glyph, and only the row spans that differ from the previous frame go into the display; scroll detection and encoding are then up to the shared display. DejaVu Sans Mono is bundled, with the bundled NanumGothicCoding as fallback for Hangul, Han and Kana; `font-path` and system fonts are further fallbacks. Supports double-width characters, box-drawing characters, drag/double-click selection → client clipboard, Ctrl+Shift+V/right-click paste, links under the pointer (section 2.10), wheel scrollback and resizing. Argument names match the guacd SSH plugin.
-- RDP (`rdp/`): IronRDP (connector/session/graphics/cliprdr/displaycontrol) with rustls. Security: TLS and NLA (CredSSP/NTLM); certificates are verified unless `ignore-cert` is set. Bitmap updates go into the display per changed rectangle, copied once straight from IronRDP's decoded image (`Display::put_image` converts to opaque RGBA in the same pass; `rdp::bench` compares it with the earlier copy into a temporary buffer); pointer bitmaps become the cursor. No bulk compression is negotiated: IronRDP's reactivation sequence (its connection finalization) rejects compressed Share Data PDUs, which xrdp sends after a resize once compression is negotiated. Modifiers, function keys and shortcuts are sent as scancodes, other characters (including Hangul) as Unicode events. Mouse, text clipboard (both directions, UTF-16), display-update resizing and scale changes during the session (section 2.8) are supported. IronRDP does not implement RC4 standard RDP security, so `security=rdp` is refused.
-- RDP audio (`rdp/audio.rs`): registers the RDPSND static channel and the `AUDIO_PLAYBACK_DVC` dynamic channel, and picks among the server's formats only those it can decode (PCM 8/16-bit, G.711, IMA/MS ADPCM), preferring 16-bit, 44.1k, 48k, stereo. Sound is sent right away, independent of frame pacing, as a Guacamole `audio/L16;rate=R,channels=C` stream (reduced to 8-bit if the client only accepts L8). When the client takes no audio or `disable-audio` is set, the channels are not created, so the remote session plays no sound. If the client rejects the stream (`ack` error), audio stops for that session.
-
-### 2.5 Video mode (molcajeted → WebCodecs)
-
-Areas with a lot of motion (video playback, animation, 3D) are expensive even as JPEG. molcajeted finds such areas and sends them as a compressed video stream into a separate layer. It uses the Guacamole protocol's `video` instruction (stream, layer, mimetype) unchanged; the stream content uses this project's framing (`molcajete_protocol::video`). The stock JS client does not advertise our mimetypes such as `video/h264`, so with it everything stays images, as before.
-
-- **Negotiation.** The client advertises in the handshake `video` only the codecs that `VideoDecoder.isConfigSupported` accepts (`video/av1`, `video/h265`, `video/h264`). The server picks, in the operator's order of preference (`--video av1,h265,h264`, `none` to disable), a codec the client can decode and the server can encode. Not used for sessions with `force-lossless` or for SSH.
-- **Finding the area.** For every 64×64 tile, the number of frames in which it had to be sent as an image is counted and halved every second. Tiles scoring 8 or more are busy: at 30 fps this takes about 0.3 s, at 15 fps about 0.6 s, and fewer than 6 updates per second never get there. Scrolling and window moves are handled by `copy` first and only the remaining differences count, so they are not mistaken for video. Video mode starts when the bounding box of the busy tiles meets all of:
-  - 6 tiles or more
-  - busy tiles cover at least half the box
-  - more than 256 colours (text and UI are better served by lossless encodings)
-- **Video layer.** Layer 1 is sized to the area (rounded up to multiples of 16) and placed over it (`size`, `move`), and a `video` stream is opened on it. The frame given to the encoder (the area at the encoded size, the padding repeating the last column and row) is kept between frames and brought up to date only in the tiles touched since the last flush: a run of touched tiles is compared with it one pixel row at a time and copied, so a small change costs a few rows and a frame in which nothing really changed (the same pixels drawn again) is not encoded. Every frame in which the area changed is fed to the encoder, and the result goes out with a 9-byte header (length, timestamp, key frame flag) in blobs of at most 6048 bytes. The first frame is a key frame carrying the codec configuration (SPS/PPS, VPS, AV1 sequence header). Tiles inside the video area are left out of the normal image diff.
-- **The default layer's copy is left alone.** While the video plays, the video area of `sent` (the copy of the client's default layer) is not touched, so the copy keeps matching what the default layer really holds beneath the video layer. When the area has not changed for 1 s, the layer is removed with `end` and `dispose`, and in the same frame the whole area is compared with the copy and updated losslessly. No lossy content stays on screen, and no stale content shows through when the layer disappears. When the busy area extends beyond the video area (window moved or resized), the video restarts over the new area once the busy area has extended beyond it for 8 frames and then not grown for 10 more (smaller flickering edges do not count as growth), or after 60 frames even if it keeps growing; meanwhile the part outside the video goes as images. The new area covers everything the busy area covered during that time and, where it grew from the old video, is extended by as much again on those sides, so that a window that is opened or resized restarts the stream once or twice instead of every few frames (in a simulation of a window growing from 832×960 to 1280×2176 over 3 s: 2 starts instead of 8). An idle timer per session (`Display::idle_deadline`) makes this clean-up happen even without changes; the same timer drives the lossless refinement of JPEG areas that calmed down, which previously waited for the next change.
-- **Codecs and bitrate.** The target bitrate is area × 30 fps × 0.1 bpp for H.264, 0.7× that for H.265 and 0.6× for AV1 (300 kbps to 16 Mbps). Software AV1 (SVT-AV1) takes about 25 ms per 720p frame, so areas larger than about 0.94 MP (1280×736) use the next codec in line (H.265, then H.264). Hardware encoders have no size limit.
-- **Encoders (`video/`).** ffmpeg runs as a child process with RGBA piped in. Nothing is linked, so the GPL x264/x265 pose no licensing problem. Output is read as an AVI container: with a raw elementary stream the end of a frame is only known once the next one starts, which would add a frame of delay, whereas this way each frame in yields its access unit right away. At startup `ffmpeg -encoders` is read and each candidate does a 3-frame trial encode; only working ones are kept. Priority: hardware (NVENC/QSV/VA-API/AMF; on macOS VideoToolbox), ffmpeg software (libsvtav1, libx265, libx264), built-in OpenH264 (cargo feature `openh264`, needs a C++ compiler). Colour space is BT.709 limited range, signalled in the bitstream. Every backend converts RGBA to 4:2:0 with the same fixed-point arithmetic (`video/yuv.rs`), on aarch64 with NEON 16 pixels at a time (bit-identical to the scalar code, which handles the rest of a row and other architectures); for VideoToolbox the conversion writes straight into the planes of the NV12 pixel buffer taken from the session's pool, without an intermediate buffer. VideoToolbox is called directly (`video/videotoolbox.rs`) instead of through ffmpeg's `*_videotoolbox`, because ffmpeg does not wait for VideoToolbox's asynchronous output and each packet would come one frame late; after each frame `VTCompressionSessionCompleteFrames` waits for its packet, which is then converted from length-prefixed NAL units to Annex B with the parameter sets in front of key frames.
-- **Failures.** An encoder error ends video mode and falls back to images; after three failures the session stops trying. A client rejecting the `video` stream or reporting a decoder error with `ack` turns video off the same way.
-
-### 2.6 Binary tunnel (raw stream data)
-
-In the Guacamole protocol stream data is base64 inside `blob` instructions inside text WebSocket messages: 4 bytes on the wire for every 3 of an image, a video frame or an audio packet, on both legs (molcajeted → gateway → browser). In the browser each blob was copied four times: into a JavaScript string by the browser, into wasm as UTF-8, into the parser buffer, and out of the base64 decoder; the finished image was then copied back out for `ImageDecoder`. Between molcajete components the data now stays raw bytes end to end. Only the server → client direction changes; what the client sends (input, acknowledgements, clipboard and `argv` streams) is small and stays text.
-
-**Records** (`molcajete_protocol::binary`). The server → client stream becomes a sequence of records:
+In the Guacamole protocol stream data is base64 inside `blob` instructions inside text WebSocket messages: 4 bytes on the wire for every 3 of an image, a video frame or an audio packet. Between molcajete components the server → client stream is a sequence of records instead:
 
 ```
 record = tag (1 byte)  length (4 bytes, unsigned, little endian)  body (length bytes)
@@ -208,53 +154,20 @@ other     skipped by readers (room for later additions)
 ```
 
 - The instruction records, concatenated, are the ordinary instruction stream without its `blob` instructions; a blob record applies at its position in that stream. `img`, `video`, `audio`, `end` and `ack` are unchanged.
-- Consecutive blob records of a stream are equivalent to one with the data joined. Writers keep a record within 64 KiB (`MAX_WRITTEN_RECORD`), so an image up to that size is one blob instead of one per 6048 bytes, and larger data is split (PCM only between whole sample frames). Readers accept bodies up to 16 MiB.
-- On TCP (molcajeted → gateway) the records follow each other in the byte stream, starting right after the `;` of `ready`. On the WebSocket every binary message holds whole records.
+- Consecutive blob records of a stream are equivalent to one with the data joined. Writers keep a record within 64 KiB (`MAX_WRITTEN_RECORD`), so an image up to that size is one blob instead of one per 6048 bytes, and larger data is split (`RecordWriter::blob_aligned` splits PCM only between whole sample frames). Readers accept bodies up to 16 MiB (`MAX_RECORD_BODY`).
+- On TCP the records follow each other in the byte stream, starting right after the `;` of `ready`. On the WebSocket every binary message holds whole records.
+- `RecordWriter` builds records (molcajeted, and the gateway when it converts a stock guacd's text), `RecordReader` cuts a byte stream split anywhere into records (the gateway's TCP side), and `records` iterates over one WebSocket message.
+- Only the server → client direction uses records. What the client sends (input, acknowledgements, clipboard and `argv` streams) is small and stays text.
 
-**Negotiation.** Each leg is negotiated on its own, and each falls back to the text protocol when the peer does not know the extension:
+**Why records, and not binary messages for blobs only.** Carrying each blob as its own binary WebSocket message between text messages would have been the smallest change, but a text message cannot continue across a blob: a frame with *n* images would take about 2*n* messages where the gateway sent one or two, and each message is a task in the browser. With records one message still carries a whole batch (up to about 64 KiB), the gateway forwards molcajeted's records without re-encoding them, and the client finds each part from its 5-byte header instead of scanning. The record size is capped because the client treats 15 s without a message as a dead tunnel and a message only counts once it has arrived completely: bounded messages keep arriving on a slow link. A binary encoding of the instructions themselves was not worth it: outside the blobs the stream is a few percent of the bytes, and keeping it as text keeps one parser and one encoder for both modes.
 
-- Browser ⇄ gateway: the client offers the WebSocket subprotocols `molcajete-binary-v1, guacamole`. The gateway selects the first one it supports; an older gateway, or one with `[server] binary_tunnel = false`, selects `guacamole`. The stock guacamole-common-js client offers only `guacamole` and gets exactly the stock tunnel. Under the binary subprotocol the data from the server arrives in binary messages; the tunnel's own messages (UUID, ping replies) are still text messages, and the client handles either kind at any time.
-- Gateway ⇄ molcajeted: molcajeted lists the connection parameter `molcajete-binary` last in `args`. A gateway whose browser selected the binary subprotocol answers `1` in `connect`, and molcajeted switches to records after `ready`. In every other case the gateway sends an empty value (a connection parameter of that name in the database is ignored), as does the stock web application for a parameter it has no setting for, and molcajeted sends base64 like guacd. Stock guacd never lists the parameter and is sent nothing it does not know. (`video` mimetypes are announced the same way: something only molcajete peers act on.)
+### 3.4 Video framing (`video`)
 
-| Browser | Daemon | Browser ⇄ gateway | Gateway ⇄ daemon |
-|---|---|---|---|
-| molcajete-client | molcajeted | binary (records forwarded) | records |
-| molcajete-client | stock guacd | binary (gateway decodes base64) | text |
-| stock guacamole-common-js | molcajeted | text | text |
-| stock guacamole-common-js | stock guacd | text | text |
-| stock web application (Java) | molcajeted | — | text |
+A `video` stream carries this project's framing: per frame a 9-byte header (`FRAME_HEADER_LEN`: length, timestamp in milliseconds, key frame flag) followed by one H.264/H.265 access unit in Annex B form or one AV1 temporal unit of OBUs. molcajeted writes it with `encode_frame`; the client reassembles frames across blob boundaries with `FrameReader`. `VideoCodec` maps the mimetypes `video/av1`, `video/h265` and `video/h264`.
 
-The gateway logs the mode of every tunnel as `framing` (`binary`, `transcoded`, `text`) in `tunnel established`, and molcajeted logs `binary` in `connection established`. Appending `?text` to the session URL keeps a client on the text protocol, for comparisons.
+### 3.5 zstd images (`zimage`)
 
-**Why records, and not binary messages for blobs only.** Carrying each blob as its own binary WebSocket message between text messages would have been the smallest change, but a text message cannot continue across a blob: a frame with *n* images would take about 2*n* messages where the gateway sent one or two, and each message is a task in the browser. With everything in records one message still carries a whole batch (up to about 64 KiB), the gateway forwards molcajeted's records without parsing instructions at all, and the client finds each part from its 5-byte header instead of scanning. The record size is capped, rather than sending an image of any size as one record, because the client treats 15 s without a message as a dead tunnel and a message only counts once it has arrived completely: bounded messages keep arriving on a slow link. A fully binary encoding of the instructions themselves was not worth it: outside the blobs the stream is a few percent of the bytes, and keeping it as text keeps one parser and one instruction encoder for both modes.
-
-**In the client.** A binary message is an `ArrayBuffer`. The client reads each record header through a typed-array view, copies instruction text straight into the parser buffer (`Parser::feed_with`), and keeps stream data as views of the message:
-
-- images: a single-blob image is handed to `ImageDecoder` as that view; an image in several blobs is joined once into a new array. Only the first 2 KiB enter wasm, to tell from the header whether the image is opaque.
-- video: frames that lie whole within a blob (molcajeted starts each frame in a new record) go to `EncodedVideoChunk` as views; a frame larger than a record is reassembled by `FrameReader` as before.
-- audio: PCM is copied once, into wasm for Web Audio or, in worker mode, into a buffer of its own that is transferred to the page (transferring the message itself would detach the image views).
-
-The worker and main-thread modes share all of this; the text path (`String` → parser → base64 decoder) is still there for stock guacd behind an older gateway and for recordings.
-
-**Compression.** WebSocket `permessage-deflate` is not in use and must stay that way for these payloads, which are already compressed: tungstenite (0.29, under axum 0.8) does not implement the extension, so the gateway never answers the browser's offer with `Sec-WebSocket-Extensions`. A test checks this for every tunnel mode. A reverse proxy passes WebSocket frames through unchanged.
-
-**Effect on the wire.** `display::bench` runs fixed scenarios on a 5K screen through the display twice, once per output mode (`cargo test --release -p molcajete-daemon display::bench -- --ignored --nocapture --test-threads=1`, the `wire` lines). Bytes and blobs per frame, molcajeted → gateway and, forwarded unchanged, gateway → browser:
-
-| Scenario | Text | Binary | Change |
-|---|---|---|---|
-| `scroll` (document scrolls) | 44.2 kB in 6.2 blobs | 33.1 kB in 1.0 blobs | −25.1% |
-| `drag` (window dragged) | 66.9 kB in 11.4 blobs | 50.3 kB in 4.5 blobs | −24.9% |
-| `corners` (two small changes) | 23.3 kB in 4.1 blobs | 17.5 kB in 2.0 blobs | −25.0% |
-| `page` (full page of new text) | 1151.1 kB in 149.6 blobs | 861.8 kB in 16.9 blobs | −25.1% |
-| `scatter` (40 small changes) | 173.6 kB in 39.0 blobs | 130.7 kB in 33.3 blobs | −24.7% |
-
-The binary stream is 0.2–3% larger than the encoded images themselves (record headers and the instructions around them).
-
-### 2.7 zstd images (a lossless image type the client decodes itself)
-
-Every lossless update used to be a PNG. molcajeted paid for DEFLATE on each one, and the client for an `ImageDecoder` per image: a decoder object, a promise, a `VideoFrame` and, for most images, a pass through the staging canvas before the texture upload; a frame could only be applied once all of its images had come back from their decoders. For a client that announces it, molcajeted now sends screen content as a format the client decodes itself, in wasm, while it draws the frame.
-
-**Format** (`molcajete_protocol::zimage`, mimetype `image/x-molcajete-zstd-v1`). An image is indexed or RGB pixels, as they are, in one Zstandard frame:
+A lossless image type that the wasm client decodes itself (mimetype `image/x-molcajete-zstd-v1`). An image is indexed or RGB pixels, as they are, in one Zstandard frame:
 
 ```
 u8      kind: 0 = indexed, 1 = RGB
@@ -272,32 +185,14 @@ indexed only:
 ```
 
 - Every pixel is opaque; there is no alpha channel, no row filter and no interlacing. The `img` instruction says where the image goes and with which composite mode, as for any other type.
-- An image has at most 2^25 pixels (an 8K screen has 33.2 million).
-- The frame uses no dictionary and is the only one; nothing follows it. It decompresses to exactly the number of bytes the header implies. Its window is at most 8 MiB, unless it is a single-segment frame, whose window is its content. A decoder can therefore check, before it allocates anything, that it will need no more than the image itself and 8 MiB.
-- An index that has no palette entry is black.
-- A decoder refuses anything else, and an image it refuses is skipped like an image the browser cannot decode: its frame is still applied. The version is part of the mimetype; a change to the format is a new mimetype, announced next to this one.
+- An image has at most 2^25 pixels (`MAX_PIXELS`; an 8K screen has 33.2 million).
+- The frame uses no dictionary and is the only one. It decompresses to exactly the number of bytes the header implies. Its window is at most 8 MiB (`MAX_WINDOW`) unless it is a single-segment frame, so a decoder can check before allocating that it needs no more than the image and 8 MiB.
+- An index without a palette entry is black.
+- A decoder refuses anything else, and a refused image is skipped like an image the browser cannot decode: its frame is still applied. A change to the format is a new mimetype.
 
-The decoder (`zimage::Decoder`) checks the header and the frame header itself and leaves the Zstandard frame to `ruzstd`, a pure Rust decoder, writing into a buffer of the size the header implies. It never panics on any input and never produces more or fewer pixels than announced; tests feed it images cut at every length, every byte replaced, bytes removed and inserted, and random data.
+`zimage::Decoder` checks the header and the frame header itself and leaves the Zstandard frame to `ruzstd`, a pure Rust decoder, so the crate still builds for wasm. It never panics and never produces more or fewer pixels than announced; tests feed it images cut at every length, every byte replaced, bytes removed and inserted, and random data. The encoder needs libzstd and lives in molcajeted (`display/encode.rs`).
 
-**Negotiation.** The client lists the mimetype in the `image` instruction of the handshake, after the stock ones (the tunnel URL carries it as one more `image=` parameter, which every gateway passes on). molcajeted uses the type only for a client that listed it, so the stock clients and older molcajete clients get PNG as before, and a stock guacd ignores a mimetype it does not know. Nothing depends on the tunnel: the data is an `img` stream like any other, in blob records or in base64 `blob` instructions. `--image-zstd false` turns the type off in a daemon and `?png` in a session.
-
-**Which images.** molcajeted chooses per image (`display/encode.rs`):
-
-| Region | Sent as |
-|---|---|
-| one colour | `rect` + `cfill`, as before |
-| opaque, up to 256 colours | zstd image, indexed |
-| opaque, more colours, at least 3 of 4 pixels equal to their left neighbour (in every fourth row) | zstd image, RGB |
-| opaque, more colours, otherwise: a photograph, a gradient | PNG (RGB, adaptive filter) |
-| any transparent pixel; the cursor | PNG (the format has no alpha) |
-| wider or higher than 65535 pixels, or more than 2^25 pixels | PNG |
-| large, colourful and changing often | JPEG, as before; refined later by this table |
-
-The share of repeated pixels tells screen content from photographs well: it is 94 to 97% in the windows and pages with more than 256 colours of the recorded sessions, and 3 to 15% in photographs. Without a row filter Zstandard needs 22 to 74% more bytes than PNG for a photograph, and 37 to 45% fewer for those windows, so the rule keeps PNG exactly where its filters earn something. It costs one look at a quarter of the rows of an image that has already failed to fit a palette; `display::bench::zstd_images` measures it on a 5120x512 photograph (0.17 ms, against 83 ms to encode it as PNG).
-
-**In the client.** A zstd image is not decoded when it arrives. Its bytes are queued (`QueuedImage::Zstd`) in the place the `img` instruction takes in its frame, and the slot counts as ready from the moment `end` arrives, so the frame waits for nothing because of it. When the frame is drawn, the image is decoded into a pixel buffer that is reused from image to image and uploaded with `texSubImage2D` from a view of the wasm memory, into the layer texture when it is drawn with SRC or OVER and no transform or clip, and through the upload texture otherwise, exactly like a decoded PNG. The pixels are opaque, so straight and premultiplied alpha are the same and the upload asks the browser for no conversion. PNG, JPEG and video frames of the same frame still wait for their decoders, and the frame with them; the order of drawing is that of the instructions in every mix.
-
-**Why this encoding.** The candidates of GH-24 were compared on the images of two recorded RDP sessions (a list being scrolled: 1194 images, 72.6 megapixels, 95% of them with at most 256 colours; pages being opened: 49 images, 14.1 megapixels, 57% of the pixels in two windows with more colours) and on the images `display::bench` produces (text whose glyphs are noise, which is pessimistic). Bytes are relative to the PNG molcajeted sends; encoding was timed natively on an Apple M4, decoding in wasm without SIMD in headless Chromium 1228 on the same machine, warm, per megapixel.
+**Why this encoding.** The candidates were compared on the images of two recorded RDP sessions (a list being scrolled: 1194 images, 72.6 megapixels, 95% of them with at most 256 colours; pages being opened: 49 images, 14.1 megapixels, 57% of the pixels in two windows with more colours) and on the images `display::bench` produces (text whose glyphs are noise, which is pessimistic). Bytes are relative to the PNG molcajeted sends; encoding was timed natively on an Apple M4, decoding in wasm without SIMD in headless Chromium 1228 on the same machine, warm, per megapixel.
 
 | Candidate | Bytes: list | Bytes: pages | Bytes: bench `page` | Bytes: bench `scatter` | Encode ms/MP (list / bench `page`) | Decode in wasm ms/MP (list / bench `page`) | Decoder in the wasm file |
 |---|---|---|---|---|---|---|---|
@@ -311,88 +206,500 @@ The share of repeated pixels tells screen content from photographs well: it is 9
 | RGB rows with PNG's adaptive filter + zstd level 1 (no palette) | 225% | 150% | 164% | 163% | 8.83 / 8.11 | 6.46 / 6.05 | 45 kB |
 | PNG decoded in wasm (`png` crate) | 100% | 100% | 100% | 100% | as PNG | 1.30 / 0.98 | 110 kB |
 
-- **QOI and LZ4** have no entropy coder. They decode fastest, but LZ4 takes 22 to 80% more bytes than PNG and QOI two and a half to ten times as many, and the bytes of a large frame are what a session waits for longest (GH-22).
-- **Row filters** make screen content larger, not smaller, under an LZ coder: an exact repetition of a glyph is no longer one after filtering. They only pay for photographs, which stay PNG.
-- **The palette** is what makes the difference on text: the same pixels as RGB take half as many bytes again. Packing the indices like PNG instead of keeping them as bytes saves 3% at most.
-- **Zstandard against DEFLATE** over the same pixels: about the same bytes (3% more on bench `scatter`, a quarter fewer on the recorded pages) at 40% of the encoding time, against a decoder that is slower in wasm (`ruzstd` reaches 350 to 500 MB/s there, `miniz_oxide` about 750 MB/s) and 25 kB larger. Level 3 costs 5% more time than level 1 for 4% fewer bytes (11% fewer on the pages); level 5 one and a half to two times the time of level 3 for another 2 to 3%.
-- **Decoding PNG in wasm** would have served stock guacd too, with no new format, but saves molcajeted nothing and adds the most code.
-- **Alpha** was left out: molcajeted sends transparent pixels only in cursors and in regions a remote protocol reports as transparent, which are rare and stay PNG, and without alpha the question of premultiplying exactly like the browser's PNG decoder does not arise.
+- **QOI and LZ4** have no entropy coder. They decode fastest, but take 22% to ten times more bytes than PNG, and the bytes of a large frame are what a session waits for longest.
+- **Row filters** make screen content larger under an LZ coder: an exact repetition of a glyph is no longer one after filtering. They only pay for photographs, which stay PNG (section 6.2).
+- **The palette** makes the difference on text: the same pixels as RGB take half as many bytes again.
+- **Zstandard against DEFLATE** over the same pixels: about the same bytes at 40% of the encoding time, against a decoder that is slower in wasm (`ruzstd` 350 to 500 MB/s, `miniz_oxide` about 750 MB/s) and 25 kB larger. Level 3 costs 5% more time than level 1 for 4% fewer bytes (11% on the pages).
+- **Decoding PNG in wasm** would have served stock guacd too, with no new format, but saves molcajeted nothing. The client does decode PNG in wasm, but only while seeking through a recording (section 4.10).
+- **Alpha** was left out: molcajeted sends transparent pixels only in cursors and in regions a remote protocol reports as transparent, which stay PNG.
 
-The comparison tool depends on the recordings, which show a private desktop, and is not in the repository; `display::bench` and `display::bench::zstd_images` reproduce the synthetic part.
+The comparison tool depends on recordings of a private desktop and is not in the repository; `display::bench` and `display::bench::zstd_images` reproduce the synthetic part.
 
-**Effect in molcajeted** (`display::bench`, a 5K screen, per frame, PNG client → zstd client):
+### 3.6 Apply-time reports (`apply_time`)
 
-| Scenario | Encoding | Whole flush | Image bytes | zstd images of all images |
-|---|---|---|---|---|
-| `page` (full page of new text) | 57.3 → 17.9 ms | 76.8 → 37.4 ms | 860.5 → 799.9 kB (−7.0%) | 7.5 of 7.5 |
-| `scatter` (40 small changes) | 7.2 → 2.6 ms | 12.5 → 7.9 ms | 128.1 → 127.8 kB | 33.3 of 33.3 |
-| `scroll` (document scrolls) | 2.2 → 0.7 ms | 14.3 → 13.5 ms | 33.0 → 32.1 kB (−2.7%) | 1.0 of 1.0 |
-| `corners` (two small changes) | 1.1 → 0.4 ms | 1.7 → 1.0 ms | 17.3 → 17.2 kB | 2.0 of 2.0 |
-| `drag` (window dragged over a wallpaper) | 1.0 → 0.7 ms | 7.7 → 7.4 ms | 49.0 → 48.4 kB (−1.2%) | 2.5 of 4.5 (the wallpaper stays PNG) |
-
-The wasm client grows by 50 kB (692,392 → 742,844 bytes as built by `scripts/build-web.sh` without `wasm-opt`; 214,863 → 231,640 bytes with `gzip -9`). molcajeted links libzstd (`zstd` crate), compiled from the source bundled with `zstd-sys`.
-
-**Effect in the client.** The two recordings were replayed into the client in headless Chromium 1228 on an Apple M4, once as recorded (PNG) and once with the same images converted by molcajeted's rule (1187 of 1217 and 49 of 68 images become zstd images; the rest are cursors and a few small photographs). The replay feeds text messages (base64), so it shows nothing of the binary tunnel.
-
-On the GPU (ANGLE on Metal), ranges of 3 or 4 runs:
-
-| Replay | Measure | PNG | zstd |
-|---|---|---|---|
-| list, `?main`, messages fed back to back | until every frame is applied | 0.35–0.40 s | 0.26–0.28 s |
-| | frame lag (from `sync` to applied), average | 3.9–5.7 ms | 0.48–0.50 ms |
-| | main thread: tasks, of which script | 355–405 ms, 299–353 ms | 268–280 ms, 50–58 ms |
-| pages, `?main`, messages fed back to back | frame lag, average | 13.4–17.0 ms | 0.72–0.86 ms |
-| | main thread: tasks, of which script | 71–96 ms, 55–74 ms | 92–102 ms, 38–56 ms |
-| list, worker, recorded timing (25 s) | frame lag, average | 1.05–1.56 ms | 1.35–1.48 ms |
-| | per image | 0.49–0.75 ms from handing it to the decoder to having it | 0.39–0.51 ms decoding |
-| list, `?main`, recorded timing | frame lag, average | 1.42–1.51 ms | 1.35–1.55 ms |
-| | main thread: tasks, of which script | 862–927 ms, 514–554 ms | 956–1071 ms, 102–113 ms |
-| pages, worker, recorded timing (20 s) | frame lag, average | 1.91–2.04 ms | 1.43–1.62 ms |
-| pages, `?main`, recorded timing | frame lag, average | 1.74–2.08 ms | 1.34–1.68 ms |
-| | main thread: tasks, of which script | 150–189 ms, 70–102 ms | 213–251 ms, 57–73 ms |
-
-- When frames queue up, a frame of zstd images is applied in a tenth of the time, because nothing in it is waited for, and the client gets through the backlog of the list about 40% sooner.
-- At the pace of a session with about three images per frame, on an otherwise idle machine, the time from `sync` to applied is the same within the spread of the runs: a PNG is back from its decoder after about as long as a zstd image takes to decode. Per megapixel these decodes were three to four times slower than in the warm measurement above, as everything is on a thread that sleeps between frames.
-- The script time of the client falls (to a fifth on the list), but the thread that draws now also carries the pixels to the GPU process: with `?main` the main thread's task time was 10 to 40% higher at recorded timing than with PNG, whose decoding and staging happen elsewhere. In the default worker mode that thread is the worker.
-- Without a GPU the upload dominates. On SwiftShader, which the tests use, `texSubImage2D` from memory took about 5.5 ms per megapixel on the calling thread, where the staging canvas costs it nearly nothing, and the backlog of the list took 0.75–0.85 s as zstd images against 0.28 s as PNG; at recorded timing the frame lag was 0.67–0.70 ms against 0.55–0.58 ms.
-
-Not measured: a deployed session (network, a 5K display, other GPUs and browsers), the worker's own CPU time, and the binary tunnel in the replay.
-
-### 2.8 Remote display size and scale (RDP)
-
-The browser decides two things about an RDP desktop: whether it takes the size of the window (`resize-method=display-update`), and its scale (`dpi`, 96 per 100 %; without one the DPI is `96 × devicePixelRatio` of the browser that connects). Both are connection parameters with guacd's names and meanings, set in the connection form; new RDP connections resize to the window.
-
-**Per browser.** The session menu changes them for one connection in one browser (`remoteScale.<id>`, `resizeToWindow.<id>` in `localStorage`), over the connection's values:
-
-- At connect the page adds `param.dpi=<dpi>` and `param.resize-method=display-update` to the tunnel URL. The gateway replaces the connection's parameters with them for that tunnel; an empty value removes the parameter, so "Automatic" makes the DPI follow the browser even when the connection has a fixed one. No other parameter can be set this way, and values the daemons would not read are ignored. The connection list returns `dpi` and `resizeMethod`, so that the menu can show what is in effect without the connection's other parameters.
-- During the session the page sends the new value as an `argv` stream, the protocol's way to change a parameter while connected (guacd uses it for credentials and for a terminal's font and colours). `size` stays as it is: a third argument would be read by molcajeted but not by stock guacd, and `argv` also carries `resize-method`. Stock guacd does not apply these two during a session, so with guacd a change takes effect at the next connection.
-- The client sends `size` only while the desktop follows the window, and sends the current size when that is turned on.
-
-**molcajeted.** Display Control ([MS-RDPEDISP]) is offered to every server, so that resizing can start during a session. A new size and a new scale both go out as a monitor layout: the size the desktop has or is about to get, with `DesktopScaleFactor` from the DPI (100–500 %) and `DeviceScaleFactor` at Windows' plateaus 100, 140 and 180 % (125 % gives 100, 175 % gives 140, as on Windows itself). Requests are applied after 500 ms without another one.
-
-**Servers without Display Control.** molcajeted sends `display-control,0` when changes cannot be applied, and `display-control,1` when they can; the session menu then disables Remote scale and Resize to window, and Fit stays. The server opens the channel when it likes, and IronRDP cannot tell "not yet" from "never", so the channel counts as missing when the server did not join `drdynvc`, or 10 s after the session became active (checked with the 5 s keepalive). A channel that opens later is reported, and requests made while it was missing are dropped. Stock guacd never sends `display-control`; clients that do not know it ignore it.
-
-Windows applies a new scale to applications that support per-monitor DPI; others keep their size until they restart, and some ask the user to sign out. The menu says so.
-
-### 2.9 Apply-time reports (pacing frames by what the client needs)
-
-molcajeted paces frames by the client (section 2.4). From the reply to `sync` alone it only learns the whole round trip: the network both ways, the frame's data arriving, and the client's decoding and drawing. Pacing by that sent fewer frames the farther away the client was, although the window of unacknowledged frames (`MAX_UNACKED_FRAMES`: 3 for RDP and VNC, 2 for SSH) already keeps the daemon from running ahead of a client. An average of the replies also took a quarter of every slow one, and only replies moved it again: a slow client on a deployed 2732×1876 session got 1 to 5 frames per second while it took about 17 ms per frame and the link was nearly idle (GH-38).
-
-**Format** (`molcajete_protocol::apply_time`). The daemon asks in its `sync`, the client answers in its reply:
+From the reply to `sync` alone a server learns only the whole round trip: the network both ways, the frame's data arriving, and the client's decoding and drawing. Pacing by that sends fewer frames the farther away the client is, although a window of unacknowledged frames already keeps the server from running ahead. A molcajete client therefore says how long a frame kept it busy:
 
 ```
 server -> client   sync,<timestamp>,<frames>,apply-us;
 client -> server   sync,<timestamp>,<frames>,<microseconds>;
 ```
 
-- The time is how long the frame kept the client busy, in whole microseconds: from the moment the frame was complete (its `sync` arrived) or, if later, the frame before it was applied, to the moment it was applied. Waiting for its images to decode counts; waiting behind earlier frames does not, as that is time the earlier frames already reported.
-- The client answers a `sync` that did not ask as a stock client does (`sync,<timestamp>`), so stock guacd, which never asks, gets nothing new.
+- The time runs from the moment the frame was complete (its `sync` arrived) or, if later, the moment the frame before it was applied, to the moment it was applied. Waiting for its images to decode counts; waiting behind earlier frames does not.
+- There is no handshake: molcajeted asks in every `sync` (`apply_time::sync_request`), and only a client that understands it answers (`apply_time::sync_reply`). A `sync` that does not ask gets the stock reply, so stock guacd sees nothing new; guacamole-common-js ignores the extra argument and its reply carries no time. The gateway passes both directions through unchanged.
 
-**Negotiation.** None in the handshake: the question is in every `sync`, and only a client that understands it answers. guacamole-common-js reads the timestamp and the frame count of a `sync` and ignores further arguments, and its reply carries no time; molcajeted reads a time only from the third argument of a reply. The gateway passes both directions through unchanged, over the text and the binary tunnel alike, so any gateway version works.
+How molcajeted uses the reports is in section 6.4.
 
-**Pacing** (`display/pacing.rs`). For a client that reports, the interval is the median of the last 8 reported times (the lower one of an even count), counting only those reported within 1 s before the last frame, at least the profile's floor and at most 500 ms. The round trip is left to the frame window. A single slow frame does not move a median, and after a pause of a second the interval starts afresh, without waiting for replies to pull it down. Everything else stays: the pause after a heavy frame (until acknowledged on desktops, fixed on terminals), the byte budget, and the 33 ms floor while a video stream is active. A client that does not report is paced by the smoothed round trip as before.
+## 4. Client (`molcajete-client` and `web/public`)
 
-**Effect.** The pacing unit tests run the same simulated clients against the stock path (no reports) and the reporting path (`cargo test -p molcajete-daemon display::pacing::tests::table -- --ignored --nocapture`, 8 s of continuous changes each). A client reports its time from when a frame reaches it, after half the round trip, and applies frames one after the other:
+The client is a Rust crate compiled to wasm (`MolcajeteClient`), plus three JavaScript files: `molcajete.js` (`MolcajeteSession`, the page side), `molcajete-worker.js` (hosts the wasm client in a worker) and `molcajete-player.js` (`RecordingPlayer`). The React session page (`web/src/session`) uses `MolcajeteSession` through `useMolcajeteClient`.
+
+### 4.1 Worker architecture
+
+By default the whole client (WebSocket tunnel, parser, image decoding, WebGL2 rendering, compositing) runs in a dedicated worker. The visible canvas is an `OffscreenCanvas` handed over with `transferControlToOffscreen()`. Only this stays on the main thread:
+
+- receiving pointer, wheel, keyboard and IME events (on a hidden `textarea`, the input sink) and posting them to the worker
+- applying the worker's `layout` (canvas CSS size) and `cursor` (RGBA turned into a CSS cursor) events to the DOM
+- playing audio (Web Audio does not exist in workers) and the UI itself
+
+Browsers without OffscreenCanvas run the same wasm client on the main thread (`MolcajeteClient::new` instead of `new_offscreen`); `?main` on the session page forces this. The reason for the split is the measurement in section 7.2: in Chromium, uploading CPU-backed images into WebGL is synchronous on the calling thread, so a main-thread WebGL client was slower than the stock 2D-canvas client, while the worker cut main-thread time to a third to a sixth of it.
+
+All browser callbacks go through one `with_inner` borrow of the client state, so re-entrant calls from JavaScript never meet an active borrow. While connected the client keeps itself alive, so the session survives the JavaScript handle being garbage-collected.
+
+### 4.2 GPU renderer (`gl`)
+
+**Layers are textures.** Each layer and buffer is an RGBA8 texture (premultiplied alpha) with its own framebuffer. Allocations grow in steps of 64 px (`ALLOC_GRANULARITY`), and resizing moves the old contents with `blitFramebuffer`. Textures are stored top row first, so inside a framebuffer `gl_FragCoord.xy` is the layer pixel, and the Y axis is flipped only when compositing onto the canvas. Nothing is read back to the CPU except the cursor.
+
+| Instruction | Implementation |
+|---|---|
+| `rect`+`cfill` | Non-overlapping rectangles are drawn as quads with vertex colours in a single draw call. |
+| Channel masks | `blendFunc` setups for the premultiplied Porter–Duff modes |
+| Unbounded modes (SRC/IN/OUT/RIN/RATOP, `is_unbounded`) | For a single rectangle, the outside is cleared with at most 4 scissor+clear calls. Otherwise a coverage mask drives a "clear outside" pass followed by a "draw inside" pass. |
+| `copy` | Between layers the source texture is sampled directly. Within a layer (scrolling) the region is first copied into a scratch texture with `copyTexSubImage2D`. |
+| `transfer` | ROP shader: applies the 4-bit truth table with integer bit operations to un-premultiplied 8-bit values. SRC uses `blitFramebuffer` (`Renderer::put`), ignoring clip and composite mode like `putImageData`. |
+| `img` | Section 4.4 |
+| `video` | Section 4.5 |
+| Paths (`arc`/`curve`/`line`/`clip`/`cstroke`/`lfill`) | Arcs and curves are flattened into polylines; fills (nonzero) and strokes are tessellated with lyon (`display/path.rs`). Coverage is drawn into an R8 mask that a shader samples. |
+| `clip` | Scissor for axis-aligned rectangles, otherwise a per-layer R8 clip mask (intersections by multiplicative blending) |
+| `lfill`/`lstroke` | Pattern shader repeating the source surface |
+| `push`/`pop`/`reset`/`transform` | Per-layer drawing state stack (transform, clip, composite mode, miter limit) |
+| `move`/`shade`/`distort`/`dispose` | Layer tree properties, applied when compositing |
+| `cursor` | Copied into a cursor texture and read back **asynchronously** with a PBO and a fence (`Readback`), so the pipeline never stalls. The CSS cursor is updated only when the pixels changed, and the readback is skipped when the source did not change. The server's `mouse` position is drawn as a software cursor. |
+
+**Compositing.** Once per animation frame the layer tree is walked and each layer drawn with its transform (`translate`, then `distort` about its centre), opacity and the parent's clip. A translucent layer with children is first rendered offscreen and blended with the group opacity, like CSS `opacity`. The canvas is created with `desynchronized: true` (low latency), and linear filtering is used only for non-integer scale factors.
+
+### 4.3 Frames
+
+Instructions are queued as `Op`s, and a frame (everything up to `sync`) runs at once when all of its images are ready, as in `Guacamole.Display`. Intermediate states never reach the screen. Each queued frame counts its pending images (`display/frames.rs`), so the queue is not rescanned after every decoded image. When a frame has run, `sync` is sent back, with the apply time when the server asked for it (section 3.6), and the next `requestAnimationFrame` composites once.
+
+The display also measures where a frame's time goes: when it starts arriving (`display/arrival.rs`, starting at the first instruction that draws on a visible layer), how long it waits for images, and how long an applied frame waits to be presented (`display/present.rs`). These go out as once-per-second `stats` events; see [observability.md](observability.md).
+
+### 4.4 Images
+
+A frame may mix three ways of getting pixels, and the drawing order is that of the instructions in every mix.
+
+**PNG, JPEG, WebP: the browser's decoder** (`image.rs`). The encoded image goes to WebCodecs `ImageDecoder` (no colour-space conversion) as a `Uint8Array`: on the binary tunnel a view of the received message when the image arrived in one blob (no copy, no pass through wasm memory), otherwise one joined array. Without `ImageDecoder`, a Blob and `createImageBitmap` are used; per image the Blob alone cost 80 ms per second of a busy session in Chromium, which is why the stock client also prefers `ImageDecoder`. The first 2 KiB (`OPACITY_PREFIX_BYTES`) enter wasm to read the PNG (colour type, tRNS) or WebP (VP8/VP8L/VP8X) header: opaque images without transform or clip are uploaded straight into the layer texture, the rest go through a reused upload texture and are blended. Decoded images are first drawn into an accelerated 2D `OffscreenCanvas` (deferred to the GPU process) and uploaded from there, so the WebGL upload is a GPU-to-GPU copy rather than a synchronous copy on the drawing thread.
+
+**zstd images: decoded in wasm when the frame is drawn.** A zstd image (section 3.5) is kept as received (`QueuedImage::Zstd`) in the place its `img` takes in the frame, and counts as ready as soon as its `end` arrives, so a frame of them waits for nothing. When the frame runs, the image is decoded into a pixel buffer reused from image to image and uploaded with `texSubImage2D` from a view of the wasm memory, into the layer texture for SRC and OVER without transform or clip, through the upload texture otherwise. No decoder object, no promise, no staging canvas. The worker announces the type only when its wasm can decode it (`set_zstd_images`; `?png` on the session page turns it off).
+
+**PNG decoded in wasm while seeking** (`png.rs`, `QueuedImage::Png`). While nothing is presented (section 4.10), PNG images bypass the browser: the `png` crate decodes and premultiplies them in wasm and they are uploaded like zstd images. Through `ImageDecoder` and the staging canvas an image costs about 120 µs on an Apple M4, most of it the staging `drawImage`; decoded in wasm about 30 µs, most of it `texSubImage2D`. Live sessions keep the browser's decoder, which runs off the drawing thread.
+
+### 4.5 Video (`video.rs`)
+
+The client advertises in the handshake only the codecs `VideoDecoder.isConfigSupported` accepts (`video/av1`, `video/h265`, `video/h264`). A `video` stream is unpacked with the framing of section 3.4 into a WebCodecs `VideoDecoder` (`optimizeForLatency`, hardware decoding where available). Each frame takes an image slot in the frame queue, like `img`, filled by the decoder's `VideoFrame`, so video stays in step with `sync` and with the other drawing. Decoded frames are uploaded to the layer texture on the GPU. A decoder error fails the pending slots (the frames are still applied) and is reported to the server with an `ack` error, after which the server sends images.
+
+On the binary tunnel a frame that lies whole within a blob (molcajeted starts each frame in a new record) goes to `EncodedVideoChunk` as a view of the message; a larger frame is reassembled by `FrameReader`.
+
+The decoder is configured with a fixed, generous codec string per codec (`codec_string`), not one derived from the stream's SPS or sequence header.
+
+### 4.6 Tunnel (`tunnel.rs`)
+
+The client offers the subprotocols `molcajete-binary-v1, guacamole` (`set_binary_tunnel(false)` or `?text` offers only `guacamole`). Which one the gateway chose only shows in the messages that arrive, so both kinds are accepted at any time; the tunnel's own messages (UUID, ping replies) are always text.
+
+A binary message is an `ArrayBuffer`. The client reads each record header through a typed-array view, copies instruction text straight into the parser buffer (`Parser::feed_with`), and keeps stream data as views of the message: images as in section 4.4, video as in section 4.5, and PCM copied once, into wasm for Web Audio or, in worker mode, into its own buffer transferred to the page (transferring the message would detach the image views). The text path (string → parser → base64 decoder) stays for stock gateways and for recordings.
+
+Keep-alive: `nop` every 5 s, a tunnel ping every second (its round trip is reported in `stats`), and the tunnel counts as dead after 15 s without a message.
+
+### 4.7 Input, clipboard and terminals
+
+**Keyboard** (`input`). The keysym is derived from `KeyboardEvent.key`/`code`/`location` with tables ported from guacamole-common-js. The keysym sent on press is remembered per physical key (`code`) and sent again on release, so releasing Shift first does not leave an `A` pressed. Keys are released when the input sink loses focus (`release_keys`). Ctrl+Alt+Shift opens the session menu (`useMenuShortcut`), as in Guacamole.
+
+**IME.** By default composition is left to the browser, and the `compositionend` result is sent as Unicode keysyms (`0x01000000 | code point`), pressed and released.
+
+**Remote composition** (`set_remote_composition`, session menu, remembered per connection in the browser). The remote host's IME composes instead, as with native RDP and VNC clients. The input sink becomes read-only so that the browser starts no composition, and a key the local input source claims (`key` is `Process` or a Hangul jamo) is sent as the US-layout character of its physical position (`code`, with Shift), so every key press reaches the remote side at once. `Lang1`/`HangulMode` are sent as `Hangul` (0xFF31); on macOS, which switches input sources with Caps Lock, a Caps Lock press that does not change the lock state is sent as `Hangul` too. molcajeted's RDP side sends `Hangul` and `Hangul_Hanja` as scancodes 0x72 and 0x71, and `server-layout=ko-kr-qwerty` sets the input language to Korean (0x412). SSH has no remote IME and always composes in the browser.
+
+**Mouse.** Pointer Events with pointer capture. Wheel deltas accumulate in 53 px steps (as in the stock client).
+
+**Clipboard.** Both directions as UTF-8 `clipboard` streams in 3 KiB blobs (`send_clipboard`). `required` requests (missing credentials) are answered with `argv` streams (`send_argv`), which also carry display parameters during a session (section 4.8).
+
+**Terminals.** SSH sessions are drawn on the server (section 6.7), so the browser has no text to select, copy or paste. For terminal protocols the page turns on terminal shortcuts (`set_terminal_shortcuts`): `molcajete.js` listens on the container in the capture phase, ahead of the client's own listeners in either mode, and keeps the keys it handles from the remote side.
+
+- *Copy.* Releasing a selection makes the daemon send its text as a `clipboard` stream (as guacd does); the page writes it to the local clipboard. That write happens after a round trip, outside the user gesture, so the shortcut (⌘C on macOS, Ctrl+Shift+C elsewhere; Ctrl+C stays `^C`) writes the last selection again within the key event. A click that clears the selection makes molcajeted send `selection,0`, so the shortcut does not copy text that is no longer selected.
+- *Paste.* ⌘V and Ctrl+Shift+V are neither forwarded nor prevented, so the browser fires `paste`, whose text is read without the Clipboard API's permission prompt. The client sends it as a `clipboard` stream followed by Ctrl+Shift+V (the paste keys of molcajeted and guacd), pressing Ctrl and Shift only when not already held (`paste_text`). Instructions keep their order on the tunnel, so the daemon has the text before the keys.
+- *Links.* molcajeted reports the link under the pointer with `link,<url>`, or `link` without an argument when there is none. The page shows the target, and ⌘-click (Ctrl-click elsewhere) opens it with `noopener,noreferrer` within the click, so popup blockers let it through; the click does not reach the remote side.
+
+### 4.8 Display size and scale
+
+The client scales the remote display into its container: `Fit` shrinks to fit and never enlarges, `Native` shows one remote pixel per device pixel (`set_scale_mode`). With auto-resize (`set_auto_resize`) it sends `size` when the container resizes, and the current size when auto-resize is turned on.
+
+For RDP the browser also decides whether the desktop takes the window's size (`resize-method=display-update`) and its scale (`dpi`, 96 per 100 %; without one the DPI is `96 × devicePixelRatio` of the connecting browser). Both are connection parameters with guacd's names and meanings. The session menu changes them for one connection in one browser (preferences `remoteScale.<id>` and `resizeToWindow.<id>` in `localStorage`):
+
+- At connect the page adds `param.dpi=<dpi>` and `param.resize-method=display-update` to the tunnel URL (`tunnelOverrides`). The gateway replaces the connection's parameters with these for that tunnel only; an empty value removes the parameter, so "Automatic" makes the DPI follow the browser even when the connection has a fixed one. No other parameter can be set this way (`valid_override`). The connection list returns `dpi` and `resizeMethod` so that the menu can show what is in effect.
+- During the session the page sends a new value as an `argv` stream, the protocol's way to change a parameter while connected. molcajeted applies `dpi` and `resize-method` immediately (section 6.8); stock guacd does not, so with it a change takes effect at the next connection.
+- molcajeted sends `display-control,0` when its RDP server cannot apply changes and `display-control,1` when it can; the session menu then disables "Remote scale" and "Resize to window", and "Fit" stays.
+
+### 4.9 Audio
+
+Raw PCM (`audio/L8`, `audio/L16`) is played with Web Audio, scheduled 50–300 ms ahead (`audio.rs`). In worker mode the worker hands PCM to the page (`audio-start`/`audio-data`/`audio-end` events, buffers transferred without copying) and the page's `PcmPlayer` schedules it. The audio context resumes on the first pointer or key input (autoplay policy).
+
+### 4.10 Playback of recordings
+
+The same client plays recordings made by the gateway (section 5.6) or by guacd. `MolcajeteSession.create(container, {playback: true})` makes a player that takes no input; `RecordingPlayer` (`molcajete-player.js`) runs where the client runs (the worker, or the page without OffscreenCanvas).
+
+- **Loading.** The page fetches the file with progress; the client copies it into wasm memory and indexes it (`recording::Index`, `load_recording`): for every `sync`, and every `mouse` and `key` with a time, where it ends and its time from the start, kept non-decreasing. A 330 MB recording loads and is indexed in about 0.3 s.
+- **Playing.** Playing to a moment (`playback_advance`) feeds the client everything up to the last indexed point at or before it, paced by `requestAnimationFrame`. The recorded `mouse` positions the software cursor, so the pointer is visible without a frame from the server. The page offers 1×, 2×, 4× and 8×. The recorded `error` and `disconnect` at the end leave the display as it is. Audio is not played back.
+- **Seeking** turns drawing to the canvas off (`set_presenting(false)`), feeds 4 MiB at a time while up to 64 frames wait for their images, and draws the result once: frames on the way are applied to the layers and never presented, and PNG images are decoded in wasm (section 4.4). A moment before what was played starts over from an empty display; seeking forward continues from the current position.
+
+Measurements are in section 7.7.
+
+## 5. Gateway (`molcajete-gateway`)
+
+The gateway is an axum server. It serves the web UI (`web/dist`), the JSON API under `/api` (authentication, connections, folders, users, groups, recordings, settings, client reports), the tunnel at `/websocket-tunnel` and `/healthz`. Its own configuration is a TOML file (`gateway.example.toml`); everything managed through the UI is in the database. Configuration keys are listed in [deployment.md](deployment.md).
+
+### 5.1 Tunnel (`tunnel.rs`, `guacd.rs`)
+
+The tunnel follows the stock contract of section 1.2, so guacamole-common-js works against it too.
+
+1. The upgrade request must come from the gateway's own origin and carry a valid session; the query string (`TunnelRequest::from_query`) accepts the short names of the molcajete client (`connection`, `width`, `image`, ...) and the stock `GUAC_*` names.
+2. The connection is looked up for the user (section 5.3). An unknown or forbidden connection closes the socket with `RESOURCE_NOT_FOUND`.
+3. The gateway performs the handshake with the connection's guacd (its own host and port, or the default) (`guacd::connect`), answering the highest common protocol version. A failed handshake closes the WebSocket with the mapped status code in the close reason, like the Java web app.
+4. `relay` pumps both directions until either side ends:
+   - daemon → browser: whole instructions (or records) are batched into one message of up to 64 KiB, sent as soon as the next read would block. Three framings exist (`Framing`), see section 5.2.
+   - browser → daemon: text only, parsed with `Limits::STRICT` and forwarded verbatim. Internal pings are answered by the gateway and never reach the daemon.
+
+The handshake, the framing and the tunnel's end are logged (`tunnel established` with `framing`, `tunnel closed` with byte counts); see [observability.md](observability.md).
+
+### 5.2 Binary tunnel negotiation
+
+Each leg is negotiated on its own and falls back to the text protocol when the peer does not know the extension:
+
+- **Browser ⇄ gateway.** The client offers `molcajete-binary-v1, guacamole`. The gateway selects the first it supports; with `[server] binary_tunnel = false`, or an older gateway, it selects `guacamole`. The stock client offers only `guacamole` and gets exactly the stock tunnel.
+- **Gateway ⇄ daemon.** molcajeted lists the parameter `molcajete-binary` last in `args`. A gateway whose browser selected the binary subprotocol answers `1` in `connect`, and molcajeted switches to records after `ready`. In every other case the gateway sends an empty value (a connection parameter of that name in the database is never passed on), as does the stock web app for a parameter it has no setting for. Stock guacd never lists the parameter and is sent nothing it does not know.
+
+| Browser | Daemon | Browser ⇄ gateway | Gateway ⇄ daemon | `framing` |
+|---|---|---|---|---|
+| molcajete-client | molcajeted | binary (records forwarded) | records | `binary` |
+| molcajete-client | stock guacd | binary (gateway decodes base64 into blob records) | text | `transcoded` |
+| stock guacamole-common-js | molcajeted | text | text | `text` |
+| stock guacamole-common-js | stock guacd | text | text | `text` |
+| stock web app (Java) | molcajeted | — | text | — |
+
+molcajeted logs `binary` in `connection established`.
+
+**Compression.** WebSocket `permessage-deflate` is not used and must stay that way for these payloads, which are already compressed. tungstenite (under axum 0.8) does not implement the extension, so the gateway never answers the browser's offer with `Sec-WebSocket-Extensions`; a test checks this for every tunnel mode.
+
+### 5.3 Authentication
+
+**Sessions** (`auth.rs`, `db/sessions.rs`). A login sets an opaque random token in an `HttpOnly`, `SameSite=Strict` cookie (`molcajete_session`, `Secure` behind HTTPS); the database stores only its SHA-256. Requests that change state must be JSON and, like the tunnel, come from the gateway's own origin when the browser says where they come from (`same_origin`). API responses are `no-store`.
+
+**Passwords.** Argon2id hashes, computed off the async workers. A login for an unknown username is verified against a dummy hash, so the response time does not reveal which usernames exist. Users created through single sign-on store `!`, which no password matches. At start the gateway imports `[[users]]` (as administrators) and `[[connections]]` from its configuration file and, when there are no users at all, creates `admin` with a random password it logs (`bootstrap.rs`).
+
+**OpenID Connect** (`oidc/mod.rs`). The authorization code flow with PKCE:
+
+```
+GET /api/auth/oidc/login     random state, nonce and PKCE verifier
+                             → molcajete_oidc_login (keyed by the state's hash, used once, 10 minutes)
+                             → state also in an HttpOnly cookie (molcajete_oidc_state)
+                             → redirect to the provider
+GET /api/auth/oidc/callback  state must match the cookie; exchange the code;
+                             verify the ID token (signature, issuer, audience, expiry, nonce, access token hash);
+                             find or create the user; issue the usual session cookie
+```
+
+- A user is found by the token's `iss` and `sub` (`molcajete_user_identity`). On the first sign-in of an identity the user with the same username is linked, unless it is already linked to another identity at that provider, or a user is created when `auto_create_users` allows it.
+- A changed username at the provider renames the user when the new name is free.
+- On every sign-in the provider's groups (`groups_claim`) can set group memberships (`sync_groups`, optionally `create_groups` and a `group_prefix`) and the user's own role (`admin_groups`, `connection_manager_groups`; `sync_role` also lowers it). A change that would leave no enabled administrator is skipped with a warning.
+- The ID token is kept with the session for RP-initiated logout.
+
+How to set this up is in [administration.md](administration.md).
+
+### 5.4 Authorization
+
+**Roles** (`Role`): `user` opens the connections granted to them; `connection_manager` also sees and opens every connection, manages connections and folders and grants them; `admin` can do everything, including users, groups and roles. Roles are stored per user and per group, and a user's effective role is the highest of their own and their groups'. Request extractors enforce them: `CurrentUser` (signed in, else 401), `ConnectionManager` and `AdminUser` (else 403). The database refuses changes that would leave no enabled administrator (`DbError::LastAdmin`).
+
+**Grants.** Connections live in a tree of folders (`molcajete_connection_group`). A connection or a folder can be granted to a user or a group; a folder grant covers everything below it. One table per (principal, target) pair, as in Guacamole's JDBC schema:
+
+| | connection | folder |
+|---|---|---|
+| user | `molcajete_connection_permission` | `molcajete_connection_group_permission` |
+| group | `molcajete_group_connection_permission` | `molcajete_group_connection_group_permission` |
+
+**The reachability query** (`db/grants.rs`, `REACHABLE`). The connections a user may open are found with one recursive query that every backend runs:
+
+```sql
+WITH RECURSIVE
+  my_groups (group_id)         -- the user's groups
+  granted_folders (id)         -- folders granted to the user or to one of those groups
+  folders (id)                 -- those folders and every folder below them (recursive)
+  reachable (connection_id)    -- connections granted to the user or their groups,
+                               -- plus connections whose parent is in folders
+```
+
+The tunnel checks one connection against it (`connection_for_user`) and the connection list is filtered by it (`connection_summaries`); connection managers and administrators skip it.
+
+### 5.5 Database and migrations (`db/`)
+
+One code path serves SQLite, PostgreSQL and MySQL/MariaDB through sqlx's `Any` driver. Queries are written with `?` placeholders and rewritten to `$n` for PostgreSQL (`Database::sql`); every integer column is `BIGINT` and ids are strings, so rows decode the same way everywhere. Migrations are per dialect in `crates/gateway/migrations/{sqlite,postgres,mysql}` and run at start:
+
+| Migration | Adds |
+|---|---|
+| `20261125000000_init` | users, connections and their parameters, user grants, login sessions |
+| `20261126000000_groups_roles_folders` | groups and members, roles, folders, group and folder grants |
+| `20261126000100_recordings` | connection attributes, the recording index |
+| `20261126000200_oidc` | identities at providers, pending sign-ins |
+
+Connection attributes (`molcajete_connection_attribute`) hold molcajete's own per-connection switches (`record-sessions`, `record-keys`, `record-exclude-mouse`, `record-molcajete-formats`); unlike parameters they never reach the daemon. Upgrading is described in [deployment.md](deployment.md#upgrading).
+
+### 5.6 Recording
+
+**Why in the gateway.** guacd records in the daemon (`recording-path`), teeing its socket into a file. molcajete records in the gateway (`recording.rs`): the gateway sees the stream of stock guacd and molcajeted alike, so one implementation covers both; it owns the database the recordings are indexed in; and molcajeted may run on another host whose disks the gateway and its API cannot reach (for example natively on a Mac for VideoToolbox while the gateway runs in Kubernetes). Stock `recording-*` parameters still go to stock guacd, which records as before.
+
+**Format.** The file is what guacd writes: the daemon → client instruction stream after the handshake, as Guacamole text, with the user's input in between as guacd's recording code writes it: `mouse,x,y,mask,timestamp` and `key,keysym,pressed,timestamp`. guacenc, the stock player (`SessionRecording`) and molcajete's player read it.
+
+- The tunnel's own instructions are left out.
+- Blob records of the binary tunnel are written back as base64 `blob` instructions of at most 6048 bytes, as libguac cuts them, whatever records the data came in (`Encoder` holds the rest of a blob until the stream's next data), so a session gives the same file on either tunnel. For this the instruction records from molcajeted are cut into instructions.
+- Times never go back. guacenc fills the time between two timestamps with frames and, given an earlier one, loops about four billion times. Frames carry the daemon's clock and input is seen on the gateway's, possibly on different hosts, so input is timed on the daemon's clock as of the last `sync` and never before the latest time written; a `sync` timed before input written ahead of it is moved up to that time.
+- Mouse by default, keys only on request (`record-exclude-mouse`, `record-keys`, like guacd's `recording-exclude-mouse` and `recording-include-keys`).
+
+**Compatibility over fidelity.** guacenc skips `image/x-molcajete-zstd-v1` images and every video stream, and the stock player draws neither. A recorded session therefore does not announce them (`stock_formats_only` drops them from the handshake), and molcajeted sends PNG and JPEG as it would to a stock client. The cost is the bandwidth and client time those formats save, for recorded connections only. A connection with `record-molcajete-formats` keeps them, and its recordings play in molcajete only.
+
+**Writing, index and retention.** A recording starts after a successful handshake; the file and its row in `molcajete_recording` are created first, and a session whose file cannot be created is refused (`SERVER_ERROR`). Both directions of the relay encode into one `Encoder` (a mutex never held across an await); before each message to the browser and after each message from it the encoded text goes through a bounded channel to a writer thread, so a slow disk slows the tunnel down instead of losing data. When the tunnel closes, the row gets its end time and size; a row left open by a crash is completed from its file at the next start. Retention runs at start and every 10 minutes: by end time (`max_age_days`) and, newest first, deleting everything older than where the sizes add up past `max_total_size`. The recording endpoints are for administrators only.
+
+### 5.7 Client reports
+
+The page posts the client's once-per-second `stats` to `/api/telemetry/client` (`client_report.rs`) when reports are enabled. The gateway records them in histograms labelled by connection, client mode and kind of client, and logs a summary per batch naming the tunnel and molcajeted's connection id. This is the only view into the browser side of the pipeline; see [observability.md](observability.md).
+
+## 6. molcajeted (`molcajete-daemon`)
+
+### 6.1 Session model
+
+molcajeted listens on port 4822 like guacd and runs one tokio task per connection, where guacd forks a process.
+
+- **Handshake** (`handshake.rs`). Compatible with guacd: `args` advertises `VERSION_1_5_0` and the argument names of guacd's plugins for `vnc`, `ssh` and `rdp`, so a connection configured for guacd works unchanged; `molcajete-binary` is appended last (section 5.2). Joining a running connection (`select,$id`) is refused, and other protocols get `UNSUPPORTED`. Client input is parsed with `Limits::STRICT`.
+- **Output** (`io.rs`). Everything sent to the client goes through one `Output`: instructions are appended as text, stream data with `Output::blob`, which writes base64 `blob` instructions of at most 6048 bytes for a stock client and blob records for a molcajete gateway. Display, video, audio and clipboard code is the same for both.
+- **Input** (`session.rs`). A reader task decodes client instructions into `ClientEvent`s (mouse, key, size, clipboard, `argv`, sync replies with their arrival time and apply time, stream acks), reassembling inbound `clipboard` and `argv` streams.
+- **Loop.** Each protocol runs one `select!` loop over remote updates, client input, the frame timer, the idle timer (`Display::idle_deadline`, for ending an idle video and refining lossy areas without new changes) and a 5 s keep-alive. The frame is built inside `block_in_place` on the connection's task.
+
+### 6.2 Display: diffing and encoding
+
+The server-side display (`display/`) is shared by all three protocols. It keeps two copies of the default layer:
+
+- `pixels`: the screen as the remote protocol reports it (`put`, `put_image`, `fill`, `copy`)
+- `sent`: a copy of what the client's layer holds, built by replaying every instruction molcajeted sends (fills, images, copies)
+
+Because the instructions sent are replayed on the copy, every optimisation corrects itself: a wrong guess shows up as a difference in the next comparison and is sent as pixels. A VNC CopyRect only needs the same `copy` applied to the copy, without flushing the source area first. A client simulator that replays the output, and a randomized test of 40 seeds of 60 random steps each (`fuzz_client_always_matches_framebuffer`), check that the client always ends up equal to the framebuffer.
+
+A flush (`Display::flush`) runs these steps over the 64×64 tiles touched since the last frame:
+
+1. **Compare once.** The touched tiles are merged into regions, and the changed column range of every row of a region (first and last differing pixel) is found with one comparison of the two buffers (`RegionDiff`). The later steps read those ranges instead of comparing again, and compare only inside a row's range where they need to know more.
+2. **Scroll detection.** Row hashes find vertical moves, sent as `copy` (at least 8 rows).
+3. **Move detection in any direction** (dragged windows). Changed regions are grouped by distance (at most 4 tiles apart) and each group is searched on its own. Hashes of the changed 64×64 blocks are looked up while a 64×64 window slides over the client copy, using a 2D rolling hash with two odd multipliers that subtracts the rows and columns leaving the window. Areas up to 512 pixels per axis are searched completely; larger ones in samples of 127×127 pixels every 384 pixels, each sample holding one window position for every way a block can be offset against the tile grid, after which the displacements found are tried on every changed block. Blocks moved by the same offset become one `copy`, front of the movement first. guacd 1.6 slides with multiplier 62 and no subtraction, which leaves part of the block out of the hash and produces many false matches.
+   Every copy is checked against the framebuffer before it is sent, so afterwards its rows can only still differ outside it, and only those columns are compared again.
+4. **Remaining differences** are cut into changed row bands and column runs within them. A client is slowed by the number of images in a frame more than by their size, so rectangles are joined into their bounding box wherever one image is estimated to be cheaper than two: an image costs 1 KB (`IMAGE_OVERHEAD_BYTES`: headers, the `img`/`blob`/`end` instructions and a decode on the client), the unchanged pixels a join adds 1 byte per 8 pixels, or per 128 in rows that are one colour or repeat the row above. Lines of text that changed over the same columns share an image, since the leading between them is flat. Joined images stay below one megapixel so that a large update is still decoded as several images in parallel.
+5. **Encoding** chooses per rectangle (`display/encode.rs`):
+
+| Region | Sent as |
+|---|---|
+| one colour | `rect` + `cfill` |
+| opaque, up to 256 colours, client takes zstd images | zstd image, indexed |
+| opaque, more colours, at least 3 of 4 pixels equal to their left neighbour (sampled every fourth row), client takes zstd images | zstd image, RGB (level 3) |
+| up to 256 colours, otherwise | palette PNG (1/2/4/8 bit) |
+| more colours, otherwise (photographs, gradients) | RGB PNG (DEFLATE level 4, adaptive filter) |
+| any transparent pixel; the cursor; larger than the zstd type allows | PNG |
+| large, colourful and changing often, client takes JPEG, session not `force-lossless` | JPEG, re-sent losslessly by this table once the area calms down |
+
+The share of repeated pixels separates screen content from photographs well: it is 94 to 97% in windows and pages with more than 256 colours in recorded sessions and 3 to 15% in photographs. Without a row filter Zstandard needs 22 to 74% more bytes than PNG for a photograph and 37 to 45% fewer for those windows, so the rule keeps PNG exactly where its filters earn something. The check costs one look at a quarter of the rows of an image that already failed to fit a palette (0.17 ms on a 5120×512 photograph against 83 ms to encode it as PNG, `display::bench::zstd_images`).
+
+Lossy refinement: each tile has a heat (about updates per second, decaying). Lossy tiles are re-sent losslessly once their heat falls below 0.25; the idle timer makes this happen without a new change.
+
+### 6.3 Parallel encoding
+
+The rectangles of a frame are encoded side by side on a thread pool shared by all sessions (`display/pool.rs`, rayon): half the available cores, at most 8, set with `--encode-threads` (1 encodes on the session's thread). Regions do not overlap, so encoding only reads the framebuffer; the instructions are then written and the copy updated one rectangle after the other in the original order, so the output is the same instruction for instruction as encoding them one by one. Lossy refinement encodes on the pool too. Every pool thread keeps its own zstd context. The pool is bounded so that one busy session cannot take every core.
+
+The frame is still built on the connection's task, so input, audio and remote updates wait until it is done, only for a shorter time (section 7.5).
+
+### 6.4 Frame pacing and flow control
+
+molcajeted paces frames by what the client can take (`display/pacing.rs`). Remote updates keep arriving between frames and accumulate as differences from the copy, so short-lived intermediate states are never sent. The first change after a quiet period goes out immediately, so input stays responsive.
+
+**The client's need.** The next frame waits for the client's interval, at least the profile's floor and at most 500 ms:
+
+- A client that reports apply times (section 3.6): the median of its last 8 reports (the lower one of an even count), counting only those within 1 s before the last frame. A single slow frame does not move a median, and after a pause the interval starts afresh. The round trip is left to the window of unacknowledged frames.
+- Any other client: the exponentially smoothed time until its `sync` reply (the processing lag), counted up to when the reply arrived rather than when the session loop got to it.
+
+**Profiles** (`Pacing`, chosen with `Display::with_pacing`; all protocols ask `Display::next_frame_at`):
+
+| | `Pacing::DESKTOP` (RDP, VNC) | `Pacing::TERMINAL` (SSH) |
+|---|---|---|
+| Floor | 16 ms (about 60 fps) | 33 ms (about 30 fps) |
+| After a frame over 32 KiB | 66 ms, or less once the client has acknowledged it | at least 66 ms (about 15 fps), however fast the acknowledgement |
+| Byte budget | 8 MiB/s: a quarter second's worth may go at once, beyond that frames are spaced at the budget's rate (at most 500 ms apart) | none |
+
+On a 4K or 5K screen nearly every frame of scrolling or dragging is larger than 32 KiB, and a fixed pause held those to 15 fps on links that take 60; for desktops the pause therefore lasts only until the link has delivered and the client applied the frame. For terminals more frames under a flood of output show nothing more, so the pause bounds bandwidth (section 7.4). While a video stream is active the floor is 33 ms, the rate its rate control was set up for.
+
+**Flow control.** Each protocol keeps a window of unacknowledged frames (`MAX_UNACKED_FRAMES`): RDP and VNC send while at most 2 are pending (so up to 3 are in flight), SSH stops at 2. With the window full no update requests go to the remote server; they resume when replies arrive, or with the next 5 s keep-alive. RDP additionally sends a frame at least every 100 ms while PDUs keep arriving (`rdp/pacing.rs`).
+
+### 6.5 Video mode
+
+Areas with a lot of motion (video playback, animation, 3D) are expensive even as JPEG. molcajeted finds them and sends them as a video stream into a separate layer, using the protocol's `video` instruction unchanged with the framing of section 3.4. Stock clients do not advertise these mimetypes, so they keep getting images.
+
+**Negotiation.** The server picks, in the operator's order (`--video av1,h265,h264`, `none` to disable), the first codec the client advertised and an encoder can produce (`session::enable_video`). Video is not used for `force-lossless` sessions or for SSH.
+
+**Finding the area** (`display/video.rs`). Each 64×64 tile's motion score grows by one per frame in which it had to be sent as pixels and halves every second. Tiles scoring 8 or more are busy: at 30 fps this takes about 0.3 s, at 15 fps about 0.6 s, and fewer than 6 updates per second never get there. Scrolling and window moves are handled by `copy` first, so they are not mistaken for video. Video starts when the bounding box of the busy tiles has at least 6 tiles, busy tiles cover at least half of it, and it holds more than 256 colours.
+
+**The video layer.** Layer 1 is sized to the area (rounded up to multiples of 16) and placed over it, and a `video` stream is opened on it. The frame given to the encoder (the padding repeating the last column and row) is kept between frames and updated only in the tiles touched since the last flush, one pixel row at a time, so a small change costs a few rows and a frame in which the same pixels were drawn again is not encoded. The first frame is a key frame carrying the codec configuration. Tiles inside the area are left out of the image diff.
+
+**Keeping the default layer honest.** While the video plays, the video area of `sent` is not touched, so the copy keeps matching what the default layer holds beneath the video. When the area has not changed for 1 s, the layer is removed (`end`, `dispose`) and in the same frame the area is compared with the copy and updated losslessly, so no lossy content stays on screen and nothing stale shows through.
+
+**Moving and growing areas.** When the busy area extends beyond the video, the video restarts over the new area once it has extended beyond it for 8 frames and then not grown for 10 more (flickering edges do not count as growth), or after 60 frames even if it keeps growing; meanwhile the part outside goes as images. The new area covers everything the busy area covered meanwhile and, where it grew from the old video, is extended by as much again on those sides, so an opening or resizing window restarts the stream once or twice instead of every few frames (simulating a window growing from 832×960 to 1280×2176 over 3 s: 2 starts instead of 8).
+
+**Codecs and bitrate.** The target is area × 30 fps × 0.1 bits per pixel for H.264, 0.7× that for H.265 and 0.6× for AV1, between 300 kbps and 16 Mbps. Software encoders are slow on large frames, so an area beyond what the best backend encodes in real time uses the next codec (`realtime_pixels`: SVT-AV1 up to 1280×736, about 25 ms per 720p frame; x265 up to 1920×1088). Hardware encoders and software H.264 have no limit.
+
+**Encoders** (`video/`). Backends in order of preference for a codec:
+
+1. hardware: VideoToolbox on macOS (H.265, H.264), and through ffmpeg NVENC, QSV, VA-API and AMF when `ffmpeg -encoders` lists them
+2. software through ffmpeg: libsvtav1, libx265, libx264
+3. the built-in OpenH264 encoder (cargo feature `openh264`, needs a C++ compiler)
+
+Each candidate must pass a trial encode at start. All backends emit one access unit per frame, without lookahead or reordering.
+
+- **Colour conversion** (`video/yuv.rs`). molcajeted converts RGBA to 4:2:0 itself for every backend, BT.709 limited range (signalled in the bitstream), with the same fixed-point arithmetic everywhere; on aarch64 with NEON 16 pixels at a time, bit-identical to the scalar code that handles the rest of a row and other architectures. Output is planar (`yuv420p`) or NV12 depending on the encoder.
+- **ffmpeg** (`video/ffmpeg.rs`) runs as a child process per encoder, driven over pipes and never linked, so the GPL x264/x265 pose no licensing problem. Raw 4:2:0 frames go to stdin; packets come back framed by the AVI muxer (`video/avi.rs`), because with a raw elementary stream the end of a frame is only known when the next one starts, which would add a frame of delay. ffmpeg cannot be asked for a key frame over a raw pipe, so a forced key frame restarts the process.
+- **VideoToolbox** (`video/videotoolbox.rs`) is called directly instead of through ffmpeg's `*_videotoolbox`, because ffmpeg does not wait for VideoToolbox's asynchronous output and each packet would come one frame late. After each frame `VTCompressionSessionCompleteFrames` waits for its packet. The conversion writes straight into the planes of the NV12 pixel buffer taken from the session's pool. Length-prefixed NAL units are converted to Annex B with the parameter sets in front of key frames. The session requires the hardware encoder.
+
+**Failures.** An encoder error ends video mode and falls back to images; after three failures the session stops trying. A client rejecting the stream or reporting a decoder error with `ack` turns video off for the session.
+
+### 6.6 VNC (`vnc/`)
+
+An RFB client of its own (`vnc/rfb`): RFB 3.3/3.7/3.8, None and VNC authentication, Raw/CopyRect/Hextile/ZRLE, the Cursor/DesktopSize/ExtendedDesktopSize/LastRect pseudo-encodings, clipboard in both directions and remote resize. It always asks for 32 bpp little-endian true colour, so every decoder handles one pixel layout. CopyRect becomes a `copy` on both the display and its client copy. Parameters (`hostname`, `encodings`, `read-only`, `disable-copy`, `force-lossless`, ...) follow guacd's VNC plugin.
+
+### 6.7 SSH (`ssh/`)
+
+- **Connection** with russh: password, private key with passphrase, keyboard-interactive, asking with `required` when a value is missing, and `host-key` pinning.
+- **Terminal.** alacritty_terminal keeps an xterm-compatible screen (256 colours and true colour, alternate screen, scrollback, bracketed paste, SGR mouse). The default terminal type is `xterm-256color`.
+- **Rendering.** Cells are rasterised on the server with ab_glyph, and only the row spans that differ from the previous frame go into the display; scroll detection and encoding are up to the shared display, so any Guacamole client works. DejaVu Sans Mono is bundled, with the bundled NanumGothicCoding as fallback for Hangul, Han and Kana; `font-path` and system fonts are further fallbacks. Double-width and box-drawing characters are drawn to the cell grid.
+- **Selection and clipboard.** Drag and double-click select; releasing sends the text as a `clipboard` stream; a click that clears the selection sends `selection,0`. Ctrl+Shift+V and right-click paste. Wheel scrolls back.
+- **Links** (`ssh/link.rs`). The cell under the pointer is checked for an OSC 8 hyperlink or an `http://`, `https://` or `mailto:` URL in the line's text, followed across wrapped lines (at most 16 each way) and without trailing punctuation or unbalanced closing brackets. Links are looked for when the pointer moves, a modifier changes and before every frame; not while the application takes mouse events (Shift bypasses it) or a button is held. The link is underlined, the pointer becomes a hand, and the client gets `link,<url>` or a bare `link`.
+
+Parameter names match guacd's SSH plugin.
+
+### 6.8 RDP (`rdp/`)
+
+- **Protocol** through IronRDP (connector, session, graphics, cliprdr, displaycontrol, rdpsnd, rdpdr) with rustls. Security: TLS and NLA (CredSSP/NTLM); certificates are verified unless `ignore-cert` is set. IronRDP does not implement standard RDP security (RC4), so `security=rdp` (and `vmconnect`) are refused.
+- **Graphics.** Bitmap updates go into the display per changed rectangle, copied once straight from IronRDP's decoded image: `Display::put_image` takes a `SourceImage` (data, stride, `ChannelOrder`) and writes opaque RGBA in the same pass (section 7.8). Pointer bitmaps become the cursor. IronRDP does not pass drawing orders such as ScrBlt through, so RDP gets no `copy` hints from the server; the shared display's scroll and move detection find them.
+- **No bulk compression.** IronRDP's reactivation sequence rejects compressed Share Data PDUs, which xrdp sends after a resize once compression is negotiated, and the bulk decompressor is private to IronRDP's active stage, so compression is not negotiated.
+- **Input.** Modifiers, function keys and shortcuts are sent as scancodes, other characters (Hangul included) as Unicode events; Hangul and Hanja as scancodes 0x72 and 0x71 (section 4.7). Mouse and text clipboard in both directions (UTF-16).
+- **Display size and scale.** Display Control ([MS-RDPEDISP]) is offered to every server. A new size (`size` while resizing follows the window) and a new scale (`argv` `dpi`) both go out as a monitor layout: the size the desktop has or is about to get, with `DesktopScaleFactor` from the DPI (100–500 %) and `DeviceScaleFactor` at Windows' plateaus 100, 140 and 180 %. Requests are applied after 500 ms without another one. The server opens the channel when it likes, and "not yet" and "never" look the same, so the channel counts as missing when the server did not join `drdynvc`, or 10 s after the session became active (`display_control::WAIT`); molcajeted then sends `display-control,0`, and `display-control,1` if the channel opens later. Windows applies a new scale to applications that support per-monitor DPI; others keep their size until they restart.
+- **Audio** (`rdp/audio.rs`). The RDPSND static channel and the `AUDIO_PLAYBACK_DVC` dynamic channel are registered, together with a device redirection channel (RDPDR) that redirects nothing, because Windows only starts RDPSND once RDPDR has completed its capability exchange. Among the server's formats only decodable ones are accepted (PCM 8/16-bit, G.711, IMA/MS ADPCM), preferring 16-bit, 44.1 or 48 kHz, stereo. Sound goes out right away, independent of frame pacing, as `audio/L16;rate=R,channels=C` (8-bit if the client only takes L8). Without client audio or with `disable-audio` the channels are not created, so the remote session plays nothing. A rejected stream stops audio for the session.
+
+## 7. Verification
+
+### 7.1 Tests
+
+- **Unit tests.** Protocol: every split point, code point lengths, limits, invalid UTF-8, binary records at every split point, the zstd image decoder on damaged input. Gateway: the guacd handshake against a fake guacd, error mapping, query parsing, tunnels of all four client/daemon combinations through a real WebSocket, migrations and queries on every database backend, the OIDC flow against a fake provider, recording encoding, retention and permissions. Daemon: the handshake with and without the binary parameter, display merging, copy ordering and blob splitting, the same frame as text and as records, PNG and zstd round trips through the client's decoder, the choice between zstd and PNG, the client simulator and randomized display test, pacing, YUV conversion, the RFB client, RDP settings and keyboard mapping. Client logic: path tessellation, keysyms, key release pairing, wheel, PCM.
+- **Browser tests** (`tests/browser`, headless Chromium, `npm test`):
+  - `renderer.test.mjs`: pixels of the WebGL2 renderer against what the HTML-canvas reference client produces, including zstd images at every index depth, through clips, transforms and composite modes, damaged images, and frames where zstd, PNG and JPEG images overlap.
+  - `input.test.mjs`: keyboard and IME handling of the page-side client (Korean composition driven over CDP), in worker and main-thread mode.
+  - `binary.test.mjs`: a stand-in gateway sends one frame (a PNG larger than a record, a PNG with transparency, a JPEG, zstd images, PCM audio and an H.264 stream cut at arbitrary points) as records to a client offering the binary subprotocol and as base64 to one that does not, in worker and main-thread mode; all four must show the same pixels, and `sync` replies must carry the apply time only when asked.
+  - `playback.test.mjs`: seeking and playing recordings; a frame decoded by the browser and in wasm must give the same pixels.
+  - `video.test.mjs`: real H.264 and AV1 bitstreams made with ffmpeg, framed as molcajeted frames them, checked on the composited canvas, including the return to the default layer after `dispose`. Linux Chromium has no H.265 decoder; Windows Chrome 158 (headless, hardware decoding) decoded all three codecs.
+- **End to end.** VNC (x11vnc), SSH (OpenSSH) and RDP (xrdp and Windows 11) through the gateway, with stock guacd 1.6 and molcajeted, in worker and main-thread mode: display, key input with Shift combinations, Hangul, mouse, scrolling, selection and clipboard in both directions, resizing, error mapping (wrong password, closed port, host-key mismatch). On the stock guacd path Hangul on the SSH command line was garbled; molcajeted shows it correctly because of its `xterm-256color` default.
+- **Audio.** A 440 Hz sine played in an xrdp session arrives as `audio/L16;rate=44100,channels=2` (about 177 KB/s, on par with stock guacd), and the samples the browser schedules are at 440.0 Hz in both client modes.
+- **Recordings.** Real VNC, SSH and RDP sessions through stock guacd 1.6 and molcajeted (the latter on the binary tunnel) were encoded with guacenc 1.6 without errors, and their last frames show the session's screen; a session recorded with `record-molcajete-formats` encodes too but is nearly black there.
+- **Settling.** After scrolling an xterm continuously and stopping, the client canvas was compared pixel by pixel with the X server's screen (`xwd`). The molcajeted path showed zero differences in every run. The stock guacd 1.6 path, with either client, sometimes left hundreds to thousands of stale pixels where a window had closed; that is guacd's behaviour.
+
+### 7.2 The client against the stock client (`tests/browser/replay-bench.mjs`)
+
+Live comparisons are unreliable: guacd adapts the number of frames to how fast the client answers `sync`, so two clients do not even receive the same input. Instead, 12 seconds of the protocol stream of a real session (an x11vnc desktop with an xterm scrolling continuously) were recorded with timing and replayed into both clients with the same instructions at the same moments. Afterwards the two screens matched except for 15 cursor pixels. The metric is main-thread task time from CDP `Performance.getMetrics`, summed over the 12 s. The replay feeds text messages (base64 PNG), so it predates the binary tunnel and zstd images.
+
+Real GPU (Chromium ANGLE → D3D12, Intel Graphics, WSL2), 3 runs:
+
+| Recording | guacamole-common-js | wasm, main-thread WebGL | **wasm, worker + OffscreenCanvas** |
+|---|---|---|---|
+| guacd 1.6 (7.7 MiB) | 418 – 1,007 ms | 4,529 – 4,921 ms | **111 – 152 ms** |
+| molcajeted (33 MiB) | 806 – 862 ms | 4,206 – 4,713 ms | **179 – 183 ms** (one run 762 ms) |
+
+SwiftShader (software GPU, less noise), 2 runs:
+
+| Recording | guacamole-common-js | wasm, main-thread WebGL | **wasm, worker** |
+|---|---|---|---|
+| guacd 1.6 | 436 – 438 ms | 639 – 660 ms | **162 – 167 ms** |
+| molcajeted | 313 – 318 ms | 531 – 541 ms | **195 – 215 ms** |
+
+The worker figures include the harness posting the recording to the worker; in a session the WebSocket lives in the worker, so the main thread's share is smaller still.
+
+1. The wasm side (parsing, base64, dispatch) is a small part of the total.
+2. A Blob and `createImageBitmap` per image cost 80 ms per second for the Blob alone.
+3. In Chromium, uploading CPU-held decoded images (`VideoFrame`, `ImageBitmap`) into WebGL is synchronous on the calling thread. On a real GPU that made main-thread WebGL slower than the stock client, whose 2D `drawImage` is deferred to the GPU process.
+4. The same work in a worker cuts main-thread time to a third to a sixth of the stock client's and makes the page's responsiveness independent of how much the remote screen changes.
+
+`tests/browser/bench.mjs` makes the same comparison on a live session and is for reference only.
+
+### 7.3 zstd images in the client
+
+Two recordings (the list and the pages of section 3.5) were replayed into the client in headless Chromium 1228 on an Apple M4, once as recorded (PNG) and once with the images converted by molcajeted's rule. GPU (ANGLE on Metal), ranges of 3 or 4 runs:
+
+| Replay | Measure | PNG | zstd |
+|---|---|---|---|
+| list, `?main`, messages back to back | until every frame is applied | 0.35–0.40 s | 0.26–0.28 s |
+| | frame lag (`sync` to applied), average | 3.9–5.7 ms | 0.48–0.50 ms |
+| | main thread: tasks, of which script | 355–405 ms, 299–353 ms | 268–280 ms, 50–58 ms |
+| pages, `?main`, messages back to back | frame lag, average | 13.4–17.0 ms | 0.72–0.86 ms |
+| list, worker, recorded timing (25 s) | frame lag, average | 1.05–1.56 ms | 1.35–1.48 ms |
+| pages, worker, recorded timing (20 s) | frame lag, average | 1.91–2.04 ms | 1.43–1.62 ms |
+| list, `?main`, recorded timing | main thread: tasks, of which script | 862–927 ms, 514–554 ms | 956–1071 ms, 102–113 ms |
+
+- When frames queue up, a frame of zstd images is applied in a tenth of the time, because nothing in it is waited for.
+- At the pace of a session with about three images per frame, the frame lag is the same within the spread: a PNG is back from its decoder after about as long as a zstd image takes to decode.
+- Script time falls (to a fifth on the list), but the drawing thread now also carries the pixels to the GPU process, so with `?main` its task time at recorded timing was 10 to 40% higher. In the default worker mode that thread is the worker.
+- Without a GPU the upload dominates: on SwiftShader, `texSubImage2D` from memory took about 5.5 ms per megapixel on the calling thread, and the list's backlog took 0.75–0.85 s as zstd against 0.28 s as PNG.
+
+The wasm client grew by 50 kB for the zstd decoder. Not measured: a deployed session, other GPUs and browsers, the worker's own CPU time.
+
+### 7.4 Bandwidth against guacd
+
+An x11vnc desktop with an xterm scrolling continuously was recorded for 12 s at a time, alternating between the two daemons (`tests/browser/record.mjs`). The rows are historical stages of the display pipeline; load varied between measurements, so compare within a row.
+
+| Stage | guacd 1.6 | molcajeted |
+|---|---|---|
+| First implementation (merged change rectangles, fast PNG) | 7.7 MiB | 33.0 MiB |
+| Comparison with the client copy, scroll detection | 2.3 MiB | 9.7 MiB |
+| Better PNG compression, frame pacing | 3.0 / 4.7 MiB | **4.3 / 4.2 MiB** |
+
+Window dragging (xterm moved with xdotool, 10 s each, 2 runs): guacd 1.6 sent 0.73 / 1.04 MiB, molcajeted **0.40 / 0.41 MiB** while sending more frames (142 against 88–132). guacd 1.6 uses WebP heavily under this load; molcajeted got there with lossless PNG, and lossless WebP was 18% larger than its PNG on the same data. All settling checks after these optimisations showed zero pixel differences.
+
+A command flooding the terminal (`while :; do ls -la /usr/bin /etc; done`) for 8 s, alternating, with the browser client:
+
+| Connection | guacd 1.6 | molcajeted |
+|---|---|---|
+| SSH | 7.2 / 7.3 MiB, 13.5 fps | **5.5 / 5.6 MiB, 14 fps** |
+| RDP (xrdp) | 8.3 / 8.5 MiB, 15.5 fps | 8.1 / 9.4 MiB, 13–14 fps |
+
+SSH is still paced this way (`Pacing::TERMINAL`). The RDP row was measured with the fixed pause after heavy frames; with `Pacing::DESKTOP` a flooding terminal inside a remote desktop now gets more frames and bytes when the link and the client keep up.
+
+**Binary tunnel on the wire.** `display::bench` runs fixed scenarios on a 5K screen once per output mode (`cargo test --release -p molcajete-daemon display::bench -- --ignored --nocapture --test-threads=1`, the `wire` lines). Bytes and blobs per frame, molcajeted → gateway and, forwarded unchanged, gateway → browser:
+
+| Scenario | Text | Binary | Change |
+|---|---|---|---|
+| `scroll` (document scrolls) | 44.2 kB in 6.2 blobs | 33.1 kB in 1.0 blobs | −25.1% |
+| `drag` (window dragged) | 66.9 kB in 11.4 blobs | 50.3 kB in 4.5 blobs | −24.9% |
+| `corners` (two small changes) | 23.3 kB in 4.1 blobs | 17.5 kB in 2.0 blobs | −25.0% |
+| `page` (full page of new text) | 1151.1 kB in 149.6 blobs | 861.8 kB in 16.9 blobs | −25.1% |
+| `scatter` (40 small changes) | 173.6 kB in 39.0 blobs | 130.7 kB in 33.3 blobs | −24.7% |
+
+The binary stream is 0.2–3% larger than the encoded images themselves. These were measured with PNG images; zstd images shrink the payload further (section 7.5).
+
+### 7.5 Building a frame in molcajeted
+
+`display::bench` on a 5120×2654 framebuffer, ms per frame, after comparing once per flush and encoding side by side (M4 with 10 cores, pool of 5 threads, a busy machine, so indicative only; median of 3 runs):
+
+| Scenario | Flush, PNG client | Flush, zstd client | Pixel phase, PNG / zstd |
+|---|---:|---:|---:|
+| `page` (full page of new text) | 33.3 | 22.2 | 24.7 / 13.5 |
+| `scatter` (40 small changes) | 6.6 | 5.5 | 2.8 / 1.7 |
+| `scroll` (document scrolls) | 10.3 | 8.8 | 2.5 / 1.0 |
+| `drag` (window dragged over a wallpaper) | 6.4 | 6.2 | 2.0 / 1.8 |
+| `corners` (two small changes) | 1.5 | 0.9 | 1.1 / 0.5 |
+
+- Encoding side by side cut the pixel phase of `page` by 55% (PNG) and 37% (zstd), `scatter` by 46% / 26%; scroll and corners send about one image per frame and gain nothing. With 7.5 images per `page` frame the frame is now bound by its largest images.
+- Comparing once per flush took 26 to 30% off a scroll frame. Scroll and move detection still take 3 to 4.5 ms of frames in which they find nothing.
+- The output is the same instruction for instruction as before both changes (the lossless digests `display::bench` prints match).
+- zstd images cost 7.0% fewer image bytes than PNG on `page`, 2.7% on `scroll`, and about the same elsewhere; on `drag` the wallpaper stays PNG.
+
+Earlier, sampling the move search instead of sliding over the bounding box of every change took two small changes in opposite corners of this screen from 77.8 ms to 3.8 ms per flush, and a deployed 5120×2654 RDP session from about 50 ms to 12 ms per flush on average.
+
+### 7.6 Pacing by apply time
+
+The pacing tests run simulated clients against the stock path (no reports) and the reporting path (`cargo test -p molcajete-daemon display::pacing::tests::table -- --ignored --nocapture`, 8 s of continuous changes each). A client reports its time from when a frame reaches it, after half the round trip, and applies frames one after the other:
 
 | Client | fps stock / reporting | most frames unacknowledged | bytes sent |
 |---|---|---|---|
@@ -403,38 +710,40 @@ client -> server   sync,<timestamp>,<frames>,<microseconds>;
 | SSH flood, 50 kB frames, 30 ms replies | 15.2 / 15.2 | 1 / 1 | 6.10 / 6.10 MB |
 | SSH, light frames, 1 ms replies | 30.4 / 30.4 | 1 / 1 | 0.49 / 0.49 MB |
 
-The slow client can apply at most 28.4 frames per second (24 × 16 ms + 496 ms per 25 frames), so reporting brings it to what it can take; the frame window holds what is queued at the client to three frames. The SSH flood of section 3.2 sends the same bytes, since the pause after heavy frames sets its rate. `molcajeted_client_apply_seconds` records the reported times.
+The slow client can apply at most 28.4 frames per second, so reporting brings it to what it can take while the window holds what is queued at the client to three frames. Before apply-time reports, a slow client on a deployed 2732×1876 session got 1 to 5 frames per second although it needed about 17 ms per frame and the link was nearly idle.
 
-### 2.10 Copy, paste and links in terminals
+### 7.7 Video mode
 
-Terminals (SSH, telnet, Kubernetes) are drawn on the server, so the browser has no text to select, copy or paste; every key goes to the input sink and is forwarded. The page turns on terminal shortcuts for these protocols (`set_terminal_shortcuts`). `molcajete.js` then listens on the container in the capture phase, ahead of the client's own listeners in either mode, and keeps the keys it handles from the remote side. Other protocols get every key and click as before.
+A 640×360 video (`mandelbrot`, a zooming fractal) was played on the desktop with ffplay, measuring what the client received over 10 s; 4.5 s after playback ended the canvas was compared with the real screen.
 
-**Copy.** Releasing a selection sends its text as a `clipboard` stream (as guacd does). The page writes it to the local clipboard and shows "Copied to the clipboard."; that write happens after a round trip, outside the gesture, and a browser that refuses it gets an error toast pointing to the shortcut. The shortcut is ⌘C on macOS and Ctrl+Shift+C elsewhere; Ctrl+C stays `^C`. It writes the last selection within the key event, where it counts as a user gesture (the Clipboard API, or the `copy` command on pages without it). A click that clears the selection makes molcajeted send `selection,0`, so the shortcut does not copy text that is no longer selected; without a selection Ctrl+Shift+C goes to the remote side and ⌘C does nothing. `disable-copy` stops the `clipboard` streams, so nothing can be copied.
+| Path | Images only | H.264 (x264) | H.265 (x265) | AV1 (SVT-AV1) | guacd 1.6 |
+|---|---|---|---|---|---|
+| VNC, Linux Chromium | 6.36 MiB, 13.6 fps | 1.01 MiB, 15.9 fps | (no decoder) | **0.59 MiB**, 18.1 fps | 4.43 MiB, 12.4 fps |
+| RDP (xrdp), Linux Chromium | 7.64 MiB, 16.6 fps | 1.19 MiB, 25.0 fps | (no decoder) | **0.53 MiB**, 20.2 fps | 12.36 MiB, 24.9 fps |
+| VNC, Windows Chrome (hardware decoding) | 6.76 MiB, 14.5 fps | 0.79 MiB, 12.7 fps | 0.65 MiB, 12.0 fps | **0.44 MiB**, 10.5 fps | |
 
-**Paste.** ⌘V and Ctrl+Shift+V are not forwarded and not prevented, so the browser fires `paste`, whose text is read without the Clipboard API's permission prompt. The client sends it as a `clipboard` stream, followed by Ctrl+Shift+V (the paste keys of molcajeted and guacd), pressing Ctrl and Shift only when they are not already held. Instructions keep their order on the tunnel, so the daemon has the text before the keys. `read-only`, `disable-paste` and bracketed paste are the daemon's, as before.
+- Video mode sends about 1/6 – 1/9 of the images-only volume with H.264 and 1/11 – 1/15 with AV1; against stock guacd 1/7 over VNC and 1/23 over RDP. For a 704×448 area the bitrates were 946 kbps (H.264), 662 kbps (H.265) and 567 kbps (AV1).
+- A 1280×720 video exceeds software AV1's real-time limit and was sent as H.264: 15.15 MiB images only, 2.63 MiB as video.
+- After playback VNC showed zero pixel differences; for RDP the only difference inside the area was the pointer drawn by x11grab.
+- Motion that is not video stays images: `testsrc2` (small movements over solid bars) is too sparse to start video, and a terminal flooding text stays lossless because of the colour condition.
+- The Windows Chrome row shows low frame rates, probably from headless window rendering; compare within the row.
 
-**Links.** molcajeted looks for a link in the cell under the pointer: an OSC 8 hyperlink on the cell, or an `http://`, `https://` or `mailto:` URL in the text of the line, followed across wrapped lines (at most 16 each way) and without trailing punctuation or unbalanced closing brackets. Other schemes are not links. Links are looked for when the pointer moves, when a modifier changes and before every frame (output moves them); not while the application gets mouse events (Shift bypasses it, as for selection) or a button is held. The link is underlined, the pointer becomes a hand, and the client gets `link,<url>`, or `link` without an argument when there is none any more. The page shows the target in the bottom-left corner, which for OSC 8 can differ from the text. ⌘-click (Ctrl-click elsewhere) opens it with `noopener,noreferrer`, within the click so that popup blockers let it through, and the click does not reach the remote side; a plain click still selects. Stock guacd never sends `link` or `selection`; clients that do not know them ignore them.
+Preparing a frame for the hardware encoder (Apple M4, loaded machine, per frame): RGBA → NV12 at 1920×1080 0.72 ms with NEON (1.26 ms before); a frame in which one tile changed is brought up to date in 0.002 ms instead of 0.185 ms; the whole video phase with VideoToolbox H.265 at 1920×1080 takes about 6.2 ms, most of it the hardware encode.
 
-### 2.11 Session recordings
+### 7.8 RDP bitmap updates
 
-**Where.** guacd records in the daemon (`recording-path`): its socket to the users is teed into a file. molcajete records in the gateway (`crates/gateway/src/recording.rs`) instead. The gateway sees the stream of stock guacd and molcajeted alike, so one implementation covers both; it owns the database the recordings are indexed in; and molcajeted may run on another host than the gateway (in our deployment natively on a Mac while the gateway runs in Kubernetes), whose disks the gateway and its API cannot reach. Stock `recording-*` parameters are still passed to stock guacd, which records as before.
+`rdp::bench::bitmap_updates` puts 64×64 tiles covering a 5120×2654 desktop and 4000 scattered small rectangles through the earlier two-copy path and `put_image` (median of 15 alternating runs, loaded machine):
 
-**Format.** The file is what guacd writes: the server → client instruction stream after the handshake, as Guacamole text, with the user's input in between as guacd's recording code (`guac_recording_report_mouse/key`) writes it: `mouse,x,y,mask,timestamp` and `key,keysym,pressed,timestamp`. guacenc, the stock player (`SessionRecording`) and our player read it. Details:
+| Scenario | Two copies | `put_image` |
+|---|---|---|
+| tiles, RgbA32 | 0.40–0.59 ms/MP | 0.27–0.33 ms/MP |
+| scattered, RgbA32 | 1.34–1.56 ms/MP | 0.89–1.10 ms/MP |
+| tiles, BgrA32 | 0.89–1.10 ms/MP | 0.28–0.42 ms/MP |
+| scattered, BgrA32 | 2.03–2.45 ms/MP | 0.89–1.03 ms/MP |
 
-- The tunnel's own instructions (UUID, ping replies) are left out.
-- Blob records of the binary tunnel (section 2.6) are written back as base64 `blob` instructions. Consecutive data of a stream is cut at 6048 bytes, as libguac cuts it, whatever the records it came in (the rest of a blob is held until the stream's next data or anything else arrives), so a session through molcajeted on the binary tunnel and on the text tunnel give the same file.
-- Times never go back. guacenc fills the time between two timestamps with frames and, given an earlier one, loops on a negative count about four billion times. Frames carry the daemon's clock, the input is seen on the gateway's, and the two may be on different hosts. Input is therefore timed on the daemon's clock as of the last `sync` (its timestamp minus the gateway's time when it arrived), and never before the latest time written; a `sync` the daemon timed before input written ahead of it is moved up to that time. For that, instruction records from molcajeted are cut into instructions; text from guacd already is.
-- Mouse by default, keys only on request (`record-exclude-mouse`, `record-keys`, as guacd's `recording-exclude-mouse` and `recording-include-keys`).
+### 7.9 Seeking in recordings
 
-**Compatibility.** Recording what the browser actually got is the honest choice, but molcajeted's own formats do not survive the stock tools: guacenc skips `image/x-molcajete-zstd-v1` images ("Support for … not present") and every video stream, and the stock player leaves both undrawn, so a recorded molcajeted session with them is mostly black there. A recorded session therefore does not announce them: the gateway drops the zstd mimetype from the `image` instruction of the handshake and every `video` mimetype, and molcajeted sends PNG and JPEG as it would to the stock client. The cost is the bandwidth and the client time those formats save (section 2.7 and 3.3), for recorded connections only. A connection with `record-molcajete-formats` keeps them; its recordings play in molcajete only. Stock guacd never sends them, so nothing changes for it.
-
-**Index and retention.** Recording starts after the handshake succeeded; a file and its row in `molcajete_recording` are created, and a session whose file cannot be created is refused. Both directions of the relay encode into one encoder (a mutex never held across an await); before each message to the browser, and after each message from it, the encoded text goes through a bounded channel to a writer thread, so a slow disk slows the tunnel down instead of losing data. When the tunnel closes, the row gets the end time and size. A row left open by a crash is completed from its file at the next start. Retention deletes rows and files by the end time (`max_age_days`) and, newest first, everything older than where the sizes add up past `max_total_size`. Connection attributes (`molcajete_connection_attribute`) carry the per-connection switches; unlike parameters they never reach guacd.
-
-**Playback** (`crates/client/src/recording.rs`, `client.rs`, `web/public/molcajete-player.js`). The page fetches the file with progress, and the client copies it into wasm memory and indexes it: for every `sync`, and every `mouse` and `key` with a time, where it ends and its time from the start (kept non-decreasing). A 330 MB recording loads and is indexed in about 0.3 s. Playing to a moment feeds the client everything up to the last indexed point at or before it; the recorded `mouse` positions the software cursor, so the pointer is visible without a frame from the server. A moment before what was played starts over from an empty display. The player runs where the client runs (the worker, or the page without OffscreenCanvas) and is paced by `requestAnimationFrame` there; speeds are 1× to 8× on the page. The recorded `error` and `disconnect` at the end of a session leave the display as it is. Audio streams are not played back.
-
-**Seeking** turns drawing to the canvas off (`set_presenting`), feeds 4 MiB at a time while up to 64 frames wait for their images, and draws the result once: frames on the way are applied to the layers and never presented. Applying the images dominates. While nothing is presented, PNG images are not given to the browser's decoder: they are decoded in wasm (`crate::png`, the `png` crate, premultiplied there) and uploaded from wasm memory as zstd images are. Through `ImageDecoder` and the staging canvas an image cost about 120 µs on an Apple M4, most of it in the staging canvas's `drawImage`; decoded in wasm about 30 µs, most of it `texSubImage2D`. Playing keeps the browser's decoder, so a frame decoded either way is checked to give the same pixels (`playback.test.mjs`). The wasm client grows from 754 kB to 875 kB.
-
-Seeking to the end of an hour, measured with `tests/browser/seek-bench.mjs` (a recording repeated with shifted times, headless Chromium 1228 on the Apple M4's GPU, worker mode), each check of the screen at the end equal to the original's:
+Seeking to the end of an hour, measured with `tests/browser/seek-bench.mjs` (a recording repeated with shifted times, headless Chromium 1228 on the Apple M4's GPU, worker mode), each check of the final screen equal to the original's:
 
 | Recording (x11vnc, an xterm scrolling without pause, 1280×800) | 1 hour | Seek to the end | Back to the middle | Middle to the end |
 |---|---|---|---|---|
@@ -442,106 +751,32 @@ Seeking to the end of an hour, measured with `tests/browser/seek-bench.mjs` (a r
 | molcajeted, PNG (the default for recorded sessions) | 200 MB | 5.0 s | 2.4 s | 2.6 s |
 | stock guacd 1.6, PNG and WebP | 327 MB | 16.2 s | 8.0 s | 8.1 s |
 
-This is the worst case: the screen changes 20 times a second for the whole hour. An ordinary desktop session changes much less (the recorded RDP and SSH sessions of the verification were 5 to 8 kB/s, against 55 to 90 kB/s here) and seeks proportionally faster. guacd's recordings are slower because guacd sends larger images, and WebP still goes through the browser. Seeking backward replays from the start; checkpoints (copies of the layers every so often) would make that independent of the position, at the price of GPU memory and of video streams, whose decoder state cannot be copied.
+This is the worst case: the screen changes 20 times a second for the whole hour. Ordinary sessions change much less (the recorded RDP and SSH sessions of section 7.1 were 5 to 8 kB/s, against 55 to 90 kB/s here) and seek proportionally faster. guacd's recordings are slower because guacd sends larger images, and WebP still goes through the browser. Decoding PNG in wasm grew the client from 754 kB to 875 kB.
 
-## 3. Verification
+## 8. Roadmap
 
-- Unit tests: protocol (every split point, code point lengths, limits, invalid UTF-8, binary records at every split point), gateway (fake guacd handshake, error mapping, query parsing, tunnels of all four client/daemon combinations through a real WebSocket), daemon (handshake with and without the binary parameter, display merging/copy ordering/blob splitting, the same frame as text and as records, PNG round trips, zstd image round trips through the client's decoder and the choice between zstd and PNG), client logic (path tessellation area, keysyms, key release pairing, wheel, PCM).
-- Binary tunnel in the browser (`tests/browser/binary.test.mjs`): a stand-in gateway sends one frame over a real WebSocket (a PNG larger than a record, a PNG with transparency, a JPEG, PCM audio and an H.264 stream cut at arbitrary points) as records to a client offering the binary subprotocol and as base64 instructions to one that does not, in worker and main-thread mode; all four must show the same pixels. The frame's plain `sync` must get the stock reply, and a following `sync` that asks for the apply time (section 2.9) a reply with it.
-- zstd images: the decoder is tested on truncated images at every length, on every byte of an image replaced, on bytes removed and inserted and on random data (it must fail or produce exactly the announced number of opaque pixels, and never panic). In the browser, `renderer.test.mjs` checks the pixels of indexed images at every index depth and of RGB images, the paths through a clip, a transform and the composite modes SRC and ROVER, damaged images, and a frame in which zstd, PNG and JPEG images overlap; `binary.test.mjs` sends a frame with zstd images (one larger than a record, others overlapping a PNG and a JPEG) over both tunnels in both modes and checks that the mimetype is announced, or not when turned off.
-- Session recordings: gateway tests run sessions through a fake guacd on all four client/daemon combinations and check that the file holds the daemon's stream with guacd-sized `blob`s, the mouse with its time, keys only when asked, and that only stock formats were offered; a session whose file cannot be created is refused; non-administrators get 401/403 from every recording endpoint; retention deletes by age and by total size, oldest first. Real sessions through the gateway (VNC, SSH and RDP, each through stock guacd 1.6 and molcajeted, the latter on the binary tunnel) were encoded with guacenc 1.6 without errors, and their last frames show the session's screen; a molcajeted session with `record-molcajete-formats` encodes too but is nearly black (zstd images skipped). The playback page showed the same screens; `playback.test.mjs` checks seeking and playing in the browser and `seek-bench.mjs` times seeking (section 2.11).
-- Browser pixel tests (`tests/browser`): 27 scenarios checked against the canvas reference implementation.
-- End-to-end in real environments: with guacd 1.6 + x11vnc (xterm/xclock/xeyes), display, key input (Shift combinations) and mouse tracking; with guacd 1.6 + OpenSSH, colours, bold text, Hangul, scroll bars, drag selection and clipboard. The same items were checked on the all-Rust path (wasm client → molcajete-gateway → molcajeted → x11vnc), worker mode included.
-- molcajeted SSH: colours (16/256/true colour), bold, Hangul (in output and on the input command line), full-screen apps such as `top`/vi, fast scrolling, drag selection → clipboard, wheel scrollback, resizing, and error mapping (wrong password, closed port, host-key mismatch). On the stock guacd path Hangul on the input command line was garbled; molcajeted displays it correctly because its default terminal type is `xterm-256color`.
-- molcajeted RDP: on xrdp+XFCE, the same scenarios as with stock guacd produce the same screen: opening a terminal, Shift-combined special characters, Ctrl+C, wheel scrolling, clipboard in both directions (including Hangul), display-update resizing, and a clean exit on logout.
-- Video: `tests/browser/video.test.mjs` takes real H.264/AV1 bitstreams made with ffmpeg, frames them the way molcajeted does, feeds them as a `video` stream, and checks the composited canvas pixels and the return to the default layer after `dispose`. Linux Chromium has no H.265 decoder, so the same page was opened in Windows Chrome 158 (headless, hardware decoding), which decoded all three codecs (H.264/H.265/AV1). That browser decodes H.265 in hardware only (`prefer-software` is not supported).
-- Audio: a 440 Hz sine played in an xrdp session is sent by molcajeted as `audio/L16;rate=44100,channels=2` (about 177 KB/s, on par with stock guacd), and the samples the browser schedules in Web Audio are at 440.0 Hz too (worker and main-thread modes).
-- Settling test: after scrolling an xterm continuously for a few seconds and stopping the load, the client canvas was compared pixel by pixel with the X server screen (`xwd`). The molcajeted path showed zero differences in 5 runs (in one, the xclock second hand moved between the canvas and X captures). The stock guacd 1.6 path, viewed with either the stock JS client or ours, sometimes left hundreds to thousands of stale pixels where a window had closed. This is guacd's behaviour, not the client's.
+Tracked as issues:
 
-### 3.1 Comparison with the stock client (`tests/browser/replay-bench.mjs`)
+- Sharing a running session through links, and administrators shadowing sessions (#48); joining with `select,$id` is refused by molcajeted today
+- Active sessions and connection history for administrators, ending sessions (#49)
+- An audit log of administrative changes and logins (#50)
+- SSH jump hosts (#51)
+- Encrypting stored connection credentials and never returning them from the API (#52)
+- File transfer: SFTP in SSH sessions and drive redirection in RDP (#53); the protocol's `file`/`pipe`/`filesystem` objects are not handled yet
+- Read-only and clipboard restrictions in the connection form (#54)
+- Throttling repeated failed logins (#55)
+- Fuzzing the parsers that read untrusted input (#56)
+- API tokens for automation and one-time links for embedded sessions (#57)
+- Edge cases older remote-desktop projects have fixed: keyboard layouts, AltGr, dead keys, stuck keys, clipboard fallbacks and more (#63)
+- Audio staying silent until the next click after a stream starts (#10)
 
-Live session comparisons are unreliable: guacd adapts the number of frames to how fast the client answers `sync`, so the two clients do not even receive the same input. Instead, 12 seconds of the protocol stream of a real session (an x11vnc desktop with an xterm scrolling continuously) were recorded with timing, and replayed into both clients with **the same instructions at the same moments**. After the replay the two clients' screens matched except for 15 cursor pixels. The metric is main-thread task time from CDP `Performance.getMetrics` (summed over the 12 s). The page must be served from `localhost` (a secure context) for WebCodecs to be enabled.
+Not yet tracked:
 
-Real GPU (Chromium ANGLE → D3D12, Intel Graphics, WSL2), 3 runs:
-
-| Recording | guacamole-common-js | wasm, main-thread WebGL | **wasm, Worker + OffscreenCanvas** |
-|---|---|---|---|
-| guacd 1.6 (7.7 MiB) | 418 – 1,007 ms | 4,529 – 4,921 ms | **111 – 152 ms** |
-| molcajeted (33 MiB) | 806 – 862 ms | 4,206 – 4,713 ms | **179 – 183 ms** (one run 762 ms) |
-
-SwiftShader (software GPU, less noise), 2 runs:
-
-| Recording | guacamole-common-js | wasm, main-thread WebGL | **wasm, Worker** |
-|---|---|---|---|
-| guacd 1.6 | 436 – 438 ms | 639 – 660 ms | **162 – 167 ms** |
-| molcajeted | 313 – 318 ms | 531 – 541 ms | **195 – 215 ms** |
-
-The worker figures include the cost of the replay harness passing the recording to the worker with `postMessage`. In a real session the WebSocket lives inside the worker, so the main thread's share is even smaller.
-
-What the measurements showed:
-1. The wasm side (parsing, base64, dispatch) is a small part of the total.
-2. `new Blob()` + `createImageBitmap()` per image costs 80 ms per second for Blob creation alone. This is also why the original uses WebCodecs `ImageDecoder`.
-3. In Chromium, uploading decoded results held in CPU memory (`VideoFrame`/`ImageBitmap`) into WebGL textures happens **synchronously on the main thread**. On a real GPU, waiting on that synchronization made the main-thread WebGL setup slower than the original (whose 2D canvas `drawImage` is deferred to the GPU process).
-4. Moving the same work into a worker cuts main-thread cost to 1/3 – 1/6 of the original, and makes the page's input and UI responsiveness independent of how much the remote screen changes. That is hard to achieve with the original's design, which is tied to DOM canvases.
-
-`tests/browser/bench.mjs` makes the same comparison on a live session and, for the reasons above, is for reference only.
-
-### 3.2 molcajeted bandwidth
-
-An x11vnc desktop with an xterm scrolling continuously was recorded for 12 s at a time, alternating between the two daemons in the same period (`tests/browser/record.mjs`).
-
-| Stage | guacd 1.6 | molcajeted |
-|---|---|---|
-| First implementation (merged change rectangles + PNG Fast) | 7.7 MiB | 33.0 MiB |
-| Mirror comparison + scroll detection | 2.3 MiB | 9.7 MiB |
-| + PNG Balanced/Adaptive + frame pacing | 3.0 / 4.7 MiB | **4.3 / 4.2 MiB** |
-
-Window dragging (xterm moved continuously with xdotool, 10 s each, alternating, 2 runs): guacd 1.6 sent 0.73 / 1.04 MiB, molcajeted **0.40 / 0.41 MiB**, at less than half the bandwidth while sending more frames (142 vs 88–132).
-
-For SSH and RDP, a command flooding the terminal (`while :; do ls -la /usr/bin /etc; done`) ran for 8 s at a time, alternating, with the real browser client, comparing the bytes and frames the client received.
-
-| Connection | guacd 1.6 | molcajeted |
-|---|---|---|
-| SSH | 7.2 / 7.3 MiB, 13.5 fps | **5.5 / 5.6 MiB, 14 fps** |
-| RDP (xrdp) | 8.3 / 8.5 MiB, 15.5 fps | 8.1 / 9.4 MiB, 13–14 fps |
-
-Over SSH, molcajeted first used its own 60 fps cap and sent 9.1 MiB (24 fps). With the shared pacing (30 fps cap + client lag compensation) and the "wait 66 ms after a large frame (over 32 KiB)" rule it sends about 24% less than guacd at the same frame rate. SSH still paces this way (a unit test replays the flood against the pacing rule, with and without apply-time reports, section 2.9); RDP and VNC have since moved to the desktop profile of section 2.4, so the RDP row shows the earlier, fixed pause and a flooding terminal inside a remote desktop now gets more frames and bytes when the link and the client keep up. RDP gets no server-side `copy` hints, because IronRDP does not pass drawing orders such as ScrBlt through, but the shared display's comparison and move detection keep it on par with guacd.
-
-Load intensity varied between measurements, so only rows can be compared with each other. In the end molcajeted is on par with guacd 1.6 and sends slightly fewer bytes per frame (13.4 KB vs 15 KB). guacd 1.6 uses WebP heavily under the same load, while molcajeted gets there with lossless PNG. On the same data, lossless WebP (image-webp) was 18% larger than PNG Balanced.
-
-Accuracy is unchanged: all 3 settling tests after these optimizations showed zero pixel differences from the real X screen.
-
-### 3.3 Video mode bandwidth
-
-A 640×360 video (`mandelbrot`, a zooming fractal) was played on the desktop with ffplay, measuring what the client received over 10 s. 4.5 s after playback ended, the canvas was compared with the real screen (clock corner masked).
-
-| Path | Images only | H.264 (x264) | H.265 (x265) | AV1 (SVT-AV1) | guacd 1.6 |
-|---|---|---|---|---|---|
-| VNC, Linux Chromium | 6.36 MiB, 13.6 fps | 1.01 MiB, 15.9 fps | (no decoder) | **0.59 MiB**, 18.1 fps | 4.43 MiB, 12.4 fps |
-| RDP (xrdp), Linux Chromium | 7.64 MiB, 16.6 fps | 1.19 MiB, 25.0 fps | (no decoder) | **0.53 MiB**, 20.2 fps | 12.36 MiB, 24.9 fps |
-| VNC, Windows Chrome (HW decoding) | 6.76 MiB, 14.5 fps | 0.79 MiB, 12.7 fps | 0.65 MiB, 12.0 fps | **0.44 MiB**, 10.5 fps | |
-
-- Video mode sends about 1/6 – 1/9 of the images-only volume with H.264 and about 1/11 – 1/15 with AV1. Compared with stock guacd that is 1/7 over VNC and 1/23 over RDP. For a 704×448 area the bitrates were 946 kbps (H.264), 662 kbps (H.265) and 567 kbps (AV1).
-- A 1280×720 video (an area the size of the full screen) exceeds the real-time limit of AV1 and was sent as H.264: 15.15 MiB images only, 2.63 MiB in video mode.
-- In the settling comparison after playback, VNC showed zero pixel differences (images-only mode too). For RDP the only difference inside the video area was the mouse pointer drawn by x11grab; the differences outside it come from xrdp's colour conversion and appear with stock guacd as well.
-- Motion that is not video stays images. `testsrc2` (small movements over solid bars) is too sparse to enter video mode (4.4 MiB, same as images-only), and a terminal flooding text stays lossless because of the colour condition.
-- The Windows Chrome row shows low frame rates, probably due to headless window rendering, so compare only within that row.
-
-## 4. Remaining work (roadmap)
-
-1. molcajeted protocols
-   - SSH: SFTP, agent forwarding, italics/colour emoji
-   - RDP: drive redirection, RemoteApp, receiving EGFX/H.264 (relaying the server's H.264 as is), AAC/Opus audio, Kerberos
-   - Telnet and Kubernetes
-   - NLA has not been verified against a real (Windows) server yet
-2. Connection sharing (joining with `select,$ID`), read-only observers. Recordings (section 2.11): checkpoints for seeking backward, playing audio, the key log of a recording with keys, and recording in molcajeted for deployments without the gateway
-3. File transfer (`file`/`pipe`/`filesystem` objects), audio input (microphone), touch/multi-touch, on-screen keyboard
-4. Gateway: authentication providers (OIDC/LDAP/DB), connection permissions, TLS to guacd, HTTP tunnel (for environments without WebSocket)
-5. Renderer: batching solid fills, a WebGPU backend (`copyExternalImageToTexture`/`importExternalTexture` to cut upload costs; only `Renderer` needs replacing), context loss recovery
-6. molcajeted encoding: frame pacing from a measured link rate and per-connection limits (the byte budget is a fixed 8 MiB/s), building a frame off the connection's task (images are encoded in parallel, but the session's loop still waits for the frame), running the video encode alongside the image phase, lossy WebP (as in guacd 1.6). zstd images: the cost of one more image (section 2.4) was estimated for PNG and not looked at again; indexed images could be uploaded as indices and expanded by a shader, a quarter of the bytes the drawing thread carries to the GPU now; a faster Zstandard decoder for wasm than `ruzstd`.
-7. Binary tunnel: client → server streams (clipboard, and file upload or audio input once they exist) are still base64 text; the gateway forwards records from molcajeted without checking the instructions inside.
-8. Video mode
-   - Hardware encoders (NVENC/QSV/VA-API/AMF) are wired up but not verified on real hardware. VideoToolbox is verified on Apple M4.
-   - Forced key frames restart ffmpeg, which costs an extra 25–45 ms.
-   - Build the client codec string exactly from the SPS/sequence header (currently a generous fixed value).
-   - Several video areas at once, bitrate adapted to bandwidth.
+1. **molcajeted protocols.** Telnet and Kubernetes (the web UI already treats them as terminals for stock guacd). SSH: agent forwarding, italics and colour emoji. RDP: RemoteApp, receiving EGFX/H.264 and relaying the server's stream as is, AAC/Opus audio, Kerberos, bulk compression once IronRDP can reactivate with it.
+2. **Input.** Audio input (microphone), touch and multi-touch, an on-screen keyboard.
+3. **Gateway.** LDAP, TLS to the daemon, an HTTP tunnel for networks without WebSocket.
+4. **Recordings.** Checkpoints (copies of the layers every so often) so that seeking backward does not replay from the start, at the price of GPU memory and of video streams whose decoder state cannot be copied; playing audio; showing the key log of a recording with keys; recording in molcajeted for deployments without the gateway.
+5. **Renderer.** Batching solid fills, a WebGPU backend (`copyExternalImageToTexture`/`importExternalTexture` to cut upload costs; only `Renderer` needs replacing), recovering from a lost WebGL context.
+6. **molcajeted encoding.** Pacing from a measured link rate and per-connection limits (the byte budget is a fixed 8 MiB/s); building a frame off the connection's task (images are encoded in parallel, but the session loop still waits for the frame); running the video encode alongside the image phase; backing off scroll and move detection where it keeps finding nothing; lossy WebP as in guacd 1.6. zstd images: the cost of one more image was estimated for PNG and not revisited; indexed images could be uploaded as indices and expanded by a shader; a faster Zstandard decoder for wasm than `ruzstd`.
+7. **Binary tunnel.** Client → server streams (clipboard, and file upload or audio input once they exist) are still base64 text.
+8. **Video mode.** NVENC, QSV, VA-API and AMF are wired up but not verified on real hardware (VideoToolbox is verified on Apple M4); forced key frames restart ffmpeg (tens of milliseconds); the client's codec string should be built from the SPS or sequence header; several video areas at once; bitrate adapted to bandwidth.
