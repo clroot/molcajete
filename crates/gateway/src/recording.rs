@@ -61,6 +61,9 @@ pub struct Encoder {
     /// of the size guacd writes.
     partial: Vec<u8>,
     partial_stream: i32,
+    /// Input that arrived while a blob was held back, written after that
+    /// blob: guacd only ever writes input between whole blobs.
+    held_input: Vec<u8>,
     /// The latest time written: times in a recording never go back, which
     /// guacenc relies on.
     last_time: i64,
@@ -80,6 +83,7 @@ impl Encoder {
             base64: String::new(),
             partial: Vec::new(),
             partial_stream: 0,
+            held_input: Vec::new(),
             last_time: 0,
             clock_offset: 0,
             records: molcajete_protocol::Parser::with_limits(molcajete_protocol::Limits::LENIENT),
@@ -168,7 +172,8 @@ impl Encoder {
         self.partial.extend_from_slice(rest);
     }
 
-    /// Writes the data held back for the current blob.
+    /// Writes the data held back for the current blob, and the input that
+    /// arrived during it.
     fn end_blob(&mut self) {
         if !self.partial.is_empty() {
             let mut partial = std::mem::take(&mut self.partial);
@@ -176,6 +181,7 @@ impl Encoder {
             partial.clear();
             self.partial = partial;
         }
+        self.out.append(&mut self.held_input);
     }
 
     fn write_blob(&mut self, stream: i32, data: &[u8]) {
@@ -207,15 +213,20 @@ impl Encoder {
             }
             _ => return,
         };
-        self.end_blob();
         let time = now_ms.saturating_add(self.clock_offset).max(self.last_time);
         self.last_time = time;
-        self.out
-            .extend_from_slice(builder.arg(time).finish().as_bytes());
+        // In the middle of a blob the input waits for its end, as it would
+        // in guacd, so that the blobs do not depend on when input arrives.
+        let out = if self.partial.is_empty() {
+            &mut self.out
+        } else {
+            &mut self.held_input
+        };
+        out.extend_from_slice(builder.arg(time).finish().as_bytes());
     }
 
-    /// The text encoded since the last call. The start of a blob may be
-    /// held back for the data that follows it.
+    /// The text encoded since the last call. The start of a blob, and input
+    /// that arrived during it, may be held back for the data that follows.
     pub fn take(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.out)
     }
@@ -605,6 +616,35 @@ mod tests {
                 .iter()
                 .all(|i| i.args.iter().all(|a| a.len() <= 8192))
         );
+    }
+
+    #[test]
+    fn input_during_a_blob_does_not_cut_it() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7) as u8).collect();
+        let mouse = |encoder: &mut Encoder| {
+            raw_all("5.mouse,2.10,2.20,1.1;", |raw| {
+                encoder.client_instruction(raw, 1234)
+            });
+        };
+        // guacd: whole blobs, the mouse between them.
+        let mut encoder = Encoder::new(true, false);
+        let (first, second) = data.split_at(MAX_BLOB_BYTES);
+        encoder.blob(1, first);
+        mouse(&mut encoder);
+        encoder.blob(1, second);
+        let expected = String::from_utf8(encoder.finish()).unwrap();
+
+        // Records cut elsewhere, the mouse in the middle of the first blob.
+        let mut encoder = Encoder::new(true, false);
+        encoder.blob(1, &data[..1000]);
+        mouse(&mut encoder);
+        assert!(encoder.take().is_empty());
+        encoder.blob(1, &data[1000..7000]);
+        let mut text = encoder.take();
+        assert!(text.ends_with(b"5.mouse,2.10,2.20,1.1,4.1234;"));
+        encoder.blob(1, &data[7000..]);
+        text.extend(encoder.finish());
+        assert_eq!(String::from_utf8(text).unwrap(), expected);
     }
 
     #[test]
