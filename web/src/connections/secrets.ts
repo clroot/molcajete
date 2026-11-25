@@ -15,6 +15,12 @@ export const SENSITIVE_PARAMETERS: readonly string[] = [
   'sftp-private-key',
   'gateway-password',
   'client-key',
+  // SSH jump hosts: the single hop, and hops 1 to 4 of a chain.
+  ...['jump-host', 'jump-host-1', 'jump-host-2', 'jump-host-3', 'jump-host-4'].flatMap(prefix => [
+    `${prefix}-password`,
+    `${prefix}-private-key`,
+    `${prefix}-passphrase`,
+  ]),
 ];
 
 export function isSensitive(name: string): boolean {

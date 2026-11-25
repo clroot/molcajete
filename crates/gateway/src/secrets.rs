@@ -51,6 +51,23 @@ pub const SENSITIVE_PARAMETERS: &[&str] = &[
     "gateway-password",
     // Kubernetes: the client certificate's private key.
     "client-key",
+    // SSH jump hosts: the single hop, and hops 1 to 4 of a chain. Their
+    // `-host-key` parameters are public keys.
+    "jump-host-password",
+    "jump-host-private-key",
+    "jump-host-passphrase",
+    "jump-host-1-password",
+    "jump-host-1-private-key",
+    "jump-host-1-passphrase",
+    "jump-host-2-password",
+    "jump-host-2-private-key",
+    "jump-host-2-passphrase",
+    "jump-host-3-password",
+    "jump-host-3-private-key",
+    "jump-host-3-passphrase",
+    "jump-host-4-password",
+    "jump-host-4-private-key",
+    "jump-host-4-passphrase",
 ];
 
 /// Whether `name` is a connection parameter that holds a credential.
@@ -334,17 +351,21 @@ pub fn load(config: &Config, has_sealed: bool) -> anyhow::Result<SecretKeys> {
 fn generate_key_file(path: &Path) -> anyhow::Result<Key> {
     let mut bytes = [0u8; KEY_LEN];
     rand::rng().fill_bytes(&mut bytes);
+    let creating = || {
+        format!(
+            "no secret key is configured, and generating {} failed; make data_dir writable \
+             or configure the key ([secrets] key_file, key or {KEY_ENV})",
+            path.display()
+        )
+    };
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating the directory of {}", path.display()))?;
+        std::fs::create_dir_all(dir).with_context(creating)?;
     }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("creating the secret key file {}", path.display()))?;
+    let mut file = options.open(path).with_context(creating)?;
     std::io::Write::write_all(
         &mut file,
         format!("{}\n", STANDARD.encode(bytes)).as_bytes(),
