@@ -23,7 +23,7 @@ Administrators manage users under *Users*: username, password, role, groups, dir
 
 - Passwords need at least 8 characters. They are stored as Argon2id hashes.
 - Setting a new password, or disabling a user, signs that user out of every browser. Disabling or deleting a user also ends their open remote desktop sessions ([Sessions that end by themselves](#sessions-that-end-by-themselves)). A disabled user cannot sign in, whichever way they try.
-- Everyone can change their own password with *Change password* in the side menu; this signs them out everywhere too.
+- Everyone with a password can change it with *Change password* in the side menu; this signs them out everywhere too. Users without a password do not see the item.
 - Administrators cannot remove their own administrator role, disable themselves or delete their own account, and at least one enabled administrator always remains: a change that would leave none is refused.
 - With [single sign-on](#single-sign-on-openid-connect) configured, a user can be created without a password; such a user signs in only through the identity provider.
 
@@ -196,7 +196,7 @@ post_logout_redirect_url = "https://molcajete.example.com/"
 - On their first sign-in, people are created as users with the `user` role, no password and no connections (`auto_create_users = false` lets in only users an administrator created first, matched by username).
 - An existing user with the same username is linked to the identity on its first sign-in, unless that user is already linked to someone else at the provider. Use a username claim (`username_claim`, `preferred_username` by default) that people cannot change themselves at the provider: whoever arrives with the name `admin` is linked to the local `admin` account.
 - Users are then recognised by the provider's issuer and subject, not by name. A user renamed at the provider keeps their account, and the local username follows when the new one is free.
-- Users created on sign-in cannot use the password form or *Change password*; an administrator may still set them a password.
+- Users created on sign-in cannot use the password form, and the side menu does not offer them *Change password*; an administrator may still set them a password.
 - Disabled users are refused, whichever way they sign in.
 - Signing out of a session opened through the provider also signs out there, when the provider supports RP-initiated logout (`end_session_endpoint`).
 
@@ -388,8 +388,8 @@ curl -b cookies -OJ 'https://molcajete.example.com/api/recordings/<id>/file?down
 | Route | Methods | Who |
 | --- | --- | --- |
 | `/api/auth/login`, `/api/auth/logout` | `POST` | anyone |
-| `/api/auth/me` | `GET` | signed-in users |
-| `/api/auth/password` | `PUT` (`{"currentPassword": …, "newPassword": …}`) | signed-in users |
+| `/api/auth/me` | `GET` (the user, with `hasPassword`) | signed-in users |
+| `/api/auth/password` | `PUT` (`{"currentPassword": …, "newPassword": …}`; `409` for a user without a password) | signed-in users |
 | `/api/connections`, `/api/folders` | `GET` | signed-in users (what they can open) |
 | `/api/connections`, `/api/connections/{id}` | `POST`, `GET`, `PUT`, `DELETE` | connection managers |
 | `/api/connections/{id}/parent`, `/api/folders/{id}/parent` | `PUT` (move; `{"parentId": null}` for the top level) | connection managers |

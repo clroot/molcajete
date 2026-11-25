@@ -182,7 +182,11 @@ pub async fn login(
     let cookie = start_session(&state, &user, auth::is_https(&headers), None).await?;
     let entry = Entry::new(action::LOGIN_SUCCESS).by(&user).from(&address);
     audit::record(&state.db, entry).await;
-    Ok(([(header::SET_COOKIE, cookie)], Json(user)).into_response())
+    let me = Me {
+        user,
+        has_password: true,
+    };
+    Ok(([(header::SET_COOKIE, cookie)], Json(me)).into_response())
 }
 
 /// Opens a login session for the user and returns its cookie. `id_token` is
@@ -249,8 +253,25 @@ pub async fn logout(
     })
 }
 
-pub async fn me(CurrentUser(user): CurrentUser) -> Json<User> {
-    Json(user)
+/// The signed-in user, as `GET /api/auth/me` and the password login return
+/// it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Me {
+    #[serde(flatten)]
+    user: User,
+    /// Whether the user has a password of their own, which they can change.
+    /// Users created through single sign-on, or by an administrator without
+    /// a password, have none.
+    has_password: bool,
+}
+
+pub async fn me(
+    State(state): State<Arc<AppState>>,
+    CurrentUser(user): CurrentUser,
+) -> ApiResult<Json<Me>> {
+    let has_password = state.db.password_hash(&user.id).await? != auth::NO_PASSWORD;
+    Ok(Json(Me { user, has_password }))
 }
 
 #[derive(Deserialize)]
@@ -267,6 +288,13 @@ pub async fn change_password(
     Json(body): Json<ChangePasswordRequest>,
 ) -> ApiResult<StatusCode> {
     let hash = state.db.password_hash(&user.id).await?;
+    if hash == auth::NO_PASSWORD {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "This account has no password to change: it signs in through single sign-on, \
+             or an administrator sets its password.",
+        ));
+    }
     let valid = state
         .throttle
         .verify(body.current_password, hash)

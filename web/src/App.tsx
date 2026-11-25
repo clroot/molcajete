@@ -1,7 +1,7 @@
 import {useCallback, useEffect, useState} from 'react';
 import {Center} from '@astryxdesign/core/Center';
 import {Spinner} from '@astryxdesign/core/Spinner';
-import {api, setUnauthorizedHandler, type User} from './api';
+import {api, setUnauthorizedHandler, type Me} from './api';
 import {useRoute} from './route';
 import AppFrame from './shell/AppFrame';
 import LoginPage from './auth/LoginPage';
@@ -15,10 +15,10 @@ import AuditPage from './audit/AuditPage';
 import ActiveSessionsPage from './activity/ActiveSessionsPage';
 import HistoryPage from './activity/HistoryPage';
 
-type Auth = {status: 'checking'} | {status: 'signedOut'} | {status: 'signedIn'; user: User};
+type Auth = {status: 'checking'} | {status: 'signedOut'} | {status: 'signedIn'; user: Me};
 
 const SIGNED_OUT: Auth = {status: 'signedOut'};
-const signedIn = (user: User): Auth => ({status: 'signedIn', user});
+const signedIn = (user: Me): Auth => ({status: 'signedIn', user});
 
 export default function App() {
   const [auth, setAuth] = useState<Auth>({status: 'checking'});
@@ -56,7 +56,7 @@ export default function App() {
   }
 }
 
-function SignedInApp({user, onSignOut}: {user: User; onSignOut: () => void}) {
+function SignedInApp({user, onSignOut}: {user: Me; onSignOut: () => void}) {
   const route = useRoute();
   if (route.name === 'session') {
     return <SessionPage key={route.connectionId} connectionId={route.connectionId} />;

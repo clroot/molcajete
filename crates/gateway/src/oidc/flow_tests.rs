@@ -176,6 +176,23 @@ async fn first_sign_in_creates_the_user() {
     assert_eq!(me["username"], "ada");
     assert_eq!(me["isAdmin"], false);
     assert!(me["lastLoginAt"].is_i64());
+    // No password of her own, so none to change.
+    assert_eq!(me["hasPassword"], false);
+    let change = Request::put("/api/auth/password")
+        .header(header::COOKIE, &session)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"currentPassword":"","newPassword":"a-new-password"}"#,
+        ))
+        .unwrap();
+    let change = sso.send(change).await;
+    assert_eq!(change.status(), StatusCode::CONFLICT);
+    assert!(
+        body_json(change).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("no password")
+    );
 
     // The same identity signs in to the same account; it has no password.
     let again = sso

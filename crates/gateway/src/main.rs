@@ -585,6 +585,7 @@ mod tests {
         let me = body_json(app.get("/api/auth/me", Some(&cookie)).await).await;
         assert_eq!(me["username"], "admin");
         assert_eq!(me["isAdmin"], true);
+        assert_eq!(me["hasPassword"], true);
 
         let logout = Request::post("/api/auth/logout")
             .header(header::COOKIE, &cookie)
