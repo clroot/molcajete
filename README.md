@@ -118,6 +118,19 @@ session.set_event_handler((type, detail) => console.log(type, detail));
 session.connect(session.tunnel_url("wss://example.com/websocket-tunnel", "vnc"));
 ```
 
+## Deployment and observability
+
+`Dockerfile` builds two images: `--target gateway` (with the wasm client)
+and `--target daemon` (molcajeted with ffmpeg). `deploy/` has a Docker
+Compose file, Kubernetes manifests, a reverse-proxy example and a Grafana
+Alloy configuration.
+
+Both binaries can write JSON logs (`--log-format json`). With
+`--telemetry-listen`, they also serve Prometheus metrics for every stage of
+the frame pipeline, and `--profiling` adds pprof CPU profiles for Pyroscope.
+The gateway can also collect performance reports from the browser
+(`--client-reports`). See [docs/deployment.md](docs/deployment.md) (Korean).
+
 ## Tests
 
 ```sh

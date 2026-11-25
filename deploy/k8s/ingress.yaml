@@ -1,0 +1,16 @@
+# Tailnet-only upstream for the NAS reverse proxy (deploy/nas-nginx.conf),
+# like the zot registry: https://molcajete.<tailnet>.ts.net
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: molcajete
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: molcajete
+      port:
+        number: 80
+  tls:
+    - hosts:
+        - molcajete

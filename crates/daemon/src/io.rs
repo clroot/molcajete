@@ -43,6 +43,10 @@ impl GuacReader {
 pub struct GuacWriter {
     socket: OwnedWriteHalf,
     buf: String,
+    bytes: metrics::Counter,
+    /// Time spent in `write_all`: grows when the gateway / browser cannot
+    /// keep up (TCP backpressure).
+    write_time: metrics::Histogram,
 }
 
 impl GuacWriter {
@@ -50,7 +54,16 @@ impl GuacWriter {
         Self {
             socket,
             buf: String::with_capacity(64 * 1024),
+            bytes: metrics::Counter::noop(),
+            write_time: metrics::Histogram::noop(),
         }
+    }
+
+    /// Starts recording output metrics labelled with `protocol`.
+    pub fn record_metrics(&mut self, protocol: &'static str) {
+        self.bytes = metrics::counter!("molcajeted_sent_bytes_total", "protocol" => protocol);
+        self.write_time =
+            metrics::histogram!("molcajeted_socket_write_seconds", "protocol" => protocol);
     }
 
     pub fn push(&mut self, encoded: &str) {
@@ -69,7 +82,10 @@ impl GuacWriter {
 
     pub async fn flush(&mut self) -> std::io::Result<()> {
         if !self.buf.is_empty() {
+            let started = std::time::Instant::now();
             self.socket.write_all(self.buf.as_bytes()).await?;
+            self.write_time.record(started.elapsed());
+            self.bytes.increment(self.buf.len() as u64);
             self.buf.clear();
         }
         Ok(())

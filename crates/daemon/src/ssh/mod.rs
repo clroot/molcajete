@@ -69,7 +69,8 @@ pub async fn run(
     let renderer = Renderer::new(fonts, scheme);
 
     // Terminal text must stay crisp: never use lossy encodings.
-    let mut display = Display::new(ImageFormats::from_mimetypes(&info.image), true);
+    let mut display =
+        Display::new(ImageFormats::from_mimetypes(&info.image), true).with_protocol("ssh");
     session::send_name(writer.buffer(), &settings.hostname);
     display.resize(info.width, info.height, writer.buffer());
     paint_background(&mut display, &mut writer, background);

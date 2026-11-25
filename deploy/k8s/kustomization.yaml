@@ -1,0 +1,13 @@
+# Template for the OrbStack cluster's GitOps repo (services/molcajete).
+# Copy this directory, set the image tags, and add a SealedSecret named
+# `molcajete-config` holding `gateway.toml` (see docs/deployment.md).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: molcajete
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  # - sealed-secret.yaml
