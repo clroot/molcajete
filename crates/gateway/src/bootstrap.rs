@@ -11,12 +11,14 @@ use crate::db::{ConnectionRecord, Database, DbError, NewUser, Role, UserUpdate};
 
 impl ConnectionConfig {
     pub fn to_record(&self) -> ConnectionRecord {
+        let address = self.guacd.as_ref().and_then(|g| g.address());
         ConnectionRecord {
             id: self.id.clone(),
             name: self.display_name().to_owned(),
             protocol: self.protocol.clone(),
-            guacd_host: self.guacd.as_ref().map(|g| g.host.clone()),
-            guacd_port: self.guacd.as_ref().map(|g| g.port),
+            guacd_host: address.as_ref().map(|(host, _)| host.clone()),
+            guacd_port: address.map(|(_, port)| port),
+            guacd_handshake_timeout: self.guacd.as_ref().and_then(|g| g.handshake_timeout),
             parameters: self.parameters.clone(),
             stored_secrets: Default::default(),
             clear_secrets: Default::default(),
@@ -163,7 +165,7 @@ mod tests {
             [[connections]]
             id = "desk"
             protocol = "vnc"
-            guacd = { host = "127.0.0.1", port = 4823 }
+            guacd = { host = "127.0.0.1", port = 4823, handshake_timeout = 40 }
             [connections.parameters]
             hostname = "10.0.0.5"
             password = "vnc-pass"
@@ -185,6 +187,7 @@ mod tests {
             db.connection_secrets("desk").await.unwrap()["password"],
             "vnc-pass"
         );
+        assert_eq!(desk.guacd_handshake_timeout, Some(40));
 
         // Changes made in the database survive a restart with the same file.
         set_password(&db, "boss", "changed-password").await.unwrap();

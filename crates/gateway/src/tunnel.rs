@@ -204,6 +204,9 @@ async fn serve_tunnel(
     let defaults = &state.config.guacd;
     let guacd_host = connection.guacd_host.as_deref().unwrap_or(&defaults.host);
     let guacd_port = connection.guacd_port.unwrap_or(defaults.port);
+    let handshake_timeout = connection
+        .guacd_handshake_timeout
+        .unwrap_or(defaults.handshake_timeout);
     // Stored credentials are decrypted here, for the handshake only.
     let mut stored = connection.parameters.clone();
     match state.db.connection_secrets(&connection.id).await {
@@ -238,7 +241,7 @@ async fn serve_tunnel(
         &parameters,
         &request.info,
         request.binary,
-        Duration::from_secs(defaults.handshake_timeout),
+        Duration::from_secs(handshake_timeout),
     )
     .await
     {

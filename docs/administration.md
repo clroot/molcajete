@@ -84,7 +84,7 @@ Connection managers and administrators create and edit connections under *Connec
 - a **name** shown in the list;
 - a **protocol**: VNC, RDP, SSH, Telnet or Kubernetes;
 - the **parameters** sent to the daemon in Guacamole's `connect` instruction. The form has fields for the common ones (host name, port, credentials; for RDP also the domain, security mode, keyboard layout, resizing the desktop to the window and display scale; for SSH a private key and font size; for Kubernetes namespace, pod and container). Any other Guacamole parameter can be added under *Advanced* as a name and value. Empty values are not stored;
-- optionally a **daemon** of its own (*Advanced → guacd host / port*) instead of the gateway's default `[guacd]`: this is how a connection is served by molcajeted while others use stock guacd, or the other way round. molcajeted serves VNC, SSH and RDP; Telnet and Kubernetes need stock guacd;
+- optionally a **daemon** of its own (*Advanced → guacd host / port*) instead of the gateway's default `[guacd]`: this is how a connection is served by molcajeted while others use stock guacd, or the other way round. molcajeted serves VNC, SSH and RDP; Telnet and Kubernetes need stock guacd. *Advanced → Handshake timeout* gives the connection its own wait for the daemon to reach the remote desktop instead of `[guacd] handshake_timeout`, whichever daemon it uses;
 - optionally **SSH jump hosts** to reach the server through ([below](#ssh-jump-hosts));
 - **recording** settings ([session recordings](#session-recordings));
 - the **folder** it is in.

@@ -9,6 +9,7 @@ import {PlusIcon, TrashIcon} from '@heroicons/react/24/outline';
 import {
   extraParameter,
   isGuacdPortValid,
+  isHandshakeTimeoutValid,
   otherStoredSecrets,
   type ConnectionForm,
   type ExtraParameter,
@@ -25,7 +26,11 @@ type Props = {
 /** guacd override and free parameters, collapsed unless already in use. */
 export default function AdvancedSettings({form, onChange, storedSecret}: Props) {
   const otherSecrets = otherStoredSecrets(form);
-  const isInUse = form.extras.length > 0 || form.guacdHost !== '' || otherSecrets.length > 0;
+  const isInUse =
+    form.extras.length > 0 ||
+    form.guacdHost !== '' ||
+    otherSecrets.length > 0 ||
+    form.guacdHandshakeTimeout !== '';
   return (
     <Collapsible defaultIsOpen={isInUse} trigger={<Heading level={3}>Advanced</Heading>}>
       <VStack gap={5} paddingBlockStart={3}>
@@ -47,6 +52,17 @@ export default function AdvancedSettings({form, onChange, storedSecret}: Props) 
             inputMode="numeric"
             isDisabled={!form.guacdHost.trim()}
             status={isGuacdPortValid(form) ? undefined : {type: 'error', message: 'Enter a port number.'}}
+          />
+          <TextInput
+            label="Handshake timeout (seconds)"
+            description="How long to wait for guacd to reach the remote desktop."
+            value={form.guacdHandshakeTimeout}
+            onChange={guacdHandshakeTimeout => onChange({guacdHandshakeTimeout})}
+            placeholder="Same as the gateway's guacd"
+            inputMode="numeric"
+            status={
+              isHandshakeTimeoutValid(form) ? undefined : {type: 'error', message: 'Enter 1 to 3600 seconds.'}
+            }
           />
         </VStack>
         {otherSecrets.length > 0 && (

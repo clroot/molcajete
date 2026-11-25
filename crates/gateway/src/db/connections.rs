@@ -24,6 +24,10 @@ pub struct ConnectionRecord {
     pub guacd_host: Option<String>,
     #[serde(default)]
     pub guacd_port: Option<u16>,
+    /// Seconds to wait for the handshake instead of `[guacd]
+    /// handshake_timeout`.
+    #[serde(default)]
+    pub guacd_handshake_timeout: Option<u64>,
     /// Protocol parameters sent in the `connect` instruction.
     ///
     /// Credentials ([`secrets::is_sensitive`]) are write-only: saving
@@ -109,6 +113,16 @@ fn guacd_port(row: &AnyRow) -> Result<Option<u16>, sqlx::Error> {
         .and_then(|p| u16::try_from(p).ok()))
 }
 
+fn guacd_handshake_timeout(row: &AnyRow) -> Result<Option<u64>, sqlx::Error> {
+    Ok(row
+        .try_get::<Option<i64>, _>("guacd_handshake_timeout")?
+        .and_then(|t| u64::try_from(t).ok()))
+}
+
+fn timeout_column(seconds: u64) -> i64 {
+    i64::try_from(seconds).unwrap_or(i64::MAX)
+}
+
 impl Database {
     /// Connections visible to a user: all of them for connection managers
     /// and administrators, otherwise those reachable through grants.
@@ -165,7 +179,8 @@ impl Database {
     pub async fn connection(&self, id: &str) -> DbResult<ConnectionRecord> {
         let row = query!(
             self,
-            "SELECT connection_id, name, protocol, guacd_host, guacd_port, parent_id \
+            "SELECT connection_id, name, protocol, guacd_host, guacd_port, \
+             guacd_handshake_timeout, parent_id \
              FROM molcajete_connection WHERE connection_id = ?"
         )
         .bind(id)
@@ -205,6 +220,7 @@ impl Database {
             protocol: row.try_get("protocol")?,
             guacd_host: row.try_get("guacd_host")?,
             guacd_port: guacd_port(&row)?,
+            guacd_handshake_timeout: guacd_handshake_timeout(&row)?,
             parameters,
             stored_secrets,
             clear_secrets: BTreeSet::new(),
@@ -283,15 +299,16 @@ impl Database {
         query!(
             self,
             "INSERT INTO molcajete_connection \
-             (connection_id, name, protocol, guacd_host, guacd_port, parent_id, \
-              created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+             (connection_id, name, protocol, guacd_host, guacd_port, \
+              guacd_handshake_timeout, parent_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&c.id)
         .bind(&c.name)
         .bind(&c.protocol)
         .bind(c.guacd_host.as_deref())
         .bind(c.guacd_port.map(i64::from))
+        .bind(c.guacd_handshake_timeout.map(timeout_column))
         .bind(c.parent_id.as_deref())
         .bind(now)
         .bind(now)
@@ -313,13 +330,15 @@ impl Database {
         let result = query!(
             self,
             "UPDATE molcajete_connection \
-             SET name = ?, protocol = ?, guacd_host = ?, guacd_port = ?, updated_at = ? \
+             SET name = ?, protocol = ?, guacd_host = ?, guacd_port = ?, \
+             guacd_handshake_timeout = ?, updated_at = ? \
              WHERE connection_id = ?"
         )
         .bind(&c.name)
         .bind(&c.protocol)
         .bind(c.guacd_host.as_deref())
         .bind(c.guacd_port.map(i64::from))
+        .bind(c.guacd_handshake_timeout.map(timeout_column))
         .bind(now_millis())
         .bind(&c.id)
         .execute(&mut *tx)
@@ -582,6 +601,7 @@ mod tests {
             protocol: "vnc".into(),
             guacd_host: None,
             guacd_port: None,
+            guacd_handshake_timeout: None,
             parameters: BTreeMap::from([
                 ("hostname".into(), "10.0.0.5".into()),
                 ("port".into(), "5900".into()),
@@ -632,6 +652,7 @@ mod tests {
             let mut changed = record("desktop", "Desktop 2");
             changed.guacd_host = Some("127.0.0.1".into());
             changed.guacd_port = Some(4823);
+            changed.guacd_handshake_timeout = Some(45);
             changed.parameters.remove("password");
             changed.clear_secrets.insert("password".into());
             changed.attributes = BTreeMap::from([(attributes::RECORD_KEYS.into(), "true".into())]);
