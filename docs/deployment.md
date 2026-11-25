@@ -229,7 +229,7 @@ The daemon the gateway connects to, molcajeted or stock guacd. A connection can 
 | --- | --- | --- |
 | `host` | `127.0.0.1` | Host name or address. |
 | `port` | `4822` | |
-| `handshake_timeout` | `15` | Seconds to wait for the handshake, which includes the daemon connecting to the remote desktop. |
+| `handshake_timeout` | `15` | Seconds to wait for the handshake, which includes the daemon connecting to the remote desktop. A connection can set its own. |
 
 ### `[database]`
 
@@ -411,7 +411,7 @@ Connections imported at startup when no connection with that id exists yet; afte
 | `id` | required. Used in URLs, metrics labels and recording file names. |
 | `name` | Shown in the connection list; defaults to `id`. |
 | `protocol` | required. The daemon's protocol: `vnc`, `rdp`, `ssh` (molcajeted and guacd), `telnet`, `kubernetes` (guacd). |
-| `guacd` | This connection's daemon, `{ host = "…", port = … }`; otherwise `[guacd]`. The handshake timeout is always `[guacd] handshake_timeout`. |
+| `guacd` | This connection's daemon, `{ host = "…", port = … }` (a missing host is `127.0.0.1`, a missing port `4822`); otherwise `[guacd]`. `handshake_timeout = <seconds>` (1–3600) in the same table replaces `[guacd] handshake_timeout` for this connection, for example for a remote desktop that is slow to answer; on its own it keeps `[guacd]` as the daemon. |
 | `parameters` | Protocol parameters sent to the daemon in `connect`, as strings (Guacamole's parameter names: `hostname`, `port`, `password`, `security`, `resize-method`, …). Credentials are encrypted when imported, but stay readable in this file: remove them once imported, or leave them out. |
 | `attributes` | molcajete's own settings, never sent to the daemon. Flags are on when the value is `"true"`: `record-sessions`, `record-keys`, `record-exclude-mouse`, `record-molcajete-formats`. |
 

@@ -271,6 +271,7 @@ mod tests {
             protocol: "vnc".into(),
             guacd_host: None,
             guacd_port: None,
+            guacd_handshake_timeout: None,
             parameters: BTreeMap::new(),
             stored_secrets: Default::default(),
             clear_secrets: Default::default(),

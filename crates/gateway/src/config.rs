@@ -503,6 +503,33 @@ impl Default for GuacdConfig {
     }
 }
 
+/// A connection's own `guacd`: where to connect, and how long to wait for
+/// the handshake instead of `[guacd] handshake_timeout`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionGuacdConfig {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub handshake_timeout: Option<u64>,
+}
+
+impl ConnectionGuacdConfig {
+    /// The daemon to use instead of `[guacd]`: given a host or a port, the
+    /// other defaults to `127.0.0.1` or `4822`; given only a timeout, none.
+    pub fn address(&self) -> Option<(String, u16)> {
+        if self.host.is_none() && self.port.is_none() {
+            return None;
+        }
+        Some((
+            self.host.clone().unwrap_or_else(default_guacd_host),
+            self.port.unwrap_or_else(default_guacd_port),
+        ))
+    }
+}
+
 fn default_guacd_host() -> String {
     "127.0.0.1".into()
 }
@@ -533,7 +560,7 @@ pub struct ConnectionConfig {
     pub protocol: String,
     /// Optional guacd override for this connection.
     #[serde(default)]
-    pub guacd: Option<GuacdConfig>,
+    pub guacd: Option<ConnectionGuacdConfig>,
     /// Protocol parameters sent in the `connect` instruction.
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
@@ -563,6 +590,13 @@ impl Config {
         for c in &self.connections {
             if !seen.insert(c.id.as_str()) {
                 bail!("duplicate connection id {:?}", c.id);
+            }
+            let timeout = c.guacd.as_ref().and_then(|g| g.handshake_timeout);
+            if timeout.is_some_and(|t| !(1..=3600).contains(&t)) {
+                bail!(
+                    "connection {:?}: guacd handshake_timeout needs 1–3600 seconds",
+                    c.id
+                );
             }
         }
         if self.secrets.key.is_some() && self.secrets.key_file.is_some() {
@@ -628,6 +662,28 @@ mod tests {
         assert_eq!(config.history.retention_days, 365);
         let config: Config = toml::from_str("[history]\nretention_days = 30\n").unwrap();
         assert_eq!(config.history.retention_days, 30);
+    }
+
+    #[test]
+    fn a_connection_may_set_its_own_handshake_timeout() {
+        let parse = |guacd: &str| {
+            let config: Config = toml::from_str(&format!(
+                "[[connections]]\nid = \"d\"\nprotocol = \"vnc\"\nguacd = {guacd}\n"
+            ))
+            .unwrap();
+            config.validate().map(|()| config)
+        };
+        // A timeout alone keeps `[guacd]` as the daemon.
+        let own = parse("{ handshake_timeout = 60 }").unwrap();
+        let guacd = own.connections[0].guacd.as_ref().unwrap();
+        assert_eq!(guacd.handshake_timeout, Some(60));
+        assert_eq!(guacd.address(), None);
+        let without = parse("{ port = 4823 }").unwrap();
+        let guacd = without.connections[0].guacd.as_ref().unwrap();
+        assert_eq!(guacd.handshake_timeout, None);
+        assert_eq!(guacd.address(), Some(("127.0.0.1".into(), 4823)));
+        assert!(parse("{ handshake_timeout = 0 }").is_err());
+        assert!(parse("{ handshake_timeout = 3601 }").is_err());
     }
 
     #[test]

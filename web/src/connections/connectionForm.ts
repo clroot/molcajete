@@ -12,6 +12,8 @@ export type ConnectionForm = {
   protocol: string;
   guacdHost: string;
   guacdPort: string;
+  /** Seconds, '' for the gateway's default. */
+  guacdHandshakeTimeout: string;
   /** Folder id, '' for the top level; only used when creating. */
   parentId: string;
   /**
@@ -129,6 +131,7 @@ export function emptyConnectionForm(parentId: string | null = null): ConnectionF
     protocol: 'vnc',
     guacdHost: '',
     guacdPort: '',
+    guacdHandshakeTimeout: '',
     parentId: parentId ?? '',
     fields: {},
     extras: [],
@@ -145,6 +148,7 @@ export function toConnectionForm(c: Connection): ConnectionForm {
     protocol: c.protocol,
     guacdHost: c.guacdHost ?? '',
     guacdPort: c.guacdPort == null ? '' : String(c.guacdPort),
+    guacdHandshakeTimeout: c.guacdHandshakeTimeout == null ? '' : String(c.guacdHandshakeTimeout),
     parentId: c.parentId ?? '',
     ...splitParameters(c.protocol, c.parameters),
     recording: toRecordingChoices(c.attributes),
@@ -186,16 +190,26 @@ export function isGuacdPortValid(form: ConnectionForm) {
   return port === '' || /^\d{1,5}$/.test(port);
 }
 
+/** Empty, or whole seconds from 1 to an hour (what the gateway accepts). */
+export function isHandshakeTimeoutValid(form: ConnectionForm) {
+  const seconds = form.guacdHandshakeTimeout.trim();
+  return seconds === '' || (/^\d{1,4}$/.test(seconds) && Number(seconds) >= 1 && Number(seconds) <= 3600);
+}
+
 export type FormResult = {ok: true; connection: Connection} | {ok: false; reason: string};
 
 export function toConnection(form: ConnectionForm): FormResult {
   if (!form.name.trim()) return {ok: false, reason: 'Give the connection a name.'};
   if (!isGuacdPortValid(form)) return {ok: false, reason: 'The guacd port must be a number.'};
+  if (!isHandshakeTimeoutValid(form)) {
+    return {ok: false, reason: 'The handshake timeout must be 1 to 3600 seconds.'};
+  }
   const guacdHost = form.guacdHost.trim();
   const guacdPort = form.guacdPort.trim();
   const parameters = joinParameters(form);
   // A value typed after clearing replaces the stored one anyway.
   const clearSecrets = form.clearedSecrets.filter(name => !(name in parameters));
+  const handshakeTimeout = form.guacdHandshakeTimeout.trim();
   return {
     ok: true,
     connection: {
@@ -204,6 +218,7 @@ export function toConnection(form: ConnectionForm): FormResult {
       protocol: form.protocol,
       guacdHost: guacdHost || null,
       guacdPort: guacdHost && guacdPort ? Number(guacdPort) : null,
+      guacdHandshakeTimeout: handshakeTimeout ? Number(handshakeTimeout) : null,
       parameters,
       ...(clearSecrets.length > 0 ? {clearSecrets} : {}),
       ...(form.parentId ? {parentId: form.parentId} : {}),

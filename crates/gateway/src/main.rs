@@ -1834,6 +1834,79 @@ mod tests {
         assert!(app.state.db.list_recordings().await.unwrap().is_empty());
     }
 
+    /// Opens connection `granted`, whose own handshake timeout is
+    /// `connection_timeout`, against a guacd that never answers, with
+    /// `[guacd] handshake_timeout = global_timeout`; returns how long the
+    /// gateway waited before closing the tunnel, and the close status.
+    async fn time_a_silent_handshake(
+        global_timeout: u64,
+        connection_timeout: Option<u64>,
+    ) -> (std::time::Duration, String) {
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let guacd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guacd_port = guacd.local_addr().unwrap().port();
+        // Accepts and holds the connection without saying anything.
+        tokio::spawn(async move {
+            let (_sock, _) = guacd.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let app = app_with(&format!(
+            "\n[guacd]\nport = {guacd_port}\nhandshake_timeout = {global_timeout}\n"
+        ))
+        .await;
+        let mut granted = app.state.db.connection("granted").await.unwrap();
+        granted.guacd_handshake_timeout = connection_timeout;
+        app.state.db.update_connection(&granted).await.unwrap();
+        let bob = app.login("bob", "bob-password").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = router(app.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, service).await });
+
+        let mut request = format!("ws://{addr}/websocket-tunnel?connection=granted")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "guacamole".parse().unwrap());
+        request.headers_mut().insert("cookie", bob.parse().unwrap());
+        let started = std::time::Instant::now();
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("the handshake times out")
+            .unwrap()
+            .unwrap();
+        let Message::Close(Some(frame)) = message else {
+            panic!("expected close, got {message:?}");
+        };
+        (started.elapsed(), frame.reason.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_connection_handshake_timeout_overrides_the_global_one() {
+        use std::time::Duration;
+
+        let timeout = molcajete_protocol::Status::UPSTREAM_TIMEOUT
+            .code()
+            .to_string();
+        let (waited, status) = time_a_silent_handshake(60, Some(1)).await;
+        assert_eq!(status, timeout);
+        assert!(
+            (Duration::from_secs(1)..Duration::from_secs(5)).contains(&waited),
+            "{waited:?}"
+        );
+
+        let (waited, status) = time_a_silent_handshake(1, None).await;
+        assert_eq!(status, timeout);
+        assert!(
+            (Duration::from_secs(1)..Duration::from_secs(5)).contains(&waited),
+            "{waited:?}"
+        );
+    }
+
     #[tokio::test]
     async fn only_administrators_reach_recordings() {
         let app = app().await;
@@ -2075,6 +2148,7 @@ mod tests {
                 Some(&admin),
                 serde_json::json!({
                     "id": "jump", "name": "Jump host", "protocol": "ssh",
+                    "guacdHandshakeTimeout": 30,
                     "parameters": {
                         "hostname": "10.0.0.10", "password": "rdp-secret-2",
                         "private-key": "ssh-key-material", "passphrase": "key-passphrase"
@@ -2090,6 +2164,7 @@ mod tests {
         assert_eq!(
             updated["changes"],
             serde_json::json!({
+                "guacdHandshakeTimeout": { "from": null, "to": 30 },
                 "parameters.hostname": { "from": "10.0.0.9", "to": "10.0.0.10" },
                 "parameters.password": replaced,
                 "parameters.private-key": replaced,
@@ -2118,7 +2193,10 @@ mod tests {
         let entries = audit(&app, &admin, "action=connection.update").await;
         assert_eq!(
             entries[0]["changes"],
-            serde_json::json!({ "name": { "from": "Jump host", "to": "Jump host 2" } })
+            serde_json::json!({
+                "name": { "from": "Jump host", "to": "Jump host 2" },
+                "guacdHandshakeTimeout": { "from": 30, "to": null },
+            })
         );
         // A cleared credential shows as removed.
         let cleared = app

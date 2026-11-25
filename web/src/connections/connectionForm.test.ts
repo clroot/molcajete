@@ -19,6 +19,7 @@ const rdp = {
   protocol: 'rdp',
   guacdHost: null,
   guacdPort: null,
+  guacdHandshakeTimeout: null,
   parameters: {hostname: '10.0.0.20', security: 'nla', 'color-depth': '16'},
   attributes: {},
 };
@@ -81,6 +82,20 @@ describe('connection form', () => {
     });
     expect(toConnection({...form, guacdPort: 'x'})).toMatchObject({ok: false});
     expect(toConnection({...form, name: ' '})).toMatchObject({ok: false});
+  });
+
+  test('round-trips the handshake timeout, with or without a guacd host', () => {
+    const slow = {...rdp, guacdHandshakeTimeout: 60};
+    const form = toConnectionForm(slow);
+    expect(form.guacdHandshakeTimeout).toBe('60');
+    expect(toConnection(form)).toEqual({ok: true, connection: slow});
+    expect(toConnection({...form, guacdHandshakeTimeout: ' '})).toMatchObject({
+      ok: true,
+      connection: {guacdHandshakeTimeout: null},
+    });
+    for (const bad of ['0', '3601', '1.5', 'x']) {
+      expect(toConnection({...form, guacdHandshakeTimeout: bad})).toMatchObject({ok: false});
+    }
   });
 
   test('keeps recording choices as attributes, not parameters', () => {

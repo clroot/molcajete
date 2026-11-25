@@ -324,6 +324,9 @@ pub async fn get_connection(
 
 pub const PROTOCOLS: &[&str] = &["vnc", "rdp", "ssh", "telnet", "kubernetes"];
 
+/// The longest handshake timeout a connection may ask for, in seconds.
+const MAX_HANDSHAKE_TIMEOUT: u64 = 3600;
+
 /// Trims and checks a connection from the browser.
 fn validate_connection(mut c: ConnectionRecord) -> ApiResult<ConnectionRecord> {
     c.id = c.id.trim().to_owned();
@@ -354,6 +357,13 @@ fn validate_connection(mut c: ConnectionRecord) -> ApiResult<ConnectionRecord> {
         .filter(|h| !h.is_empty());
     if c.guacd_host.is_none() {
         c.guacd_port = None;
+    }
+    if c.guacd_handshake_timeout
+        .is_some_and(|t| !(1..=MAX_HANDSHAKE_TIMEOUT).contains(&t))
+    {
+        return Err(ApiError::bad_request(format!(
+            "The handshake timeout needs 1–{MAX_HANDSHAKE_TIMEOUT} seconds."
+        )));
     }
     let mut parameters = BTreeMap::new();
     for (name, value) in c.parameters {
@@ -1523,6 +1533,7 @@ mod tests {
             protocol: "VNC".into(),
             guacd_host: Some(" ".into()),
             guacd_port: Some(4823),
+            guacd_handshake_timeout: Some(30),
             parameters: BTreeMap::from([
                 (" hostname ".into(), "10.0.0.5".into()),
                 ("empty".into(), String::new()),
@@ -1542,6 +1553,15 @@ mod tests {
         let c = validate_connection(record("desk-1")).unwrap();
         assert_eq!((c.name.as_str(), c.protocol.as_str()), ("Desktop", "vnc"));
         assert_eq!((c.guacd_host, c.guacd_port), (None, None));
+        // The timeout applies to the default guacd too.
+        assert_eq!(c.guacd_handshake_timeout, Some(30));
+        for bad in [0, MAX_HANDSHAKE_TIMEOUT + 1] {
+            let c = ConnectionRecord {
+                guacd_handshake_timeout: Some(bad),
+                ..record("desk-1")
+            };
+            assert!(validate_connection(c).is_err(), "{bad}");
+        }
         assert_eq!(c.parent_id, None);
         assert_eq!(
             c.parameters,

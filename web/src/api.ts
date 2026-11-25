@@ -74,6 +74,8 @@ export type Connection = {
   protocol: string;
   guacdHost: string | null;
   guacdPort: number | null;
+  /** Seconds to wait for the guacd handshake; null uses the gateway's `[guacd] handshake_timeout`. */
+  guacdHandshakeTimeout?: number | null;
   /**
    * guacd parameters. Stored credentials (see `isSensitive`) never come
    * back: they are named in `storedSecrets` instead, and saving without
