@@ -1,0 +1,94 @@
+name: Bug
+description: Something does not work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search the [open and closed issues](https://github.com/clroot/molcajete/issues?q=is%3Aissue) first.
+        Please do not report security problems here. Contact the maintainer privately instead.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where the problem shows up. Pick more than one if unsure.
+      multiple: true
+      options:
+        - gateway (molcajete-gateway, tunnel, API)
+        - web UI (web/)
+        - client (molcajete-client, wasm)
+        - daemon (molcajeted)
+        - protocol (molcajete-protocol)
+        - telemetry
+        - deploy / docker
+        - docs
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Remote protocol
+      multiple: true
+      options:
+        - RDP
+        - VNC
+        - SSH
+        - Not related to a protocol
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Affects version
+      description: Commit hash or image tag you are running.
+      placeholder: 0f372e8
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Anything below that applies.
+      value: |
+        - Daemon: molcajeted / stock guacd (version)
+        - Client mode: worker (default) / main thread (`?main`)
+        - Browser and OS:
+        - Remote host (e.g. Windows 11, Ubuntu 24.04 + xrdp):
+        - Database: SQLite / PostgreSQL / MySQL
+        - Deployment: cargo run / Docker / Kubernetes
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happens, and what you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Connect to ...
+        2. ...
+        3. ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Gateway and daemon logs at debug level (`RUST_LOG=debug`), and the browser console if the problem is in the page.
+        Remove passwords and hostnames you do not want to share.
+      render: text
+    validations:
+      required: false
