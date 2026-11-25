@@ -73,6 +73,8 @@ pub struct AppState {
     pub config: Config,
     pub db: Database,
     pub client_reports: bool,
+    /// Which tunnel each page session opened, for client reports.
+    pub tunnels: client_report::Tunnels,
 }
 
 /// Lets the page know which optional features are on.
@@ -291,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         db,
         client_reports: cli.client_reports,
+        tunnels: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!(%listen, "gateway listening");
@@ -357,6 +360,7 @@ mod tests {
             config,
             db,
             client_reports: false,
+            tunnels: Default::default(),
         });
         TestApp {
             router: router(state.clone()),

@@ -276,7 +276,7 @@
     {
       "type": "stat",
       "title": "ack p95",
-      "description": "From sending a frame until the browser has drawn and acknowledged it (includes the network round trip)",
+      "description": "From sending a frame until the browser has drawn and acknowledged it (includes the network round trip). molcajeted measures it per protocol, for every client together; per session it is in the Sessions table",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -345,7 +345,7 @@
     {
       "type": "stat",
       "title": "Browser lag p95",
-      "description": "From the browser receiving a frame to drawing it (decoding + GPU)",
+      "description": "From the browser receiving a frame to drawing it (decoding + GPU), for the clients selected by Browser and Device",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -364,7 +364,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_lag_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_lag_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
           "legendFormat": "",
           "range": true,
           "instant": false,
@@ -953,6 +953,357 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "Received from the remote server",
+      "description": "Bytes molcajeted reads from the remote server (RDP, VNC, SSH)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 32,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (protocol) (rate(molcajeted_remote_received_bytes_total{protocol=~\"$protocol\"}[$__rate_interval]))",
+          "legendFormat": "{{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Remote update decode time",
+      "description": "Decoding one update from the remote server (p50 and p95)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 33,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol) (rate(molcajeted_remote_decode_seconds_bucket{protocol=~\"$protocol\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol) (rate(molcajeted_remote_decode_seconds_bucket{protocol=~\"$protocol\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Images per frame",
+      "description": "Images (PNG, JPEG, zstd) sent in one frame: each costs the client a decode",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 34,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol) (rate(molcajeted_frame_images_bucket{protocol=~\"$protocol\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol) (rate(molcajeted_frame_images_bucket{protocol=~\"$protocol\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, protocol) (rate(molcajeted_frame_images_bucket{protocol=~\"$protocol\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Copies found by detection",
+      "description": "Copies per second that scroll and move detection found (the result of the scroll and moves phases above)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 35,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (phase) (rate(molcajeted_copies_total{protocol=~\"$protocol\"}[$__rate_interval]))",
+          "legendFormat": "{{phase}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Remote decode CPU (share of one core)",
+      "description": "Time spent decoding updates from the remote server, per second of wall time",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 36,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (protocol) (rate(molcajeted_remote_decode_seconds_sum{protocol=~\"$protocol\"}[$__rate_interval]))",
+          "legendFormat": "{{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "type": "row",
       "title": "Client and network",
       "collapsed": false,
@@ -961,14 +1312,14 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 32
+        "y": 48
       },
       "panels": []
     },
     {
       "type": "timeseries",
       "title": "Server ack vs RTT, frame arrival and browser lag (p95)",
-      "description": "ack is roughly tunnel RTT + frame arrival + browser frame lag. The tunnel ping is one small message, so it does not show how long a large frame takes to cross the link: that is frame arrival (first instruction to sync, measured in the browser)",
+      "description": "ack is roughly tunnel RTT + frame arrival + browser frame lag. The tunnel ping is one small message, so it does not show how long a large frame takes to cross the link: that is frame arrival (first drawing instruction to sync, measured in the browser). The browser series follow the Browser and Device selection; the ack is for every client together",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -978,7 +1329,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 33
+        "y": 49
       },
       "targets": [
         {
@@ -999,7 +1350,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_lag_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_lag_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
           "legendFormat": "browser frame lag",
           "range": true,
           "instant": false,
@@ -1011,7 +1362,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_rtt_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_rtt_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
           "legendFormat": "tunnel RTT",
           "range": true,
           "instant": false,
@@ -1023,8 +1374,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_receive_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "frame arrival (first instruction to sync)",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_receive_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
+          "legendFormat": "frame arrival (first drawing to sync)",
           "range": true,
           "instant": false,
           "refId": "D"
@@ -1077,7 +1428,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 33
+        "y": 49
       },
       "targets": [
         {
@@ -1086,7 +1437,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le, mode) (rate(molcajete_client_frames_fps_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, mode) (rate(molcajete_client_frames_fps_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
           "legendFormat": "p50 {{mode}}",
           "range": true,
           "instant": false,
@@ -1098,7 +1449,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.1, sum by (le, mode) (rate(molcajete_client_frames_fps_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.1, sum by (le, mode) (rate(molcajete_client_frames_fps_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
           "legendFormat": "p10 {{mode}}",
           "range": true,
           "instant": false,
@@ -1152,7 +1503,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 33
+        "y": 49
       },
       "targets": [
         {
@@ -1161,7 +1512,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_queued_ops_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(molcajete_client_queued_ops_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
           "legendFormat": "browser queued ops",
           "range": true,
           "instant": false,
@@ -1215,6 +1566,339 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "Browser lag p95 by client",
+      "description": "From the browser receiving a frame's sync to applying it, per kind of client (browser engine and device)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 37,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 57
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, browser, device) (rate(molcajete_client_frame_lag_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
+          "legendFormat": "{{browser}} {{device}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Frame arrival p95 by client",
+      "description": "From a frame's first drawing instruction to its sync, per kind of client: how long its data took to arrive",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 38,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 57
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, browser, device) (rate(molcajete_client_frame_receive_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__rate_interval])))",
+          "legendFormat": "{{browser}} {{device}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Client apply time (reported to molcajeted)",
+      "description": "How long molcajete clients say a frame took to apply (decoding and drawing, without waiting behind earlier frames). It sets their frame interval",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 39,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, protocol) (rate(molcajeted_client_apply_seconds_bucket{protocol=~\"$protocol\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, protocol) (rate(molcajeted_client_apply_seconds_bucket{protocol=~\"$protocol\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{protocol}}",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Clients over the time range",
+      "description": "p95 over the selected time range per kind of client. Two clients of the same kind share a row: see the Sessions table for each session",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "id": 40,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, browser, device) (rate(molcajete_client_frame_lag_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__range])))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A",
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, browser, device) (rate(molcajete_client_frame_receive_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__range])))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "B",
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, browser, device) (rate(molcajete_client_rtt_seconds_bucket{browser=~\"$browser\", device=~\"$device\"}[$__range])))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "C",
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le, browser, device) (rate(molcajete_client_frames_fps_bucket{browser=~\"$browser\", device=~\"$device\"}[$__range])))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "D",
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "browser": 0,
+              "device": 1,
+              "Value #A": 2,
+              "Value #B": 3,
+              "Value #C": 4,
+              "Value #D": 5
+            },
+            "renameByName": {
+              "Value #A": "lag p95",
+              "Value #B": "frame arrival p95",
+              "Value #C": "RTT p95",
+              "Value #D": "fps p50"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fps p50"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "lag p95",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
       "type": "row",
       "title": "Gateway",
       "collapsed": false,
@@ -1223,7 +1907,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 73
       },
       "panels": []
     },
@@ -1240,7 +1924,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 42
+        "y": 74
       },
       "targets": [
         {
@@ -1303,7 +1987,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 42
+        "y": 74
       },
       "targets": [
         {
@@ -1366,7 +2050,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 42
+        "y": 74
       },
       "targets": [
         {
@@ -1437,7 +2121,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 82
       },
       "panels": []
     },
@@ -1454,7 +2138,7 @@
         "h": 18,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 83
       },
       "targets": [
         {
@@ -1483,7 +2167,7 @@
         "h": 14,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 101
       },
       "targets": [
         {
@@ -1508,7 +2192,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 83
+        "y": 115
       },
       "panels": []
     },
@@ -1525,7 +2209,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 84
+        "y": 116
       },
       "targets": [
         {
@@ -1550,7 +2234,7 @@
     {
       "type": "logs",
       "title": "Browser reports (client report)",
-      "description": "Performance summary the browser sends every 10 seconds",
+      "description": "Performance summary the browser sends every 10 seconds. guacd_id is molcajeted's connection id (span_id of its display summary)",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -1560,7 +2244,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 93
+        "y": 125
       },
       "targets": [
         {
@@ -1569,7 +2253,7 @@
             "uid": "loki"
           },
           "editorMode": "code",
-          "expr": "{namespace=\"molcajete\", container=\"gateway\"} |= \"client report\" | json | line_format `{{.connection}} {{.mode}} {{.session}} | fps avg/min={{printf \"%.1f\" (float64 .fps_avg)}}/{{printf \"%.1f\" (float64 .fps_min)}} | lag avg/max={{printf \"%.1f\" (float64 .frame_lag_ms_avg)}}/{{printf \"%.1f\" (float64 .frame_lag_ms_max)}}ms | rtt={{.rtt_ms_avg}}ms | queued max={{.queued_ops_max}} | {{.display_width}}x{{.display_height}}`",
+          "expr": "{namespace=\"molcajete\", container=\"gateway\"} |= \"client report\" | json | line_format `{{.connection}} {{.mode}} {{.browser}}/{{.device}} {{.guacd_id}} | fps avg/min={{printf \"%.1f\" (float64 .fps_avg)}}/{{printf \"%.1f\" (float64 .fps_min)}} | lag avg/max={{printf \"%.1f\" (float64 .frame_lag_ms_avg)}}/{{printf \"%.1f\" (float64 .frame_lag_ms_max)}}ms | arrival max={{printf \"%.1f\" (float64 .frame_receive_ms_max)}}ms | rtt={{.rtt_ms_avg}}ms | queued max={{.queued_ops_max}} | {{.display_width}}x{{.display_height}}`",
           "queryType": "range",
           "refId": "A"
         }
@@ -1595,7 +2279,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 93
+        "y": 125
       },
       "targets": [
         {
@@ -1615,6 +2299,150 @@
         "sortOrder": "Descending",
         "enableLogDetails": true,
         "dedupStrategy": "none"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Sessions",
+      "description": "One row per tunnel over the time range, from the logs. Browser columns come from the client reports (p95 of the 10-second averages, and the largest maximum); the ack columns from molcajeted's display summary, logged when a session ends, joined on its connection id (guacd_id).",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "id": 41,
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 134
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "editorMode": "code",
+          "expr": "quantile_over_time(0.95, {namespace=\"molcajete\", container=\"gateway\"} |= \"client report\" | json | unwrap frame_lag_ms_avg | __error__=\"\" [$__range]) by (guacd_id, tunnel_id, connection, browser, device)",
+          "queryType": "instant",
+          "refId": "A",
+          "legendFormat": ""
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "editorMode": "code",
+          "expr": "max_over_time({namespace=\"molcajete\", container=\"gateway\"} |= \"client report\" | json | unwrap frame_lag_ms_max | __error__=\"\" [$__range]) by (guacd_id)",
+          "queryType": "instant",
+          "refId": "B",
+          "legendFormat": ""
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "editorMode": "code",
+          "expr": "max_over_time({namespace=\"molcajete\", container=\"gateway\"} |= \"client report\" | json | unwrap frame_receive_ms_max | __error__=\"\" [$__range]) by (guacd_id)",
+          "queryType": "instant",
+          "refId": "C",
+          "legendFormat": ""
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "editorMode": "code",
+          "expr": "avg_over_time({namespace=\"molcajete\", container=\"gateway\"} |= \"client report\" | json | unwrap rtt_ms_avg | __error__=\"\" [$__range]) by (guacd_id)",
+          "queryType": "instant",
+          "refId": "D",
+          "legendFormat": ""
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "editorMode": "code",
+          "expr": "max_over_time({namespace=\"molcajete\", container=\"molcajeted\"} |= \"display summary\" | json | label_format guacd_id=span_id | unwrap client_ack_ms_avg | __error__=\"\" [$__range]) by (guacd_id)",
+          "queryType": "instant",
+          "refId": "E",
+          "legendFormat": ""
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "editorMode": "code",
+          "expr": "max_over_time({namespace=\"molcajete\", container=\"molcajeted\"} |= \"display summary\" | json | label_format guacd_id=span_id | unwrap client_ack_ms_max | __error__=\"\" [$__range]) by (guacd_id)",
+          "queryType": "instant",
+          "refId": "F",
+          "legendFormat": ""
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "guacd_id",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(guacd_id|tunnel_id|connection|browser|device|Value #[A-F])$"
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "guacd_id": 0,
+              "tunnel_id": 1,
+              "connection": 2,
+              "browser": 3,
+              "device": 4,
+              "Value #A": 5,
+              "Value #B": 6,
+              "Value #C": 7,
+              "Value #D": 8,
+              "Value #E": 9,
+              "Value #F": 10
+            },
+            "renameByName": {
+              "Value #A": "lag p95",
+              "Value #B": "lag max",
+              "Value #C": "arrival max",
+              "Value #D": "RTT avg",
+              "Value #E": "ack avg",
+              "Value #F": "ack max"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "lag p95",
+            "desc": true
+          }
+        ]
       }
     }
   ],
@@ -1652,6 +2480,64 @@
         },
         "refresh": 2,
         "sort": 1
+      },
+      {
+        "name": "browser",
+        "label": "Browser",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(molcajete_client_frames_fps_count, browser)",
+          "refId": "browser"
+        },
+        "definition": "label_values(molcajete_client_frames_fps_count, browser)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "description": "Kind of browser client (molcajete_client_* metrics only)"
+      },
+      {
+        "name": "device",
+        "label": "Device",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(molcajete_client_frames_fps_count, device)",
+          "refId": "device"
+        },
+        "definition": "label_values(molcajete_client_frames_fps_count, device)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "description": "Kind of browser client (molcajete_client_* metrics only)"
       }
     ]
   },
@@ -1662,5 +2548,5 @@
   "timezone": "browser",
   "title": "Molcajete Performance",
   "uid": "molcajete-performance",
-  "version": 2
+  "version": 3
 }

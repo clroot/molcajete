@@ -10,6 +10,7 @@
 //! the browser and nothing to wait for: they are queued as received and
 //! decoded when their frame is drawn.
 
+mod arrival;
 mod frames;
 pub mod path;
 mod present;
@@ -23,6 +24,7 @@ use crate::gl::{
     Clip, CompositeItem, CompositeNode, ImageSource, Paint, Readback, Renderer, Surface,
 };
 use crate::image::DecodedImage;
+use arrival::Arrival;
 use frames::Frames;
 use molcajete_protocol::zimage;
 use path::{Path, Shape};
@@ -403,8 +405,8 @@ pub struct RenderStats {
     pub composites: u32,
     pub draw_calls: u32,
     pub queued_ops: usize,
-    /// Per frame: from its first instruction to its `sync` (the time its
-    /// data took to arrive and be parsed).
+    /// Per frame: from its first drawing instruction to its `sync` (the
+    /// time its data took to arrive and be parsed; see [`arrival`]).
     pub receive: Span,
     /// Per frame: from its `sync` to being applied (waiting for its images
     /// and for the frames before it).
@@ -440,8 +442,8 @@ pub struct Display {
     /// When the last frame was applied (`performance.now()`, 0 before the
     /// first).
     last_applied: f64,
-    /// When the first instruction of the frame being received arrived.
-    frame_started: Option<f64>,
+    /// When the frame being received started arriving.
+    arrival: Arrival,
     /// Source of layer generations (unique across layers and re-creations).
     generation_counter: u64,
     /// Identity of the last cursor read back: (src, rect, hotspot, generation).
@@ -485,7 +487,7 @@ impl Display {
             stats: RenderStats::default(),
             unpresented: Unpresented::default(),
             last_applied: 0.0,
-            frame_started: None,
+            arrival: Arrival::default(),
             generation_counter: 0,
             last_cursor: None,
             pending_cursor: None,
@@ -563,15 +565,13 @@ impl Display {
                 let received_at = *received_at;
                 self.queued_syncs += 1;
                 self.frames.end_frame();
-                let started = self.frame_started.take().unwrap_or(received_at);
-                self.stats.receive.add(received_at - started);
+                self.stats.receive.add(self.arrival.sync(received_at));
             }
             _ => {
                 if let Op::Image { slot, .. } = &op {
                     self.frames.add_image(slot);
                 }
-                self.frame_started
-                    .get_or_insert_with(crate::scope::performance_now);
+                self.arrival.op(&op, crate::scope::performance_now);
             }
         }
         self.queue.push_back(op);
