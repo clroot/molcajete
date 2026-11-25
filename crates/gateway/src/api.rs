@@ -1,10 +1,10 @@
-//! JSON API: login sessions, connections, folders, users and groups.
+//! JSON API: login sessions, connections, folders, users, groups and recordings.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -13,9 +13,10 @@ use tracing::{error, info, warn};
 use crate::AppState;
 use crate::auth::{self, AdminUser, ConnectionManager, CurrentUser};
 use crate::db::{
-    Access, ConnectionRecord, DbError, Folder, Group, GroupUpdate, NewUser, Principal, Role,
-    Target, User, UserUpdate,
+    Access, ConnectionRecord, DbError, Folder, Group, GroupUpdate, NewUser, Principal, Recording,
+    Role, Target, User, UserUpdate, attributes,
 };
+use crate::recording;
 
 /// Error response: `{"error": "<message>"}` with a status code.
 #[derive(Debug)]
@@ -294,6 +295,15 @@ fn validate_connection(mut c: ConnectionRecord) -> ApiResult<ConnectionRecord> {
     }
     c.parameters = parameters;
     c.parent_id = c.parent_id.filter(|p| !p.is_empty());
+    // Attributes are flags the gateway acts on; unset ones are left out.
+    for name in c.attributes.keys() {
+        if !attributes::ALL.contains(&name.as_str()) {
+            return Err(ApiError::bad_request(format!(
+                "Unknown connection attribute {name:?}."
+            )));
+        }
+    }
+    c.attributes.retain(|_, value| value == "true");
     Ok(c)
 }
 
@@ -875,6 +885,104 @@ pub async fn delete_group(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---------------------------------------------------------------------------
+// Recordings (administrators only)
+
+fn recordings_dir(state: &AppState) -> std::path::PathBuf {
+    state.config.recordings.directory(&state.config.server)
+}
+
+/// A recording still being written reports the size of its file so far.
+async fn with_current_size(state: &AppState, mut recording: Recording) -> Recording {
+    if recording.ended_at.is_none()
+        && let Some(path) = recording::file_path(&recordings_dir(state), &recording)
+        && let Ok(metadata) = tokio::fs::metadata(path).await
+    {
+        recording.size_bytes = metadata.len() as i64;
+    }
+    recording
+}
+
+pub async fn list_recordings(
+    State(state): State<Arc<AppState>>,
+    AdminUser(_): AdminUser,
+) -> ApiResult<Json<Vec<Recording>>> {
+    let mut recordings = Vec::new();
+    for recording in state.db.list_recordings().await? {
+        recordings.push(with_current_size(&state, recording).await);
+    }
+    Ok(Json(recordings))
+}
+
+pub async fn get_recording(
+    State(state): State<Arc<AppState>>,
+    AdminUser(_): AdminUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Recording>> {
+    let recording = state.db.recording(&id).await?;
+    Ok(Json(with_current_size(&state, recording).await))
+}
+
+#[derive(Deserialize)]
+pub struct FileQuery {
+    /// Ask the browser to save the file instead of handing it to the page.
+    #[serde(default)]
+    download: bool,
+}
+
+/// The recording file, with range requests (`ServeFile`).
+pub async fn recording_file(
+    State(state): State<Arc<AppState>>,
+    AdminUser(admin): AdminUser,
+    Path(id): Path<String>,
+    Query(query): Query<FileQuery>,
+    request: Request,
+) -> ApiResult<Response> {
+    use tower::ServiceExt as _;
+
+    let recording = state.db.recording(&id).await?;
+    let path = recording::file_path(&recordings_dir(&state), &recording)
+        .ok_or_else(ApiError::not_found)?;
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "The recording file is missing.",
+        ));
+    }
+    let mut response = tower_http::services::ServeFile::new(&path)
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|never| match never {})
+        .map(axum::body::Body::new);
+    if query.download {
+        let disposition = format!("attachment; filename=\"{}\"", recording.file_name);
+        if let Ok(value) = HeaderValue::from_str(&disposition) {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_DISPOSITION, value);
+        }
+        info!(by = %admin.username, recording = %id, "recording downloaded");
+    }
+    Ok(response)
+}
+
+pub async fn delete_recording(
+    State(state): State<Arc<AppState>>,
+    AdminUser(admin): AdminUser,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let recording = state.db.recording(&id).await?;
+    if recording.ended_at.is_none() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "The session is still being recorded.",
+        ));
+    }
+    recording::delete(&state.db, &recordings_dir(&state), &recording).await?;
+    info!(by = %admin.username, recording = %id, file = %recording.file_name, "recording deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,6 +999,10 @@ mod tests {
                 ("empty".into(), String::new()),
             ]),
             parent_id: Some(String::new()),
+            attributes: BTreeMap::from([
+                (attributes::RECORD.into(), "true".into()),
+                (attributes::RECORD_KEYS.into(), "false".into()),
+            ]),
         }
     }
 
@@ -904,6 +1016,13 @@ mod tests {
             c.parameters,
             BTreeMap::from([("hostname".into(), "10.0.0.5".into())])
         );
+        assert_eq!(
+            c.attributes,
+            BTreeMap::from([(attributes::RECORD.into(), "true".into())])
+        );
+        let mut unknown = record("x");
+        unknown.attributes.insert("hostname".into(), "true".into());
+        assert!(validate_connection(unknown).is_err());
         assert!(validate_connection(record("has space")).is_err());
         assert!(validate_connection(record("")).is_err());
         let mut bad = record("x");

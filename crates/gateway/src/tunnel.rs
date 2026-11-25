@@ -31,12 +31,13 @@ use molcajete_protocol::{InstructionBuilder, Limits, Parser, RawInstruction, Sta
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
-use tracing::{Instrument as _, debug, info, info_span, warn};
+use tracing::{Instrument as _, debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::db::ConnectionRecord;
+use crate::db::{ConnectionRecord, attributes};
 use crate::guacd::{self, ClientInfo, GuacdSession};
+use crate::recording::{self, RecordedUser, Recorder};
 
 /// WebSocket subprotocol of the stock Guacamole tunnel.
 pub const TEXT_SUBPROTOCOL: &str = "guacamole";
@@ -61,8 +62,8 @@ pub struct TunnelRequest {
     /// Address of the browser, as seen by the gateway or reported by a
     /// trusted reverse proxy (`X-Forwarded-For`).
     pub peer: Option<String>,
-    /// The signed-in user opening the tunnel. Only used for logs.
-    pub user: Option<String>,
+    /// The signed-in user opening the tunnel, for logs and recordings.
+    pub user: Option<RecordedUser>,
     /// The browser selected the binary subprotocol.
     pub binary: bool,
     pub info: ClientInfo,
@@ -171,7 +172,7 @@ pub async fn serve(
         connection = request.connection.as_deref().unwrap_or(""),
         session = request.session.as_deref().unwrap_or(""),
         peer = request.peer.as_deref().unwrap_or(""),
-        user = request.user.as_deref().unwrap_or(""),
+        user = request.user.as_ref().map_or("", |u| u.username.as_str()),
     );
     serve_tunnel(socket, state, request, connection, tunnel_id)
         .instrument(span)
@@ -181,7 +182,7 @@ pub async fn serve(
 async fn serve_tunnel(
     mut socket: WebSocket,
     state: Arc<AppState>,
-    request: TunnelRequest,
+    mut request: TunnelRequest,
     connection: Option<ConnectionRecord>,
     tunnel_id: Uuid,
 ) {
@@ -201,12 +202,17 @@ async fn serve_tunnel(
     let guacd_host = connection.guacd_host.as_deref().unwrap_or(&defaults.host);
     let guacd_port = connection.guacd_port.unwrap_or(defaults.port);
     let parameters = request.parameters(&connection.parameters);
+    let record = recording::wanted(&state.config.recordings, &connection);
+    if record && !connection.flag(attributes::RECORD_MOLCAJETE_FORMATS) {
+        recording::stock_formats_only(&mut request.info);
+    }
     info!(
         connection = %connection.id,
         protocol = %connection.protocol,
         width = request.info.width,
         height = request.info.height,
         overrides = ?request.overrides,
+        record,
         "opening tunnel"
     );
 
@@ -231,6 +237,23 @@ async fn serve_tunnel(
     };
     let handshake = handshake_started.elapsed();
     histogram!("molcajete_gateway_handshake_seconds", &labels).record(handshake);
+
+    // A session that is to be recorded does not start unrecorded.
+    let recorder = if record {
+        let directory = state.config.recordings.directory(&state.config.server);
+        let user = request.user.clone().unwrap_or_default();
+        match Recorder::start(&state.db, &directory, &connection, &user).await {
+            Ok(recorder) => Some(recorder),
+            Err(err) => {
+                error!(error = %err, dir = %directory.display(), "cannot start the recording; refusing the session");
+                counter!("molcajete_gateway_recording_failures_total", &labels).increment(1);
+                let _ = socket.send(close_message(Status::SERVER_ERROR)).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     info!(
         guacd_id = %session.id,
@@ -258,7 +281,18 @@ async fn serve_tunnel(
             &with(&labels, "direction", "to_guacd")
         ),
     };
-    let stats = relay(socket, session, tunnel_id, request.binary, &counters).await;
+    let stats = relay(
+        socket,
+        session,
+        tunnel_id,
+        request.binary,
+        &counters,
+        recorder.as_ref(),
+    )
+    .await;
+    if let Some(recorder) = recorder {
+        recorder.finish(&state.db).await;
+    }
     if let Some(session_id) = session_id {
         state.tunnels.closed(session_id, tunnel_id);
     }
@@ -335,13 +369,15 @@ impl Framing {
 
 /// Pumps data in both directions until either side terminates.
 /// `browser_binary` tells whether the browser selected the binary
-/// subprotocol.
+/// subprotocol. With a `recorder`, what the browser is sent and its mouse
+/// and keys are recorded too.
 pub async fn relay(
     socket: WebSocket,
     session: GuacdSession,
     tunnel_id: Uuid,
     browser_binary: bool,
     counters: &RelayCounters,
+    recorder: Option<&Recorder>,
 ) -> RelayStats {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
@@ -375,6 +411,7 @@ pub async fn relay(
             out: &out_tx,
             counter: &counters.to_browser,
             total: &mut to_browser,
+            recorder,
         };
         let to_browser = async {
             match framing {
@@ -385,7 +422,7 @@ pub async fn relay(
         };
         tokio::select! {
             status = to_browser => status,
-            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &mut to_guacd) => status,
+            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &mut to_guacd, recorder) => status,
         }
     };
 
@@ -405,9 +442,16 @@ struct Upstream<'a> {
     out: &'a mpsc::Sender<Message>,
     counter: &'a Counter,
     total: &'a mut u64,
+    recorder: Option<&'a Recorder>,
 }
 
 impl Upstream<'_> {
+    fn record(&self, f: impl FnOnce(&mut recording::Encoder)) {
+        if let Some(recorder) = self.recorder {
+            recorder.record(f);
+        }
+    }
+
     /// Reads more from guacd. `Err` carries the status the tunnel ends with.
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Status> {
         match self.rd.read(buf).await {
@@ -428,7 +472,11 @@ impl Upstream<'_> {
     }
 
     /// Sends a message to the browser; `Err` when the browser is gone.
+    /// What was recorded up to here is written first.
     async fn send(&self, message: Message) -> Result<(), Status> {
+        if let Some(recorder) = self.recorder {
+            recorder.flush().await;
+        }
         self.out.send(message).await.map_err(|_| Status::SUCCESS)
     }
 
@@ -444,6 +492,7 @@ impl Upstream<'_> {
                     match parser.next_raw() {
                         Ok(Some(raw)) => {
                             message.push_str(raw.as_str());
+                            self.record(|e| e.server_instruction(&raw));
                             if message.len() >= MAX_MESSAGE_BYTES {
                                 let chunk = std::mem::replace(
                                     &mut message,
@@ -496,6 +545,7 @@ impl Upstream<'_> {
                                 self.send(Message::Binary(chunk.into())).await?;
                             }
                             message.extend_from_slice(bytes);
+                            self.record(|e| e.server_record(record.record()));
                         }
                         Ok(None) => break,
                         Err(err) => {
@@ -529,6 +579,7 @@ impl Upstream<'_> {
                     match parser.next_raw() {
                         Ok(Some(raw)) => {
                             push_record(&mut message, &raw, &mut data);
+                            self.record(|e| e.server_instruction(&raw));
                             if message.len() >= MAX_MESSAGE_BYTES {
                                 self.send(Message::Binary(message.take().into())).await?;
                             }
@@ -576,6 +627,7 @@ async fn browser_to_guacd(
     out: &mpsc::Sender<Message>,
     counter: &Counter,
     total: &mut u64,
+    recorder: Option<&Recorder>,
 ) -> Status {
     let mut parser = Parser::with_limits(Limits::STRICT);
     let mut forward = Vec::with_capacity(4096);
@@ -605,13 +657,22 @@ async fn browser_to_guacd(
                         }
                     }
                 }
-                Ok(Some(raw)) => forward.extend_from_slice(raw.as_bytes()),
+                Ok(Some(raw)) => {
+                    if let Some(recorder) = recorder {
+                        let now = crate::db::now_millis();
+                        recorder.record(|e| e.client_instruction(&raw, now));
+                    }
+                    forward.extend_from_slice(raw.as_bytes());
+                }
                 Ok(None) => break,
                 Err(err) => {
                     warn!(error = %err, "invalid data from browser");
                     return Status::CLIENT_BAD_REQUEST;
                 }
             }
+        }
+        if let Some(recorder) = recorder {
+            recorder.flush().await;
         }
         if !forward.is_empty() {
             if wr.write_all(&forward).await.is_err() {

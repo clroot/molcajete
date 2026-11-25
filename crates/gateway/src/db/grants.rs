@@ -273,6 +273,7 @@ mod tests {
             guacd_port: None,
             parameters: BTreeMap::new(),
             parent_id: parent.map(str::to_owned),
+            attributes: BTreeMap::new(),
         })
         .await
         .unwrap();

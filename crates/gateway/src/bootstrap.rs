@@ -17,6 +17,7 @@ impl ConnectionConfig {
             guacd_port: self.guacd.as_ref().map(|g| g.port),
             parameters: self.parameters.clone(),
             parent_id: None,
+            attributes: self.attributes.clone(),
         }
     }
 }
