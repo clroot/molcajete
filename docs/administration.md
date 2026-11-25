@@ -71,6 +71,7 @@ Connection managers and administrators create and edit connections under *Connec
 - a **protocol**: VNC, RDP, SSH, Telnet or Kubernetes;
 - the **parameters** sent to the daemon in Guacamole's `connect` instruction. The form has fields for the common ones (host name, port, credentials; for RDP also the domain, security mode, keyboard layout, resizing the desktop to the window and display scale; for SSH a private key and font size; for Kubernetes namespace, pod and container). Any other Guacamole parameter can be added under *Advanced* as a name and value. Empty values are not stored;
 - optionally a **daemon** of its own (*Advanced → guacd host / port*) instead of the gateway's default `[guacd]`: this is how a connection is served by molcajeted while others use stock guacd, or the other way round. molcajeted serves VNC, SSH and RDP; Telnet and Kubernetes need stock guacd;
+- optionally **SSH jump hosts** to reach the server through ([below](#ssh-jump-hosts));
 - **recording** settings ([session recordings](#session-recordings));
 - the **folder** it is in.
 
@@ -95,6 +96,33 @@ ignore-cert = "true"
 ```
 
 The attributes are the recording switches below: `record-sessions`, `record-exclude-mouse`, `record-keys` and `record-molcajete-formats`, each `"true"` when on. Unlike parameters they are never sent to the daemon.
+
+### SSH jump hosts
+
+A server that only a bastion can reach is opened through SSH jump hosts, set in the *SSH jump hosts* section of the connection form for any protocol. Only molcajeted connects through them: it logs in to the first jump host, from there to the next one, and has the last open the connection to the server. Stock guacd ignores these parameters and connects directly.
+
+- **Jump hosts** (`jump-hosts`): one per line (or separated by commas), in the order they are passed through, as `user@host` or `user@host:port`; the port defaults to 22 and IPv6 addresses go in brackets (`[2001:db8::1]:22`). Up to four.
+- **Username, password, private key, key passphrase** (`jump-host-username`, `jump-host-password`, `jump-host-private-key`, `jump-host-passphrase`): used for every jump host. The username is for hosts listed without one.
+- **Host key** (`jump-host-host-key`): the jump hosts must present this key, or the connection is refused. It takes a known_hosts line, a public key (`ssh-ed25519 AAAA…`) or a SHA-256 fingerprint (`SHA256:…`, as `ssh-keygen -lf` prints it), one per line. Without it any key is accepted. `ssh-keyscan -t ed25519 bastion.example.com` prints a host's key; check it against the host itself before pinning it.
+- **One jump host differs from the others**: add its own values under *Advanced → Other parameters*, named after its position in the list: `jump-host-2-password`, `jump-host-2-private-key`, `jump-host-2-passphrase`, `jump-host-2-host-key` for the second. Its own password or key replaces the shared password and key.
+
+The jump hosts must allow TCP forwarding (OpenSSH: `AllowTcpForwarding yes`, the default). When a password is left out, the browser asks for it when the session starts (*Jump host password*, or *Jump host 2 password* with several hops). Errors name the jump host they come from, for example `jump host 1 (admin@bastion:22) presented a host key that does not match its configured host key`.
+
+In `gateway.toml` the parameters go with the others:
+
+```toml
+[connections.parameters]
+hostname = "10.20.0.5"        # as the last jump host sees it
+jump-hosts = "admin@bastion.example.com"
+jump-host-private-key = """
+-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----
+"""
+jump-host-host-key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF8z..."
+```
+
+The host name and port of the connection are resolved and reached by the last jump host, not by molcajeted. Each session opens its own SSH connections to the jump hosts.
 
 ### Folders
 

@@ -4,6 +4,7 @@ import {Layout, LayoutContent, LayoutFooter} from '@astryxdesign/core/Layout';
 import {HStack, VStack} from '@astryxdesign/core/Stack';
 import {TextInput} from '@astryxdesign/core/TextInput';
 import {Button} from '@astryxdesign/core/Button';
+import {requiredLabel} from '../connections/jumpHosts';
 
 type Props = {
   /** Parameter names the server asked for, e.g. ["username", "password"]. */
@@ -36,7 +37,7 @@ export default function CredentialsDialog({parameters, connectionName, onSubmit,
                 {parameters.map((parameter, i) => (
                   <TextInput
                     key={parameter}
-                    label={parameter}
+                    label={requiredLabel(parameter)}
                     type={isSecret(parameter) ? 'password' : 'text'}
                     value={values[parameter] ?? ''}
                     onChange={value => setValues(v => ({...v, [parameter]: value}))}

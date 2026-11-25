@@ -97,7 +97,8 @@ crates/
 web/          React + Astryx UI; web/public holds the client glue (molcajete.js, molcajete-worker.js,
               molcajete-player.js) next to the built wasm package (pkg/)
 tests/browser headless Chromium tests and benchmarks
-docker/       test targets (guacd 1.6, X11 over VNC, OpenSSH, xrdp on 127.0.0.1:3390, Keycloak)
+docker/       test targets (guacd 1.6, X11 over VNC, OpenSSH, xrdp on 127.0.0.1:3390, Keycloak,
+              the same targets behind SSH jump hosts)
 deploy/       Compose, Kubernetes, launchd and reverse proxy files (see deployment.md)
 ```
 
@@ -120,6 +121,7 @@ Between molcajete components a few extensions are used. Each is offered in a way
 | `display-control` (section 4.8) | instruction sent by molcajeted's RDP sessions | molcajete web UI | menu items stay enabled; changes apply at the next connection |
 | `link`, `selection` (section 4.7) | instructions sent by molcajeted's SSH terminal | molcajete web UI | no link opening; copy shortcut uses the last selection |
 | Per-browser display parameters (section 4.8) | `param.dpi`, `param.resize-method` in the tunnel URL | gateway | the connection's own values |
+| SSH jump hosts (section 6.9) | `jump-hosts` and `jump-host-*` connection parameters, listed in molcajeted's `args` | molcajeted | the daemon connects to the server directly |
 
 How each extension behaves across component versions is tabulated in [Mixed versions](deployment.md#mixed-versions) in deployment.md.
 
@@ -464,7 +466,7 @@ The page posts the client's once-per-second `stats` to `/api/telemetry/client` (
 
 molcajeted listens on port 4822 like guacd and runs one tokio task per connection, where guacd forks a process.
 
-- **Handshake** (`handshake.rs`). Compatible with guacd: `args` advertises `VERSION_1_5_0` and the argument names of guacd's plugins for `vnc`, `ssh` and `rdp`, so a connection configured for guacd works unchanged; `molcajete-binary` is appended last (section 5.2). Joining a running connection (`select,$id`) is refused, and other protocols get `UNSUPPORTED`. Client input is parsed with `Limits::STRICT`.
+- **Handshake** (`handshake.rs`). Compatible with guacd: `args` advertises `VERSION_1_5_0` and the argument names of guacd's plugins for `vnc`, `ssh` and `rdp`, so a connection configured for guacd works unchanged, followed by the jump host parameters (section 6.9); `molcajete-binary` is appended last (section 5.2). Joining a running connection (`select,$id`) is refused, and other protocols get `UNSUPPORTED`. Client input is parsed with `Limits::STRICT`.
 - **Output** (`io.rs`). Everything sent to the client goes through one `Output`: instructions are appended as text, stream data with `Output::blob`, which writes base64 `blob` instructions of at most 6048 bytes for a stock client and blob records for a molcajete gateway. Display, video, audio and clipboard code is the same for both.
 - **Input** (`session.rs`). A reader task decodes client instructions into `ClientEvent`s (mouse, key, size, clipboard, `argv`, sync replies with their arrival time and apply time, stream acks), reassembling inbound `clipboard` and `argv` streams.
 - **Loop.** Each protocol runs one `select!` loop over remote updates, client input, the frame timer, the idle timer (`Display::idle_deadline`, for ending an idle video and refining lossy areas without new changes) and a 5 s keep-alive. The frame is built inside `block_in_place` on the connection's task.
@@ -581,11 +583,21 @@ Parameter names match guacd's SSH plugin.
 - **Display size and scale.** Display Control ([MS-RDPEDISP]) is offered to every server. A new size (`size` while resizing follows the window) and a new scale (`argv` `dpi`) both go out as a monitor layout: the size the desktop has or is about to get, with `DesktopScaleFactor` from the DPI (100–500 %) and `DeviceScaleFactor` at Windows' plateaus 100, 140 and 180 %. Requests are applied after 500 ms without another one. The server opens the channel when it likes, and "not yet" and "never" look the same, so the channel counts as missing when the server did not join `drdynvc`, or 10 s after the session became active (`display_control::WAIT`); molcajeted then sends `display-control,0`, and `display-control,1` if the channel opens later. Windows applies a new scale to applications that support per-monitor DPI; others keep their size until they restart.
 - **Audio** (`rdp/audio.rs`). The RDPSND static channel and the `AUDIO_PLAYBACK_DVC` dynamic channel are registered, together with a device redirection channel (RDPDR) that redirects nothing, because Windows only starts RDPSND once RDPDR has completed its capability exchange. Among the server's formats only decodable ones are accepted (PCM 8/16-bit, G.711, IMA/MS ADPCM), preferring 16-bit, 44.1 or 48 kHz, stereo. Sound goes out right away, independent of frame pacing, as `audio/L16;rate=R,channels=C` (8-bit if the client only takes L8). Without client audio or with `disable-audio` the channels are not created, so the remote session plays nothing. A rejected stream stops audio for the session.
 
+### 6.9 SSH jump hosts (`jump/`)
+
+Any of the three protocols can reach its server through one to four SSH jump hosts (`jump-hosts`). `Chain::connect` opens a TCP connection to the first hop, runs an SSH session over it (russh, with the SSH plugin's handshake, host key pinning and authentication from `ssh/client.rs`), and asks that hop for a `direct-tcpip` channel to the next one; the next SSH session runs inside that channel, and so on. The last hop's channel goes to the target. Without jump hosts it is a plain TCP connection.
+
+- **One stream type.** `Upstream` is either the TCP socket or the last channel, holding the SSH session of every hop for as long as it lives. The RFB client takes it split into boxed halves, the RDP connector wraps it in `CountingStream` and TLS, and the SSH plugin runs its own handshake over it, so no protocol code knows whether a tunnel is in between. Through a tunnel the RDP client address sent to the server is unspecified, since the TCP connection to the target belongs to the last hop.
+- **Parameters.** Shared values (`jump-host-username`, `-password`, `-private-key`, `-passphrase`, `-host-key`) apply to every hop without its own; `jump-host-<n>-password`, `-private-key`, `-passphrase` and `-host-key` apply to hop `n` only, and a hop's own password or key replaces both shared ones. Every name is in `args` for every protocol (`jump::ARGS`), so the per-hop names are fixed in number: four hops.
+- **Missing values.** A hop without a username or credentials is asked for with `required` before connecting: `jump-host-username`, and `jump-host-password` (one hop) or `jump-host-<n>-password` (several), together with the SSH target's own `username`/`password` in an SSH session.
+- **Errors** name the hop, as `jump host <n> (<user>@<host>:<port>)`: unreachable (`UPSTREAM_NOT_FOUND`), a host key that does not match its pin (`UPSTREAM_ERROR`), a failed login (`CLIENT_UNAUTHORIZED`), or a hop that cannot open a channel to the next hop or to the target, with the reason it gave (`UPSTREAM_NOT_FOUND`).
+- Each hop sends an SSH keepalive every 30 s. A chain is opened per session; sharing an open chain between sessions to the same network is not implemented.
+
 ## 7. Verification
 
 ### 7.1 Tests
 
-- **Unit tests.** Protocol: every split point, code point lengths, limits, invalid UTF-8, binary records at every split point, the zstd image decoder on damaged input. Gateway: the guacd handshake against a fake guacd, error mapping, query parsing, tunnels of all four client/daemon combinations through a real WebSocket, migrations and queries on every database backend, the OIDC flow against a fake provider, recording encoding, retention and permissions. Daemon: the handshake with and without the binary parameter, display merging, copy ordering and blob splitting, the same frame as text and as records, PNG and zstd round trips through the client's decoder, the choice between zstd and PNG, the client simulator and randomized display test, pacing, YUV conversion, the RFB client, RDP settings and keyboard mapping. Client logic: path tessellation, keysyms, key release pairing, wheel, PCM.
+- **Unit tests.** Protocol: every split point, code point lengths, limits, invalid UTF-8, binary records at every split point, the zstd image decoder on damaged input. Gateway: the guacd handshake against a fake guacd, error mapping, query parsing, tunnels of all four client/daemon combinations through a real WebSocket, migrations and queries on every database backend, the OIDC flow against a fake provider, recording encoding, retention and permissions. Daemon: the handshake with and without the binary parameter, display merging, copy ordering and blob splitting, the same frame as text and as records, PNG and zstd round trips through the client's decoder, the choice between zstd and PNG, the client simulator and randomized display test, pacing, YUV conversion, the RFB client, RDP settings and keyboard mapping, jump host chains against in-process russh bastions (one and two hops, host key mismatch, failed login, unreachable hops and targets). Client logic: path tessellation, keysyms, key release pairing, wheel, PCM.
 - **Browser tests** (`tests/browser`, headless Chromium, `npm test`):
   - `renderer.test.mjs`: pixels of the WebGL2 renderer against what the HTML-canvas reference client produces, including zstd images at every index depth, through clips, transforms and composite modes, damaged images, and frames where zstd, PNG and JPEG images overlap.
   - `input.test.mjs`: keyboard and IME handling of the page-side client (Korean composition driven over CDP), in worker and main-thread mode.
@@ -593,6 +605,7 @@ Parameter names match guacd's SSH plugin.
   - `playback.test.mjs`: seeking and playing recordings; a frame decoded by the browser and in wasm must give the same pixels.
   - `video.test.mjs`: real H.264 and AV1 bitstreams made with ffmpeg, framed as molcajeted frames them, checked on the composited canvas, including the return to the default layer after `dispose`. Linux Chromium has no H.265 decoder; Windows Chrome 158 (headless, hardware decoding) decoded all three codecs.
 - **End to end.** VNC (x11vnc), SSH (OpenSSH) and RDP (xrdp and Windows 11) through the gateway, with stock guacd 1.6 and molcajeted, in worker and main-thread mode: display, key input with Shift combinations, Hangul, mouse, scrolling, selection and clipboard in both directions, resizing, error mapping (wrong password, closed port, host-key mismatch). On the stock guacd path Hangul on the SSH command line was garbled; molcajeted shows it correctly because of its `xterm-256color` default.
+- **Jump hosts** (`docker/jump/compose.yml`: targets on an internal network, OpenSSH bastions bridging to it). VNC, SSH and RDP through one and two hops, from the browser through the gateway and with a bare Guacamole client against molcajeted: the session works; a missing jump host password is asked for; a wrong pinned key, a wrong password and an unreachable second hop end the session with an error naming the hop.
 - **Audio.** A 440 Hz sine played in an xrdp session arrives as `audio/L16;rate=44100,channels=2` (about 177 KB/s, on par with stock guacd), and the samples the browser schedules are at 440.0 Hz in both client modes.
 - **Recordings.** Real VNC, SSH and RDP sessions through stock guacd 1.6 and molcajeted (the latter on the binary tunnel) were encoded with guacenc 1.6 without errors, and their last frames show the session's screen; a session recorded with `record-molcajete-formats` encodes too but is nearly black there.
 - **Settling.** After scrolling an xterm continuously and stopping, the client canvas was compared pixel by pixel with the X server's screen (`xwd`). The molcajeted path showed zero differences in every run. The stock guacd 1.6 path, with either client, sometimes left hundreds to thousands of stale pixels where a window had closed; that is guacd's behaviour.
@@ -760,7 +773,6 @@ Tracked as issues:
 - Sharing a running session through links, and administrators shadowing sessions (#48); joining with `select,$id` is refused by molcajeted today
 - Active sessions and connection history for administrators, ending sessions (#49)
 - An audit log of administrative changes and logins (#50)
-- SSH jump hosts (#51)
 - Encrypting stored connection credentials and never returning them from the API (#52)
 - File transfer: SFTP in SSH sessions and drive redirection in RDP (#53); the protocol's `file`/`pipe`/`filesystem` objects are not handled yet
 - Read-only and clipboard restrictions in the connection form (#54)

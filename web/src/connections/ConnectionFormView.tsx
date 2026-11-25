@@ -13,6 +13,7 @@ import ParameterInput from './ParameterInput';
 import AdvancedSettings from './AdvancedSettings';
 import {folderOptions} from './tree';
 import RecordingSettings from './RecordingSettings';
+import JumpHostSettings from './JumpHostSettings';
 
 const FORM_ID = 'connection-form';
 
@@ -118,6 +119,13 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
               />
             ))}
           </VStack>
+
+          <Divider />
+
+          <JumpHostSettings
+            fields={form.fields}
+            onChange={(name, value) => update({fields: {...form.fields, [name]: value}})}
+          />
 
           <Divider />
 

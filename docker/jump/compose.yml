@@ -1,0 +1,55 @@
+# Targets that only SSH jump hosts can reach.
+#   docker compose -f docker/jump/compose.yml up -d --build
+#
+# The VNC, SSH and RDP targets sit on an internal network with no route out
+# and no published ports. bastion1 bridges to it and is the only service
+# published (127.0.0.1:2231); bastion2 is on the internal network only and
+# is reached through bastion1 to test two hops.
+#
+#   jump-hosts: jump@127.0.0.1:2231                  (password: jump)
+#   jump-hosts: jump@127.0.0.1:2231, jump@bastion2   (two hops)
+#   targets:    vnc:5900 (password secret), ssh:2222 (guac / guac),
+#               rdp:3389 (ubuntu / ubuntu)
+#
+# The bastions' host keys, to pin in jump-host-host-key:
+#   docker compose -f docker/jump/compose.yml exec bastion1 cat /etc/ssh/ssh_host_ed25519_key.pub
+name: molcajete-jump
+
+services:
+  bastion1:
+    build: ./bastion
+    networks: [edge, internal]
+    ports:
+      - "127.0.0.1:2231:22"
+
+  bastion2:
+    build: ./bastion
+    networks: [internal]
+
+  vnc:
+    build: ../vnc
+    environment:
+      VNC_PASSWORD: secret
+    networks: [internal]
+
+  ssh:
+    image: linuxserver/openssh-server:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      PASSWORD_ACCESS: "true"
+      USER_NAME: guac
+      USER_PASSWORD: guac
+    networks: [internal]
+
+  # xrdp + XFCE desktop; log in as ubuntu / ubuntu.
+  rdp:
+    image: scottyhardy/docker-remote-desktop:latest
+    hostname: rdp
+    shm_size: "1gb"
+    networks: [internal]
+
+networks:
+  edge: {}
+  internal:
+    internal: true

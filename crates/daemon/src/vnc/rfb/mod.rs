@@ -26,8 +26,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::io::BufReader;
-use tokio::net::TcpStream;
 
+use crate::jump::Upstream;
 use crate::remote::{self, CountingStream};
 
 pub use reader::RfbReader;
@@ -85,6 +85,7 @@ pub mod encoding {
 /// Parameters for [`connect`].
 #[derive(Clone)]
 pub struct ConnectOptions {
+    /// The server, for logs; [`connect`] takes the connection to it.
     pub host: String,
     pub port: u16,
     /// Password for VNC authentication (security type 2).
@@ -255,16 +256,16 @@ pub enum RfbError {
     UnsupportedSecurity,
 }
 
-/// Connects to a VNC server and performs the RFB handshake: version negotiation,
-/// authentication, ClientInit/ServerInit, SetPixelFormat and SetEncodings.
+/// Performs the RFB handshake with a VNC server over `stream` (the connection to
+/// `options.host` and `options.port`): version negotiation, authentication,
+/// ClientInit/ServerInit, SetPixelFormat and SetEncodings.
 ///
 /// No FramebufferUpdateRequest is sent; call [`RfbWriter::request_update`] to start receiving
 /// framebuffer content.
 pub async fn connect(
+    stream: Upstream,
     options: &ConnectOptions,
 ) -> Result<(RfbReader, RfbWriter, ServerInfo), RfbError> {
-    let stream = TcpStream::connect((options.host.as_str(), options.port)).await?;
-    stream.set_nodelay(true)?;
     let (read_half, mut write_half) = stream.into_split();
     let read_half = CountingStream::new(read_half, remote::received_bytes("vnc"));
     let mut input = BufReader::with_capacity(READ_BUFFER_SIZE, read_half);

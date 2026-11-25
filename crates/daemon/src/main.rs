@@ -11,6 +11,7 @@
 mod display;
 mod handshake;
 mod io;
+mod jump;
 mod rdp;
 mod remote;
 mod session;
@@ -146,7 +147,9 @@ async fn handle(stream: TcpStream, peer: SocketAddr) {
     // Everything logged for this connection carries its id, which the
     // gateway logs as `guacd_id`.
     let span = info_span!("connection", id = %connection_id, protocol, %peer);
-    session(reader, writer, protocol, args, connection_id)
+    // Every protocol can go through SSH jump hosts.
+    let args: Vec<&str> = args.iter().chain(jump::ARGS).copied().collect();
+    session(reader, writer, protocol, &args, connection_id)
         .instrument(span)
         .await;
 }
