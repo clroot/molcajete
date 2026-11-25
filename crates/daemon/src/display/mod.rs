@@ -255,6 +255,8 @@ pub struct Display {
     clock: FrameClock,
     /// Encoded image bytes of the frame being built.
     frame_bytes: usize,
+    /// Images of the frame being built.
+    frame_images: u32,
     /// Last cursor sent (hotspot, size, pixels), to drop redundant updates.
     last_cursor: Option<(u32, u32, u32, u32, Vec<u8>)>,
     /// Video encoding, when the client and the server both support it.
@@ -629,6 +631,7 @@ impl Display {
             last_sync: None,
             clock: FrameClock::new(Pacing::TERMINAL),
             frame_bytes: 0,
+            frame_images: 0,
             last_cursor: None,
             video_support: None,
             video: None,
@@ -921,6 +924,7 @@ impl Display {
         stats.add(self.refine_lossy(out));
         phase_done(&mut self.metrics, Phase::Refine);
         self.frame_bytes += stats.bytes;
+        self.frame_images += stats.images;
         self.metrics.flushed(started.elapsed());
         stats
     }
@@ -1849,8 +1853,9 @@ impl Display {
         let now = Instant::now();
         self.last_sync = Some(ts);
         let bytes = std::mem::take(&mut self.frame_bytes);
+        let images = std::mem::take(&mut self.frame_images);
         self.clock.frame_sent(ts, now, bytes);
-        self.metrics.frame(bytes, self.clock.unacked());
+        self.metrics.frame(bytes, images, self.clock.unacked());
         // Asks a molcajete client how long it takes to apply the frame;
         // stock clients ignore the extra argument.
         *out += &apply_time::sync_request(ts, 1);
