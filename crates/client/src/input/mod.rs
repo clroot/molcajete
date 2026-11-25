@@ -7,31 +7,128 @@ use std::collections::HashMap;
 
 use molcajete_protocol::MouseButtons;
 
+/// Who composes text typed with an input method (Hangul, …).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Composition {
+    /// The browser's IME composes; finished text is typed as Unicode keysyms.
+    #[default]
+    Local,
+    /// Keys are sent by their physical position (US layout) as they are
+    /// pressed and the remote host's IME composes, as native RDP and VNC
+    /// clients do.
+    Remote {
+        /// Caps Lock switches the remote input mode (Hangul/English) instead
+        /// of locking capitals: the key macOS uses to switch input sources.
+        caps_lock_toggles: bool,
+    },
+}
+
 /// Tracks pressed keys by physical key (`KeyboardEvent.code`) so that each
 /// release reports the same keysym as its press, even if modifiers changed
 /// in between (press Shift, press "a" → "A", release Shift, release "a").
 #[derive(Default)]
 pub struct Keyboard {
     pressed: HashMap<String, u32>,
+    composition: Composition,
+    /// Whether capitals are locked, as last reported by the browser.
+    caps_locked: bool,
+    /// A Caps Lock `keydown` was taken as a toggle; its `keyup` is not one.
+    caps_toggle_down: bool,
 }
 
 /// A key press (`true`) or release (`false`).
 pub type KeyEvent = (u32, bool);
 
+fn tap(keysym: u32) -> Vec<KeyEvent> {
+    vec![(keysym, true), (keysym, false)]
+}
+
 impl Keyboard {
+    pub fn set_composition(&mut self, composition: Composition) {
+        self.composition = composition;
+        self.caps_toggle_down = false;
+    }
+
+    pub fn composition(&self) -> Composition {
+        self.composition
+    }
+
+    fn caps_lock_toggles(&self) -> bool {
+        matches!(
+            self.composition,
+            Composition::Remote {
+                caps_lock_toggles: true
+            }
+        )
+    }
+
+    fn shift_held(&self) -> bool {
+        self.pressed
+            .values()
+            .any(|&k| k == keysym::SHIFT_L || k == keysym::SHIFT_R)
+    }
+
+    /// Caps Lock while it toggles the remote input mode. A press that
+    /// changes the lock state (a long press on macOS) is still Caps Lock;
+    /// any other press is the toggle. Browsers on macOS report only
+    /// `keydown` or only `keyup` for some presses, so either counts once.
+    fn caps_lock_event(&mut self, down: bool, locked: bool) -> Vec<KeyEvent> {
+        if locked != self.caps_locked {
+            self.caps_locked = locked;
+            self.caps_toggle_down = false;
+            return tap(keysym::CAPS_LOCK);
+        }
+        if down {
+            // Auto-repeat must not toggle again.
+            let first = !self.caps_toggle_down;
+            self.caps_toggle_down = true;
+            return if first {
+                tap(keysym::HANGUL)
+            } else {
+                Vec::new()
+            };
+        }
+        if std::mem::take(&mut self.caps_toggle_down) {
+            Vec::new()
+        } else {
+            tap(keysym::HANGUL)
+        }
+    }
+
+    /// The keysym to send for a key the local input method claimed, when the
+    /// remote host composes: the key's US-layout character.
+    fn physical_keysym(&self, key: &str, code: &str, composing: bool) -> Option<u32> {
+        if self.composition == Composition::Local {
+            return None;
+        }
+        if !(composing || key == "Process" || keysym::is_hangul_key(key)) {
+            return None;
+        }
+        keysym::us_layout_char(code, self.shift_held())
+            .map(|c| c as u32)
+            .or_else(|| keysym::editing_key_by_code(code))
+    }
+
     /// Handles `keydown`. Returns the events to send, or `None` when the
     /// event should be left to the browser (IME composition, dead keys).
+    /// `caps_lock` is the lock state the event reports.
     pub fn key_down(
         &mut self,
         key: &str,
         code: &str,
         location: u32,
         composing: bool,
+        caps_lock: bool,
     ) -> Option<Vec<KeyEvent>> {
-        if composing || key == "Process" || key == "Dead" {
-            return None;
+        if code == "CapsLock" && self.caps_lock_toggles() {
+            return Some(self.caps_lock_event(true, caps_lock));
         }
-        let keysym = keysym::keysym_for_event(key, code, location)?;
+        self.caps_locked = caps_lock;
+        let keysym = match self.physical_keysym(key, code, composing) {
+            Some(keysym) => keysym,
+            None if composing || key == "Process" || key == "Dead" => return None,
+            None => keysym::keysym_for_event(key, code, location)?,
+        };
         let id = if code.is_empty() { key } else { code };
         let mut events = Vec::with_capacity(2);
         if let Some(previous) = self.pressed.insert(id.to_owned(), keysym)
@@ -43,7 +140,16 @@ impl Keyboard {
         Some(events)
     }
 
-    pub fn key_up(&mut self, key: &str, code: &str, location: u32) -> Vec<KeyEvent> {
+    pub fn key_up(
+        &mut self,
+        key: &str,
+        code: &str,
+        location: u32,
+        caps_lock: bool,
+    ) -> Vec<KeyEvent> {
+        if code == "CapsLock" && self.caps_lock_toggles() {
+            return self.caps_lock_event(false, caps_lock);
+        }
         let id = if code.is_empty() { key } else { code };
         match self.pressed.remove(id) {
             Some(keysym) => vec![(keysym, false)],
@@ -59,6 +165,7 @@ impl Keyboard {
 
     /// Releases everything (on blur or disconnect).
     pub fn release_all(&mut self) -> Vec<KeyEvent> {
+        self.caps_toggle_down = false;
         self.pressed
             .drain()
             .map(|(_, keysym)| (keysym, false))
@@ -136,27 +243,117 @@ mod tests {
     fn release_uses_pressed_keysym() {
         let mut kb = Keyboard::default();
         assert_eq!(
-            kb.key_down("Shift", "ShiftLeft", 1, false),
+            kb.key_down("Shift", "ShiftLeft", 1, false, false),
             Some(vec![(keysym::SHIFT_L, true)])
         );
         assert_eq!(
-            kb.key_down("A", "KeyA", 0, false),
+            kb.key_down("A", "KeyA", 0, false, false),
             Some(vec![('A' as u32, true)])
         );
         assert_eq!(
-            kb.key_up("Shift", "ShiftLeft", 1),
+            kb.key_up("Shift", "ShiftLeft", 1, false),
             vec![(keysym::SHIFT_L, false)]
         );
         // Shift is up now, but the release must still be "A".
-        assert_eq!(kb.key_up("a", "KeyA", 0), vec![('A' as u32, false)]);
+        assert_eq!(kb.key_up("a", "KeyA", 0, false), vec![('A' as u32, false)]);
         assert!(!kb.any_pressed());
     }
 
     #[test]
     fn composition_is_left_to_the_browser() {
         let mut kb = Keyboard::default();
-        assert_eq!(kb.key_down("Process", "KeyG", 0, true), None);
-        assert_eq!(kb.key_down("ㅎ", "KeyG", 0, true), None);
+        assert_eq!(kb.key_down("Process", "KeyG", 0, true, false), None);
+        assert_eq!(kb.key_down("ㅎ", "KeyG", 0, true, false), None);
+    }
+
+    fn remote(caps_lock_toggles: bool) -> Keyboard {
+        let mut kb = Keyboard::default();
+        kb.set_composition(Composition::Remote { caps_lock_toggles });
+        kb
+    }
+
+    #[test]
+    fn remote_composition_sends_physical_keys() {
+        let mut kb = remote(false);
+        // A composing IME reports "Process"; an inactive one the jamo.
+        assert_eq!(
+            kb.key_down("Process", "KeyG", 0, true, false),
+            Some(vec![('g' as u32, true)])
+        );
+        assert_eq!(
+            kb.key_up("Process", "KeyG", 0, false),
+            vec![('g' as u32, false)]
+        );
+        assert_eq!(
+            kb.key_down("ㅏ", "KeyK", 0, false, false),
+            Some(vec![('k' as u32, true)])
+        );
+        assert_eq!(kb.key_up("ㅏ", "KeyK", 0, false), vec![('k' as u32, false)]);
+        // Shift selects the double consonants on the remote side.
+        kb.key_down("Shift", "ShiftLeft", 1, false, false);
+        assert_eq!(
+            kb.key_down("ㅃ", "KeyQ", 0, false, false),
+            Some(vec![('Q' as u32, true)])
+        );
+        kb.key_up("ㅃ", "KeyQ", 0, false);
+        kb.key_up("Shift", "ShiftLeft", 1, false);
+        // Editing keys claimed by the IME are forwarded too.
+        assert_eq!(
+            kb.key_down("Process", "Backspace", 0, true, false),
+            Some(vec![(0xFF08, true)])
+        );
+        // Latin text and named keys are unchanged.
+        assert_eq!(
+            kb.key_down("é", "KeyE", 0, false, false),
+            Some(vec![(0xE9, true)])
+        );
+        assert_eq!(
+            kb.key_down("HangulMode", "Lang1", 0, false, false),
+            Some(vec![(keysym::HANGUL, true)])
+        );
+        // Dead keys still compose locally.
+        assert_eq!(kb.key_down("Dead", "Quote", 0, false, false), None);
+    }
+
+    #[test]
+    fn caps_lock_toggles_the_remote_input_mode() {
+        let toggle = tap(keysym::HANGUL);
+        let caps = tap(keysym::CAPS_LOCK);
+
+        // Press and release both reported: one toggle.
+        let mut kb = remote(true);
+        assert_eq!(
+            kb.key_down("CapsLock", "CapsLock", 0, false, false),
+            Some(toggle.clone())
+        );
+        assert_eq!(
+            kb.key_down("CapsLock", "CapsLock", 0, false, false),
+            Some(vec![])
+        );
+        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false), vec![]);
+        // Only the release reported.
+        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false), toggle);
+        // A press that locks capitals is Caps Lock, and so is its unlock.
+        assert_eq!(
+            kb.key_down("CapsLock", "CapsLock", 0, false, true),
+            Some(caps.clone())
+        );
+        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false), caps);
+        assert!(!kb.any_pressed());
+
+        // Capitals already locked when the session started.
+        let mut kb = remote(true);
+        kb.key_down("A", "KeyA", 0, false, true);
+        kb.key_up("A", "KeyA", 0, true);
+        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false), caps);
+
+        // Without the option, and when composing locally, it stays Caps Lock.
+        for mut kb in [remote(false), Keyboard::default()] {
+            assert_eq!(
+                kb.key_down("CapsLock", "CapsLock", 0, false, true),
+                Some(vec![(keysym::CAPS_LOCK, true)])
+            );
+        }
     }
 
     #[test]

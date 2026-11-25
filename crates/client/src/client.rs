@@ -25,7 +25,7 @@ use crate::audio::{RawAudioPlayer, RawFormat};
 use crate::display::{DisplayEvent, DrawOp, ImageSlot, ImageState, Op};
 use crate::geom::Rect;
 use crate::gl::CanvasTarget;
-use crate::input::{self, Keyboard, WheelAccumulator};
+use crate::input::{self, Composition, Keyboard, WheelAccumulator};
 use crate::scope;
 use crate::tunnel::{Tunnel, TunnelHandlers};
 use crate::{display::Display, gl::Renderer};
@@ -1240,9 +1240,19 @@ impl Inner {
 
     /// `keydown`; returns whether the event was consumed (and should have
     /// its default action prevented).
-    pub fn key_down(&mut self, key: &str, code: &str, location: u32, composing: bool) -> bool {
+    pub fn key_down(
+        &mut self,
+        key: &str,
+        code: &str,
+        location: u32,
+        composing: bool,
+        caps_lock: bool,
+    ) -> bool {
         self.resume_audio();
-        match self.keyboard.key_down(key, code, location, composing) {
+        match self
+            .keyboard
+            .key_down(key, code, location, composing, caps_lock)
+        {
             Some(events) => {
                 for (keysym, pressed) in events {
                     self.send_key(keysym, pressed);
@@ -1253,9 +1263,11 @@ impl Inner {
         }
     }
 
-    pub fn key_up(&mut self, key: &str, code: &str, location: u32) -> bool {
-        let events = self.keyboard.key_up(key, code, location);
-        let consumed = !events.is_empty();
+    pub fn key_up(&mut self, key: &str, code: &str, location: u32, caps_lock: bool) -> bool {
+        let events = self.keyboard.key_up(key, code, location, caps_lock);
+        // In remote composition every key belongs to the remote host, even
+        // one that sends nothing (the release of a Caps Lock toggle).
+        let consumed = !events.is_empty() || self.composes_remotely();
         for (keysym, pressed) in events {
             self.send_key(keysym, pressed);
         }
@@ -1268,21 +1280,52 @@ impl Inner {
             &event.code(),
             event.location(),
             event.is_composing(),
+            event.get_modifier_state("CapsLock"),
         ) {
             event.prevent_default();
         }
     }
 
     fn on_key_up(&mut self, event: KeyboardEvent) {
-        if self.key_up(&event.key(), &event.code(), event.location()) {
+        if self.key_up(
+            &event.key(),
+            &event.code(),
+            event.location(),
+            event.get_modifier_state("CapsLock"),
+        ) {
             event.prevent_default();
+        }
+    }
+
+    fn composes_remotely(&self) -> bool {
+        self.keyboard.composition() != Composition::Local
+    }
+
+    /// Chooses who composes text typed with an input method. With `remote`,
+    /// keys are sent by physical position and the remote host's IME composes;
+    /// `caps_lock_toggles` makes Caps Lock the Hangul/English key.
+    pub fn set_remote_composition(&mut self, remote: bool, caps_lock_toggles: bool) {
+        self.release_keys();
+        self.keyboard.set_composition(if remote {
+            Composition::Remote { caps_lock_toggles }
+        } else {
+            Composition::Local
+        });
+        if let Some(dom) = &self.dom {
+            // Browsers do not start an input method on a read-only field,
+            // but it still takes focus and key events.
+            dom.sink.set_read_only(remote);
+            dom.sink.set_value("");
         }
     }
 
     /// Types text (e.g. a finished IME composition) on the remote side.
     pub fn type_text(&mut self, text: &str) {
-        for (keysym, pressed) in input::type_text(text) {
-            self.send_key(keysym, pressed);
+        // The keys that made up this text were already sent one by one.
+        if !self.composes_remotely() {
+            for (keysym, pressed) in input::type_text(text) {
+                self.send_key(keysym, pressed);
+            }
         }
         if let Some(dom) = &self.dom {
             dom.sink.set_value("");

@@ -107,6 +107,10 @@ pub enum ResizeMethod {
 pub enum KeyboardLayout {
     /// US English: printable ASCII characters are sent as scancodes.
     EnUsQwerty,
+    /// Korean: the same key positions as US English, with the session's
+    /// input language set to Korean so that the remote IME composes Hangul
+    /// from the keys and the Hangul and Hanja keys work.
+    KoKrQwerty,
     /// Every printable character is sent as a Unicode event.
     Failsafe,
 }
@@ -114,9 +118,12 @@ pub enum KeyboardLayout {
 impl KeyboardLayout {
     /// Windows keyboard layout identifier advertised to the server.
     pub fn layout_id(self) -> u32 {
-        // Both use the US layout on the server side; "failsafe" only changes
-        // how characters are sent.
-        0x0000_0409
+        match self {
+            Self::KoKrQwerty => 0x0000_0412,
+            // "failsafe" uses the US layout on the server side and only
+            // changes how characters are sent.
+            Self::EnUsQwerty | Self::Failsafe => 0x0000_0409,
+        }
     }
 }
 
@@ -215,6 +222,7 @@ impl Settings {
         };
         let layout = match params.value("server-layout") {
             Some("failsafe") => KeyboardLayout::Failsafe,
+            Some("ko-kr-qwerty") => KeyboardLayout::KoKrQwerty,
             _ => KeyboardLayout::EnUsQwerty,
         };
         let line_endings = match params.value("normalize-clipboard") {
@@ -338,6 +346,18 @@ mod tests {
             dpi: 96,
             ..ClientInfo::default()
         }
+    }
+
+    #[test]
+    fn korean_layout_sets_the_session_input_language() {
+        let s = Settings::parse(
+            &params(&[("hostname", "win"), ("server-layout", "ko-kr-qwerty")]),
+            &info(),
+        )
+        .unwrap();
+        assert_eq!(s.layout, KeyboardLayout::KoKrQwerty);
+        assert_eq!(s.layout.layout_id(), 0x412);
+        assert_eq!(KeyboardLayout::Failsafe.layout_id(), 0x409);
     }
 
     #[test]

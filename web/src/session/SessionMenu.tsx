@@ -10,6 +10,9 @@ import {Text} from '@astryxdesign/core/Text';
 
 export type ScaleMode = 'fit' | 'native';
 
+// macOS has no 한/영 key and switches input sources with Caps Lock.
+const toggleKey = /mac/i.test(navigator.platform) ? 'Caps Lock' : 'the 한/영 key or right Alt';
+
 type Props = {
   isOpen: boolean;
   onOpenChange: (isOpen: boolean) => void;
@@ -20,6 +23,9 @@ type Props = {
   onScaleModeChange: (mode: ScaleMode) => void;
   showStats: boolean;
   onShowStatsChange: (show: boolean) => void;
+  /** `null` when the connection has no remote input method to compose with. */
+  remoteComposition: boolean | null;
+  onRemoteCompositionChange: (isRemote: boolean) => void;
   onCtrlAltDel: () => void;
   onDisconnect: () => void;
 };
@@ -62,6 +68,14 @@ export default function SessionMenu(props: Props) {
                   {value: 'native', label: 'Native (1:1)'},
                 ]}
               />
+              {props.remoteComposition !== null && (
+                <Switch
+                  label="Compose Korean on the remote computer"
+                  description={`Each key shows up as you press it, and the remote computer turns the keys into Hangul. Switch between Hangul and English with ${toggleKey}.`}
+                  value={props.remoteComposition}
+                  onChange={props.onRemoteCompositionChange}
+                />
+              )}
               <Switch
                 label="Show performance stats"
                 value={props.showStats}

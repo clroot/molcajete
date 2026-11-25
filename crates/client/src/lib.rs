@@ -82,17 +82,33 @@ mod wasm_api {
         }
 
         /// `keydown`; returns whether the default action should be prevented.
-        pub fn key_down(&self, key: &str, code: &str, location: u32, composing: bool) -> bool {
+        /// `caps_lock` is `getModifierState("CapsLock")` of the event.
+        pub fn key_down(
+            &self,
+            key: &str,
+            code: &str,
+            location: u32,
+            composing: bool,
+            caps_lock: bool,
+        ) -> bool {
             let mut consumed = false;
-            self.run(|inner| consumed = inner.key_down(key, code, location, composing));
+            self.run(|inner| consumed = inner.key_down(key, code, location, composing, caps_lock));
             consumed
         }
 
         /// `keyup`; returns whether the default action should be prevented.
-        pub fn key_up(&self, key: &str, code: &str, location: u32) -> bool {
+        pub fn key_up(&self, key: &str, code: &str, location: u32, caps_lock: bool) -> bool {
             let mut consumed = false;
-            self.run(|inner| consumed = inner.key_up(key, code, location));
+            self.run(|inner| consumed = inner.key_up(key, code, location, caps_lock));
             consumed
+        }
+
+        /// Lets the remote host's IME compose text (Hangul, …): keys are
+        /// sent by physical position as they are pressed instead of sending
+        /// the text the local IME composed. With `caps_lock_toggles`, Caps
+        /// Lock is sent as the Hangul/English key.
+        pub fn set_remote_composition(&self, remote: bool, caps_lock_toggles: bool) {
+            self.run(|inner| inner.set_remote_composition(remote, caps_lock_toggles));
         }
 
         /// Forwards audio streams to the page as `audio-start`, `audio-data`
