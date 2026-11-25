@@ -224,6 +224,66 @@ fn changes_are_trimmed_to_the_changed_pixels() {
 }
 
 #[test]
+fn lines_of_text_over_the_same_columns_share_an_image() {
+    let (mut d, mut c, _) = setup(512, 256);
+    d.fill(0, 0, 512, 256, [255, 255, 255, 255]);
+    flush_into(&mut d, &mut c);
+    // Four lines, 20 rows of text and 8 rows of leading each.
+    let leading = 8;
+    assert!(leading > ROW_GAP_MERGE);
+    for line in 0..4u32 {
+        let text: Vec<u8> = (0..20)
+            .flat_map(|row| text_row(400, (line * 20 + row + 1) as u64))
+            .collect();
+        d.put(40, 20 + line * (20 + leading), 400, 20, &text);
+    }
+    let (stats, _) = flush_into(&mut d, &mut c);
+    assert_eq!(stats.images, 1);
+    // The image is as tall as the lines and no wider than them.
+    assert!(stats.pixels <= 400 * (3 * 28 + 20));
+}
+
+#[test]
+fn changes_beside_unchanged_text_stay_apart() {
+    let (mut d, mut c, _) = setup(512, 256);
+    let page: Vec<u8> = (0..256).flat_map(|row| text_row(512, row + 1)).collect();
+    d.put(0, 0, 512, 256, &page);
+    flush_into(&mut d, &mut c);
+    // Two neighbouring lines change at different columns: one image for
+    // both would resend the unchanged text between them.
+    for (x, y) in [(0, 20), (300, 48)] {
+        let text: Vec<u8> = (0..20)
+            .flat_map(|row| text_row(100, 1000 + (y + row) as u64))
+            .collect();
+        d.put(x, y, 100, 20, &text);
+    }
+    let (stats, _) = flush_into(&mut d, &mut c);
+    assert_eq!(stats.images, 2);
+    assert!(stats.pixels <= 2 * 100 * 20);
+}
+
+#[test]
+fn joined_images_stay_below_the_size_limit() {
+    let (mut d, mut c, _) = setup(2048, 1024);
+    d.fill(0, 0, 2048, 1024, [255, 255, 255, 255]);
+    flush_into(&mut d, &mut c);
+    // A page of text twice the size of the largest joined image.
+    for line in 0..36u32 {
+        let text: Vec<u8> = (0..20)
+            .flat_map(|row| text_row(2048, (line * 20 + row + 1) as u64))
+            .collect();
+        d.put(0, line * 28, 2048, 20, &text);
+    }
+    let rects = d.changed_rects(&Rect::new(0, 0, 2048, 1024));
+    assert!(
+        rects.len() > 1 && rects.len() < 36,
+        "{} images",
+        rects.len()
+    );
+    assert!(rects.iter().all(|r| r.area() <= MAX_JOINED_PIXELS));
+}
+
+#[test]
 fn scrolling_becomes_a_copy() {
     let (w, h) = (320u32, 240u32);
     let (mut d, mut c, _) = setup(w, h);
