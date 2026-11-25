@@ -249,6 +249,10 @@ pub(crate) mod tests {
 
     /// Every table, children first.
     const TABLES: &[&str] = &[
+        "molcajete_recording",
+        "molcajete_connection_attribute",
+        "molcajete_oidc_login",
+        "molcajete_user_identity",
         "molcajete_session",
         "molcajete_connection_permission",
         "molcajete_connection_group_permission",
