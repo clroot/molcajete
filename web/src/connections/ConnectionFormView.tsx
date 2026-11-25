@@ -7,7 +7,7 @@ import {Divider} from '@astryxdesign/core/Divider';
 import {Heading} from '@astryxdesign/core/Heading';
 import {api, errorMessage, type Connection, type Folder} from '../api';
 import {FormActions, FormDrawerLayout} from '../shell/FormDrawer';
-import {PROTOCOLS, protocolInfo} from './protocols';
+import {PROTOCOLS, protocolInfo, type ParameterField} from './protocols';
 import {
   changeProtocol,
   clearSecret,
@@ -52,6 +52,15 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
       onKeep: () => setForm(f => keepSecret(f, name)),
     };
   };
+  const parameterInput = (field: ParameterField) => (
+    <ParameterInput
+      key={`${form.protocol}:${field.name}`}
+      field={field}
+      value={form.fields[field.name] ?? ''}
+      onChange={value => update({fields: {...form.fields, [field.name]: value}})}
+      secret={storedSecret(field.name)}
+    />
+  );
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -127,15 +136,14 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
 
           <VStack gap={4}>
             <Heading level={3}>{protocol.label} settings</Heading>
-            {protocol.fields.map(field => (
-              <ParameterInput
-                key={`${form.protocol}:${field.name}`}
-                field={field}
-                value={form.fields[field.name] ?? ''}
-                onChange={value => update({fields: {...form.fields, [field.name]: value}})}
-                secret={storedSecret(field.name)}
-              />
-            ))}
+            {protocol.fields.filter(field => !field.section).map(parameterInput)}
+          </VStack>
+
+          <Divider />
+
+          <VStack gap={4}>
+            <Heading level={3}>Clipboard and input</Heading>
+            {protocol.fields.filter(field => field.section === 'input').map(parameterInput)}
           </VStack>
 
           <Divider />

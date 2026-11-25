@@ -19,6 +19,7 @@ const styles = stylex.create({
     transform: 'translateX(-50%)',
     pointerEvents: 'none',
   },
+  topRight: {position: 'fixed', top: 8, right: 8, pointerEvents: 'none'},
   bottomLeft: {
     position: 'fixed',
     bottom: 8,
@@ -63,6 +64,18 @@ export function AudioHint() {
       <HStack gap={2} vAlign="center">
         <Icon icon={SpeakerXMarkIcon} color="secondary" size="sm" />
         <Text>Click or press a key to turn on sound</Text>
+      </HStack>
+    </Card>
+  );
+}
+
+/** Says that keys, clicks and touches do not reach the remote side. */
+export function ReadOnlyBadge() {
+  return (
+    <Card padding={2} elevation="med" xstyle={styles.topRight}>
+      <HStack gap={2} vAlign="center">
+        <StatusDot variant="neutral" label="Read-only" />
+        <Text>Read-only</Text>
       </HStack>
     </Card>
   );

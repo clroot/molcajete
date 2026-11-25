@@ -72,6 +72,10 @@ export type ConnectionSummary = {
   /** The `dpi` and `resize-method` parameters, for the session menu. */
   dpi: string | null;
   resizeMethod: string | null;
+  /** The `read-only`, `disable-copy` and `disable-paste` parameters; older gateways leave them out. */
+  readOnly?: boolean;
+  disableCopy?: boolean;
+  disablePaste?: boolean;
 };
 
 export type Connection = {

@@ -11,6 +11,7 @@ import {Heading} from '@astryxdesign/core/Heading';
 import {AUTOMATIC_SCALE_LABEL, scaleOptionsWith} from './displayScale';
 import type {RemoteScale} from './displaySettings';
 import {terminalKeys} from './terminal';
+import type {Restrictions} from './useConnection';
 
 export type ScaleMode = 'fit' | 'native';
 
@@ -33,6 +34,8 @@ type Props = {
   connectionName: string;
   /** Terminals copy and paste with shortcuts, shown under the clipboard. */
   isTerminal: boolean;
+  /** What the connection turns off. */
+  restrictions: Restrictions;
   clipboard: string;
   onClipboardChange: (text: string) => void;
   scaleMode: ScaleMode;
@@ -49,6 +52,61 @@ type Props = {
   onCtrlAltDel: () => void;
   onDisconnect: () => void;
 };
+
+const CLIPBOARD_HELP = {
+  both: 'Text here is sent to the remote clipboard; copies on the remote side show up here.',
+  copyOnly: 'Copies on the remote side show up here. Pasting into the remote side is turned off.',
+  pasteOnly: 'Text here is sent to the remote clipboard. Copying from the remote side is turned off.',
+};
+
+/**
+ * The clipboard text and, in terminals, the copy and paste shortcuts, as far
+ * as the connection allows them.
+ */
+function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Props) {
+  const canCopy = !restrictions.disableCopy;
+  const canPaste = !restrictions.disablePaste;
+  if (!canCopy && !canPaste) {
+    return <Text color="secondary">Copying and pasting are turned off for this connection.</Text>;
+  }
+  // Read-only terminals take no keys, pasted text included.
+  const canPasteKeys = canPaste && !restrictions.readOnly;
+  return (
+    <>
+      <TextArea
+        label="Clipboard"
+        description={
+          canCopy && canPaste
+            ? CLIPBOARD_HELP.both
+            : canCopy
+              ? CLIPBOARD_HELP.copyOnly
+              : CLIPBOARD_HELP.pasteOnly
+        }
+        value={clipboard}
+        onChange={onClipboardChange}
+        isReadOnly={!canPaste}
+        rows={5}
+        hasSpellCheck={false}
+      />
+      {isTerminal && (canCopy || canPasteKeys) && (
+        <VStack gap={2}>
+          {canCopy && (
+            <HStack gap={2} vAlign="center">
+              <Kbd keys={terminalKeys.copy} />
+              <Text color="secondary">copies the selected text</Text>
+            </HStack>
+          )}
+          {canPasteKeys && (
+            <HStack gap={2} vAlign="center">
+              <Kbd keys={terminalKeys.paste} />
+              <Text color="secondary">pastes from this computer</Text>
+            </HStack>
+          )}
+        </VStack>
+      )}
+    </>
+  );
+}
 
 /** The Ctrl+Alt+Shift menu: clipboard, display, input, stats and keys. */
 export default function SessionMenu(props: Props) {
@@ -74,26 +132,7 @@ export default function SessionMenu(props: Props) {
         content={
           <LayoutContent>
             <VStack gap={5}>
-              <TextArea
-                label="Clipboard"
-                description="Text here is sent to the remote clipboard; copies on the remote side show up here."
-                value={props.clipboard}
-                onChange={props.onClipboardChange}
-                rows={5}
-                hasSpellCheck={false}
-              />
-              {props.isTerminal && (
-                <VStack gap={2}>
-                  <HStack gap={2} vAlign="center">
-                    <Kbd keys={terminalKeys.copy} />
-                    <Text color="secondary">copies the selected text</Text>
-                  </HStack>
-                  <HStack gap={2} vAlign="center">
-                    <Kbd keys={terminalKeys.paste} />
-                    <Text color="secondary">pastes from this computer</Text>
-                  </HStack>
-                </VStack>
-              )}
+              <Clipboard {...props} />
               <VStack gap={4}>
                 <Heading level={3}>Display</Heading>
                 {remoteDisplay && (
@@ -152,7 +191,12 @@ export default function SessionMenu(props: Props) {
         footer={
           <LayoutFooter>
             <HStack gap={2} hAlign="between">
-              <Button label="Ctrl+Alt+Del" variant="secondary" onClick={props.onCtrlAltDel} />
+              <Button
+                label="Ctrl+Alt+Del"
+                variant="secondary"
+                onClick={props.onCtrlAltDel}
+                isDisabled={props.restrictions.readOnly}
+              />
               <Button label="Disconnect" variant="destructive" onClick={props.onDisconnect} />
             </HStack>
           </LayoutFooter>
