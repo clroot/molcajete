@@ -1,0 +1,75 @@
+# Fuzz targets for the parsers that read untrusted input (`cargo fuzz`,
+# nightly only). Not a member of the main workspace, so stable builds never
+# see it; see docs/architecture.md, section 7.1.
+[package]
+name = "molcajete-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+molcajete-daemon = { path = "../crates/daemon" }
+molcajete-protocol = { path = "../crates/protocol" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "records"
+path = "fuzz_targets/records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zimage"
+path = "fuzz_targets/zimage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "video_frames"
+path = "fuzz_targets/video_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfb"
+path = "fuzz_targets/rfb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal"
+path = "fuzz_targets/terminal.rs"
+test = false
+doc = false
+bench = false
+
+[dev-dependencies]
+# Only for writing the seed corpora (examples/seeds.rs).
+flate2 = "1"
+zstd = "0.13"

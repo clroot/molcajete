@@ -1,0 +1,3 @@
+(]0;user@host: ~[?2004huser@host:~$ ls --color
+[0m[01;34mdir[0m  [01;32mrun.sh[0m  file.txt
+user@host:~$ [?2004l

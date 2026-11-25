@@ -7,6 +7,8 @@ members = [
     "crates/daemon",
     "crates/telemetry",
 ]
+# Fuzz targets: built with nightly `cargo fuzz` only.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
