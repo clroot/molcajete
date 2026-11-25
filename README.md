@@ -96,7 +96,8 @@ echo 'new-password' | molcajete-gateway --config gateway.toml set-password admin
 The web UI (`web/`) is React with the [Astryx](https://astryx.atmeta.com)
 design system. For UI work, run `SKIP_UI=1 scripts/build-web.sh` once and
 `bun run dev` in `web/`; it proxies the API and the tunnel to a gateway on
-127.0.0.1:8080.
+127.0.0.1:8080. `bun run check` in `web/` runs the type check, ESLint,
+Prettier and the unit tests (`bun run format` fixes formatting).
 
 To use the Rust daemon instead of the stock guacd for a connection, run
 `cargo run -p molcajete-daemon -- -l 4823` and point the connection at it:

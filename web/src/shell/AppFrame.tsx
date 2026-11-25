@@ -9,10 +9,10 @@ import {
   ArrowRightStartOnRectangleIcon,
   UserCircleIcon,
 } from '@heroicons/react/24/outline';
-import type {User} from './api';
-import {href, type Route} from './route';
+import type {User} from '../api';
+import {href, type Route} from '../route';
 import Logo from './Logo';
-import ChangePasswordDialog from './pages/ChangePasswordDialog';
+import ChangePasswordDialog from '../auth/ChangePasswordDialog';
 
 type Props = {
   user: User;
@@ -32,11 +32,7 @@ export default function AppFrame({user, route, onSignOut, children}: Props) {
           collapsible
           resizable={{defaultWidth: 260, minWidth: 220, maxWidth: 360, autoSaveId: 'molcajete-sidenav'}}
           header={
-            <SideNavHeading
-              heading="molcajete"
-              icon={<Logo size={24} />}
-              headingHref={href.connections}
-            />
+            <SideNavHeading heading="molcajete" icon={<Logo size={24} />} headingHref={href.connections} />
           }
           footer={
             <SideNavSection title="Account" isHeaderHidden>

@@ -80,26 +80,21 @@ const id = (value: string) => encodeURIComponent(value);
 
 export const api = {
   me: () => request<User>('GET', 'auth/me'),
-  login: (username: string, password: string) =>
-    request<User>('POST', 'auth/login', {username, password}),
+  login: (username: string, password: string) => request<User>('POST', 'auth/login', {username, password}),
   logout: () => request<void>('POST', 'auth/logout'),
   changePassword: (currentPassword: string, newPassword: string) =>
     request<void>('PUT', 'auth/password', {currentPassword, newPassword}),
 
   connections: () => request<ConnectionSummary[]>('GET', 'connections'),
-  connection: (connectionId: string) =>
-    request<Connection>('GET', `connections/${id(connectionId)}`),
+  connection: (connectionId: string) => request<Connection>('GET', `connections/${id(connectionId)}`),
   createConnection: (c: Connection) => request<Connection>('POST', 'connections', c),
-  updateConnection: (c: Connection) =>
-    request<Connection>('PUT', `connections/${id(c.id)}`, c),
-  deleteConnection: (connectionId: string) =>
-    request<void>('DELETE', `connections/${id(connectionId)}`),
+  updateConnection: (c: Connection) => request<Connection>('PUT', `connections/${id(c.id)}`, c),
+  deleteConnection: (connectionId: string) => request<void>('DELETE', `connections/${id(connectionId)}`),
 
   users: () => request<User[]>('GET', 'users'),
   user: (userId: string) => request<UserDetail>('GET', `users/${id(userId)}`),
   createUser: (input: UserInput) => request<UserDetail>('POST', 'users', input),
-  updateUser: (userId: string, input: UserInput) =>
-    request<UserDetail>('PUT', `users/${id(userId)}`, input),
+  updateUser: (userId: string, input: UserInput) => request<UserDetail>('PUT', `users/${id(userId)}`, input),
   deleteUser: (userId: string) => request<void>('DELETE', `users/${id(userId)}`),
 };
 

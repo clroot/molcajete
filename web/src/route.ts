@@ -2,10 +2,7 @@ import {useEffect, useState} from 'react';
 
 // Hash routes, as in the original client: the gateway serves one page and
 // the fragment never reaches the server.
-export type Route =
-  | {name: 'connections'}
-  | {name: 'users'}
-  | {name: 'session'; connectionId: string};
+export type Route = {name: 'connections'} | {name: 'users'} | {name: 'session'; connectionId: string};
 
 export function parseRoute(hash: string): Route {
   const session = hash.match(/^#\/connect\/(.+)$/);

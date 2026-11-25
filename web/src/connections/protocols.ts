@@ -9,18 +9,30 @@ export type ParameterField = {
   kind: FieldKind;
   description?: string;
   placeholder?: string;
+  isRequired?: boolean;
   options?: {value: string; label: string}[];
 };
 
 export type Protocol = {
   value: string;
   label: string;
-  defaultPort: string;
   fields: ParameterField[];
 };
 
-const hostname: ParameterField = {name: 'hostname', label: 'Hostname', kind: 'text', placeholder: '192.168.0.10'};
-const port: ParameterField = {name: 'port', label: 'Port', kind: 'number'};
+const hostname: ParameterField = {
+  name: 'hostname',
+  label: 'Hostname',
+  kind: 'text',
+  placeholder: '192.168.0.10',
+  isRequired: true,
+};
+/** guacd uses the protocol's standard port when none is given. */
+const port = (defaultPort: number): ParameterField => ({
+  name: 'port',
+  label: 'Port',
+  kind: 'number',
+  placeholder: String(defaultPort),
+});
 const username: ParameterField = {name: 'username', label: 'Username', kind: 'text'};
 const password: ParameterField = {name: 'password', label: 'Password', kind: 'password'};
 
@@ -28,16 +40,19 @@ export const PROTOCOLS: Protocol[] = [
   {
     value: 'vnc',
     label: 'VNC',
-    defaultPort: '5900',
-    fields: [hostname, port, {...username, description: 'Only for servers that ask for one.'}, password],
+    fields: [
+      hostname,
+      port(5900),
+      {...username, description: 'Only for servers that ask for one.'},
+      password,
+    ],
   },
   {
     value: 'rdp',
     label: 'RDP',
-    defaultPort: '3389',
     fields: [
       hostname,
-      port,
+      port(3389),
       username,
       password,
       {name: 'domain', label: 'Domain', kind: 'text'},
@@ -65,13 +80,17 @@ export const PROTOCOLS: Protocol[] = [
   {
     value: 'ssh',
     label: 'SSH',
-    defaultPort: '22',
     fields: [
       hostname,
-      port,
+      port(22),
       username,
       password,
-      {name: 'private-key', label: 'Private key', kind: 'multiline', placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----'},
+      {
+        name: 'private-key',
+        label: 'Private key',
+        kind: 'multiline',
+        placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----',
+      },
       {name: 'passphrase', label: 'Key passphrase', kind: 'password'},
       {name: 'font-size', label: 'Font size', kind: 'number'},
     ],
@@ -79,16 +98,14 @@ export const PROTOCOLS: Protocol[] = [
   {
     value: 'telnet',
     label: 'Telnet',
-    defaultPort: '23',
-    fields: [hostname, port, username, password, {name: 'font-size', label: 'Font size', kind: 'number'}],
+    fields: [hostname, port(23), username, password, {name: 'font-size', label: 'Font size', kind: 'number'}],
   },
   {
     value: 'kubernetes',
     label: 'Kubernetes',
-    defaultPort: '8080',
     fields: [
       hostname,
-      port,
+      port(8080),
       {name: 'namespace', label: 'Namespace', kind: 'text', placeholder: 'default'},
       {name: 'pod', label: 'Pod', kind: 'text'},
       {name: 'container', label: 'Container', kind: 'text'},

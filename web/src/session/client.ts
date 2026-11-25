@@ -16,7 +16,10 @@ export type SessionStats = {
 };
 
 export type SessionEvent =
-  | {type: 'state'; detail: 'idle' | 'connecting' | 'waiting' | 'connected' | 'disconnecting' | 'disconnected'}
+  | {
+      type: 'state';
+      detail: 'idle' | 'connecting' | 'waiting' | 'connected' | 'disconnecting' | 'disconnected';
+    }
   | {type: 'error'; detail: {message: string; name: string; code?: number}}
   | {type: 'name'; detail: string}
   | {type: 'clipboard'; detail: string}
@@ -50,10 +53,15 @@ type ReporterModule = {
   SessionReporter: new (
     connection: string,
     mode: string,
-  ) => {session: string; add(stats: SessionStats): void; stop(): void; flush(options?: {beacon?: boolean}): void};
+  ) => {
+    session: string;
+    add(stats: SessionStats): void;
+    stop(): void;
+    flush(options?: {beacon?: boolean}): void;
+  };
 };
 
-const load = <T,>(file: string) =>
+const load = <T>(file: string) =>
   import(/* @vite-ignore */ new URL(file, document.baseURI).href) as Promise<T>;
 
 export const loadClient = () => load<ClientModule>('molcajete.js');

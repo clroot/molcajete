@@ -8,7 +8,7 @@ import {Button} from '@astryxdesign/core/Button';
 import {Card} from '@astryxdesign/core/Card';
 import {Banner} from '@astryxdesign/core/Banner';
 import {api, errorMessage, type User} from '../api';
-import Logo from '../Logo';
+import Logo from '../shell/Logo';
 
 // Standalone auth page paints its own body background (no host shell).
 const pageStyle: CSSProperties = {

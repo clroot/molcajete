@@ -7,6 +7,7 @@ import {Button} from '@astryxdesign/core/Button';
 import {Banner} from '@astryxdesign/core/Banner';
 import {useToast} from '@astryxdesign/core/Toast';
 import {api, errorMessage} from '../api';
+import {MIN_PASSWORD_LENGTH, PASSWORD_RULE} from './password';
 
 type Props = {
   isOpen: boolean;
@@ -34,10 +35,11 @@ export default function ChangePasswordDialog({isOpen, onOpenChange, onChanged}: 
   };
 
   const mismatch = confirm !== '' && confirm !== next;
+  const canSubmit = current !== '' && next.length >= MIN_PASSWORD_LENGTH && confirm === next;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!current || !next || mismatch) return;
+    if (!canSubmit) return;
     setIsSaving(true);
     setError('');
     try {
@@ -77,7 +79,7 @@ export default function ChangePasswordDialog({isOpen, onOpenChange, onChanged}: 
                   value={next}
                   onChange={setNext}
                   autoComplete="new-password"
-                  description="At least 8 characters. You will be signed out everywhere."
+                  description={`${PASSWORD_RULE} You will be signed out everywhere.`}
                   isRequired
                 />
                 <TextInput
@@ -101,7 +103,7 @@ export default function ChangePasswordDialog({isOpen, onOpenChange, onChanged}: 
                   variant="primary"
                   type="submit"
                   isLoading={isSaving}
-                  isDisabled={!current || !next || mismatch}
+                  isDisabled={!canSubmit}
                 />
               </HStack>
             </LayoutFooter>
