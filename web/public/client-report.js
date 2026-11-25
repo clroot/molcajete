@@ -52,6 +52,8 @@ export class SessionReporter {
       session: this.session,
       connection: this.#connection,
       mode: this.#mode,
+      // Tells an iPad (its browsers claim to be desktop Safari) from a Mac.
+      touch: navigator.maxTouchPoints > 1,
       samples: this.#samples,
     });
     this.#samples = [];

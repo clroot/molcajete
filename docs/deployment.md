@@ -263,7 +263,16 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 
 ### Browser (gateway `--client-reports`)
 
-The page batches the client's once-per-second `stats` and posts them every 10 seconds. The only labels are the configured connection id and `mode` (`worker`/`main`), so cardinality stays bounded.
+The page batches the client's once-per-second `stats` and posts them every 10 seconds. Every metric has four labels with a handful of values each, so cardinality stays bounded:
+
+| Label | Values |
+| --- | --- |
+| `connection` | The configured connection id |
+| `mode` | `worker` or `main`: where the client runs |
+| `browser` | The browser engine, from the report's `User-Agent`: `chromium` (Chrome, Edge and other Chromium browsers), `firefox`, `safari` (Safari, and every browser on iOS and iPadOS), `other` |
+| `device` | `desktop`, `tablet` or `mobile`, from the `User-Agent`; an iPad, whose browsers claim to be desktop Safari, is told from a Mac by its touch screen |
+
+Engine and device are what decide how fast a page decodes and draws, and they stay the same for the whole session; the display size would split a session into several series whenever the window is resized. Two clients of the same kind still share their series: tell them apart in the logs, where each `client report` names its tunnel (below).
 
 | Metric | Meaning |
 | --- | --- |
@@ -284,9 +293,9 @@ Main events of the JSON logs. In Loki, extract the fields with `| json`.
 | message | Source | Main fields |
 | --- | --- | --- |
 | `tunnel established` / `tunnel closed` | gateway | `tunnel_id`, `connection`, `session`, `peer`, `guacd_id`, `handshake_ms`, `duration_s`, `bytes_to_browser`, `status` |
-| `client report` | gateway | `session`, `fps_avg`, `fps_min`, `frame_lag_ms_avg/max`, `frame_present_ms_avg/max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `display_width/height` |
+| `client report` | gateway | `session`, `tunnel_id`, `guacd_id`, `browser`, `device`, `fps_avg`, `fps_min`, `frame_lag_ms_avg/max`, `frame_present_ms_avg/max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `display_width/height` |
 | `connection established` / `connection closed` | molcajeted | `id`, `protocol`, `peer`, `width`, `height`, `image`, `video`, `duration_s` |
-| `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `frame_images_max`, `scroll_copies`, `move_copies`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*`, `video_*` |
+| `display summary` | molcajeted | `span.id` (the connection id, `span_id` after `\| json`), whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `frame_images_max`, `scroll_copies`, `move_copies`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*`, `video_*` |
 | `video mode started` | molcajeted | `codec`, area, `kbps` |
 
 Keys to follow one session end to end:
@@ -295,6 +304,13 @@ Keys to follow one session end to end:
 browser session (client report.session)
   = gateway tunnel.session  ->  gateway tunnel_id, guacd_id
   = molcajeted connection.id (= guacd_id)
+```
+
+A `client report` carries the `tunnel_id` and `guacd_id` of the tunnel its page opened (looked up by `session`; absent for a page that reported before the tunnel was established, or more than two minutes after it closed). Every molcajeted log line of a connection carries its id as `span.id`, so a client report and its session's `display summary` share `guacd_id` = `span_id`:
+
+```logql
+{namespace="molcajete", container="gateway"} | json | message="client report" | guacd_id="$abcd..."
+{namespace="molcajete", container="molcajeted"} | json | message="display summary" | span_id="$abcd..."
 ```
 
 ## Finding bottlenecks

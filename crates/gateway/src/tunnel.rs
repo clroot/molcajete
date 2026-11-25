@@ -239,6 +239,12 @@ async fn serve_tunnel(
         handshake_ms = handshake.as_millis() as u64,
         "tunnel established"
     );
+    let session_id = request.session.as_deref().filter(|_| state.client_reports);
+    if let Some(session_id) = session_id {
+        state
+            .tunnels
+            .opened(session_id, &connection.id, tunnel_id, &session.id);
+    }
     let active = gauge!("molcajete_gateway_tunnels_active", &labels);
     active.increment(1.0);
     let started = Instant::now();
@@ -253,6 +259,9 @@ async fn serve_tunnel(
         ),
     };
     let stats = relay(socket, session, tunnel_id, request.binary, &counters).await;
+    if let Some(session_id) = session_id {
+        state.tunnels.closed(session_id, tunnel_id);
+    }
     active.decrement(1.0);
     let duration = started.elapsed();
     histogram!("molcajete_gateway_tunnel_duration_seconds", &labels).record(duration);
