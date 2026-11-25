@@ -139,9 +139,10 @@ neither do clients that don't announce `video/av1`, `video/h265` or
 
 In a session, press **Ctrl+Alt+Shift** for the menu (clipboard, scaling,
 Ctrl+Alt+Del, performance statistics, disconnect). Append `?main` to the URL
-to run the client on the main thread instead of a worker, and `?text` to keep
+to run the client on the main thread instead of a worker, `?text` to keep
 the tunnel on the Guacamole text protocol (base64) instead of raw image, video
-and audio data.
+and audio data, and `?png` to receive lossless updates as PNG instead of
+zstd images.
 
 Embedding the client in another page:
 
