@@ -1,0 +1,7 @@
+/target
+/web/pkg
+/dist
+*.log
+.DS_Store
+/gateway.toml
+node_modules/

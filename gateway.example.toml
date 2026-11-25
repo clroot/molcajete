@@ -1,0 +1,86 @@
+# Example gateway configuration. Copy to gateway.toml and adjust.
+
+[server]
+listen = "127.0.0.1:8080"
+static_dir = "web"
+
+[guacd]
+host = "127.0.0.1"
+port = 4822
+
+# Uncomment to require HTTP Basic authentication.
+# [[users]]
+# username = "admin"
+# password = "change-me"
+
+# Targets below match docker/compose.yml (hostnames are resolved by guacd).
+[[connections]]
+id = "vnc"
+name = "VNC test desktop"
+protocol = "vnc"
+[connections.parameters]
+hostname = "vnc"
+port = "5900"
+password = "secret"
+
+[[connections]]
+id = "ssh"
+name = "SSH test shell"
+protocol = "ssh"
+[connections.parameters]
+hostname = "ssh"
+port = "2222"
+username = "guac"
+password = "guac"
+font-size = "12"
+
+# Same desktop through the Rust daemon (cargo run -p molcajete-daemon -- -l 4823).
+# molcajeted runs on the host, so it reaches VNC through the published port.
+[[connections]]
+id = "vnc-rs"
+name = "VNC test desktop (molcajeted)"
+protocol = "vnc"
+guacd = { host = "127.0.0.1", port = 4823 }
+[connections.parameters]
+hostname = "127.0.0.1"
+port = "5900"
+password = "secret"
+
+[[connections]]
+id = "ssh-rs"
+name = "SSH test shell (molcajeted)"
+protocol = "ssh"
+guacd = { host = "127.0.0.1", port = 4823 }
+[connections.parameters]
+hostname = "127.0.0.1"
+port = "2222"
+username = "guac"
+password = "guac"
+font-size = "12"
+
+# RDP targets: the xrdp container from docker/compose.yml (published on
+# 127.0.0.1:3390 because Windows' own RDP service may hold 3389 on the host).
+[[connections]]
+id = "rdp"
+name = "RDP test desktop"
+protocol = "rdp"
+[connections.parameters]
+hostname = "rdp"
+port = "3389"
+username = "ubuntu"
+password = "ubuntu"
+security = "any"
+ignore-cert = "true"
+
+[[connections]]
+id = "rdp-rs"
+name = "RDP test desktop (molcajeted)"
+protocol = "rdp"
+guacd = { host = "127.0.0.1", port = 4823 }
+[connections.parameters]
+hostname = "127.0.0.1"
+port = "3390"
+username = "ubuntu"
+password = "ubuntu"
+security = "any"
+ignore-cert = "true"

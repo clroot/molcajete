@@ -1,0 +1,23 @@
+molcajete
+Copyright 2026 The molcajete authors
+
+This product includes software derived from Apache Guacamole
+(https://guacamole.apache.org/), developed at The Apache Software Foundation
+(https://www.apache.org/):
+
+  Apache Guacamole
+  Copyright 2020 The Apache Software Foundation
+
+  Portions derived from Apache Guacamole, translated to Rust and modified:
+  - crates/client/src/input/keysym.rs: keysym tables of
+    Guacamole.Keyboard (guacamole-common-js)
+
+Bundled fonts (crates/daemon/assets/fonts) keep their own licenses:
+  - DejaVu Sans Mono: Bitstream Vera and Arev font licenses; DejaVu changes
+    are in the public domain (see LICENSE in that directory)
+  - NanumGothicCoding: Copyright (c) 2010, NHN Corporation, SIL Open Font
+    License 1.1 (see OFL-NanumGothicCoding.txt)
+
+Apache, Apache Guacamole and Guacamole are trademarks of The Apache Software
+Foundation. This project is not affiliated with or endorsed by The Apache
+Software Foundation.

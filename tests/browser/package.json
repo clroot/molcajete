@@ -1,0 +1,12 @@
+{
+  "name": "molcajete-browser-tests",
+  "private": true,
+  "type": "module",
+  "description": "Pixel-level tests of the WebGL2 renderer in headless Chromium",
+  "scripts": {
+    "test": "node renderer.test.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "1.56.1"
+  }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "molcajete-protocol"
+description = "Apache Guacamole protocol parser/encoder and instruction types shared by the molcajete daemon, gateway and wasm client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

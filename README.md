@@ -1,0 +1,154 @@
+# molcajete
+
+**molcajete** (the stone mortar guacamole is made in) is a Rust
+reimplementation of [Apache Guacamole](https://guacamole.apache.org/),
+the clientless remote desktop gateway, with a **GPU-accelerated browser client**
+written in Rust and compiled to WebAssembly.
+
+| Component | Replaces | Status |
+|---|---|---|
+| `molcajete-protocol` | protocol code in libguac / guacamole-common / guacamole-common-js | complete: streaming parser, encoder, typed instructions, video framing |
+| `molcajete-client` (wasm) | `guacamole-common-js` (`Guacamole.Client`, `Display`, `Keyboard`, `Mouse`, …) | WebGL2 renderer, WebCodecs video, input, clipboard, audio |
+| `molcajete-gateway` | the Java web application's tunnel (`guacamole-common`) | WebSocket tunnel, static files, TOML connections, Basic auth |
+| `molcajete-daemon` (`molcajeted`) | `guacd` + libguac + protocol plugins | VNC, SSH, RDP (incl. audio); video mode (AV1/H.265/H.264) for busy areas |
+
+The gateway is wire-compatible with the stock `guacd`, and accepts the same
+tunnel parameters as the stock JavaScript client, so the pieces can be mixed
+with an existing Guacamole deployment.
+
+## Why a new client?
+
+The reference client draws every layer into its own HTML `<canvas>` and lets
+CSS composite them; raster operations read pixels back with `getImageData`,
+and everything runs on the page's main thread. `molcajete-client` instead runs the
+whole client — WebSocket, parser, image decoding, rendering — **inside a Web
+Worker**, rendering into an `OffscreenCanvas` with WebGL2:
+
+- the page only forwards input and applies layout/cursor updates, so its
+  responsiveness no longer depends on how much the remote screen changes
+  (3–6× less main-thread time than the reference client when replaying the
+  same recorded session, see [docs/architecture.md](docs/architecture.md));
+- instructions are parsed in wasm and applied one complete frame (`sync`) at a time;
+- images are decoded with WebCodecs `ImageDecoder` and uploaded straight into
+  GPU textures (opaque images go directly into the layer texture);
+- `copy`, `cfill`, Porter–Duff channel masks, `transfer` raster operations,
+  clipping and paths all run on the GPU; nothing is read back except the
+  cursor image;
+- the layer tree (move, shade, distort, nested opacity groups) is composited
+  into a single low-latency (`desynchronized`) canvas once per animation frame;
+- with molcajeted, areas playing video are streamed as AV1, H.265 or H.264
+  (whatever the browser can decode) and decoded with WebCodecs
+  `VideoDecoder`, typically in hardware: 1/6–1/15 of the bandwidth of sending
+  them as images. Once the area calms down it is refreshed losslessly.
+
+See [docs/architecture.md](docs/architecture.md) for the analysis of Apache
+Guacamole and the design of each component (Korean).
+
+## Quick start
+
+Requirements: Rust (stable) with the `wasm32-unknown-unknown` target,
+`wasm-bindgen-cli` matching the `wasm-bindgen` version in `Cargo.lock`,
+and Docker for the test targets.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.130
+
+# Test targets: stock guacd, an X11 desktop over VNC, an SSH server and an
+# xrdp desktop (published on 127.0.0.1:3390)
+docker compose -f docker/compose.yml up -d --build
+
+# Build the wasm client into web/pkg, then start the gateway
+scripts/build-web.sh
+cp gateway.example.toml gateway.toml
+cargo run -p molcajete-gateway -- --config gateway.toml
+# open http://127.0.0.1:8080
+```
+
+To use the Rust daemon instead of the stock guacd for a connection, run
+`cargo run -p molcajete-daemon -- -l 4823` and point the connection at it:
+
+```toml
+[[connections]]
+id = "vnc-rs"
+name = "VNC via molcajeted"
+protocol = "vnc"
+guacd = { host = "127.0.0.1", port = 4823 }
+[connections.parameters]
+hostname = "127.0.0.1"
+port = "5900"
+password = "secret"
+```
+
+`gateway.example.toml` also defines `ssh-rs` and `rdp-rs` (molcajeted) next to
+the stock-guacd `ssh` and `rdp` connections. The SSH terminal is rendered by
+molcajeted itself with bundled DejaVu Sans Mono and a built-in NanumGothicCoding
+fallback, so Korean/CJK text works without any fonts installed; more fonts
+can be supplied with the `font-path` parameter.
+
+### Video mode
+
+molcajeted sends busy, colourful areas (video playback, animations, 3D) as a
+video stream into a separate layer, using the first codec of `--video`
+(default `av1,h265,h264`) that both the browser can decode and the server can
+encode. Encoders come from `ffmpeg` (found in `PATH`, or `--ffmpeg <path>`),
+which runs as a child process: hardware encoders (NVENC, QSV, VA-API, AMF)
+when a trial encode works, otherwise libsvtav1, libx265 and libx264.
+Nothing is linked, so GPL encoders are fine. Areas too large for software
+AV1 in real time fall back to H.265/H.264. `--features openh264` adds a
+built-in H.264 encoder (needs a C++ compiler). `--video none` always sends
+images. Lossless (`force-lossless`) and SSH sessions never use video, and
+neither do clients that don't announce `video/av1`, `video/h265` or
+`video/h264` (such as the stock JavaScript client).
+
+In a session, press **Ctrl+Alt+Shift** for the menu (clipboard, scaling,
+Ctrl+Alt+Del, performance statistics, disconnect). Append `?main` to the URL
+to run the client on the main thread instead of a worker.
+
+Embedding the client in another page:
+
+```js
+import { MolcajeteSession } from "./molcajete.js";
+const session = await MolcajeteSession.create(document.getElementById("display"));
+session.set_event_handler((type, detail) => console.log(type, detail));
+session.connect(session.tunnel_url("wss://example.com/websocket-tunnel", "vnc"));
+```
+
+## Tests
+
+```sh
+cargo test --workspace                       # unit tests (protocol, gateway, guacd, client logic)
+scripts/build-web.sh                         # then: pixel tests of the WebGL2 renderer
+(cd tests/browser && npm install && npm test)
+(cd tests/browser && node video.test.mjs)    # video decoding (needs ffmpeg with libx264/libsvtav1)
+```
+
+The browser tests feed Guacamole instructions directly into the wasm client in
+headless Chromium and compare layer/canvas pixels with what the HTML canvas
+reference implementation produces (composite modes including the "unbounded"
+ones, raster operations, overlapping copies, PNG alpha, clipping, paths,
+patterns, layer trees and frame atomicity).
+
+`tests/browser/replay-bench.mjs` replays a recorded session into the stock
+guacamole-common-js client and into molcajete-client (main thread and worker) with
+identical timing and reports main-thread cost; set `GUAC_COMMON_JS` to the
+`guacamole-common-js/src/main/webapp/modules` directory of an Apache Guacamole
+checkout.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE); see [NOTICE](NOTICE).
+Keysym tables and protocol behaviour are derived from Apache Guacamole
+(Apache-2.0). Bundled fonts keep their own licenses:
+DejaVu Sans Mono (`crates/daemon/assets/fonts/LICENSE`) and NanumGothicCoding
+(SIL Open Font License 1.1, `crates/daemon/assets/fonts/OFL-NanumGothicCoding.txt`).
+
+Video encoders are not part of this project: molcajeted runs an `ffmpeg`
+found on the system as a separate process and links none of its libraries.
+H.264 and H.265 are covered by patent pools; if you distribute binaries or
+images that include encoders (ffmpeg, or the optional OpenH264 build), check
+the codec licensing that applies to you.
+
+Apache, Apache Guacamole and Guacamole are trademarks of The Apache Software
+Foundation. molcajete is an independent project, not affiliated with or
+endorsed by The Apache Software Foundation.
