@@ -17,6 +17,7 @@ mod jump;
 mod rdp;
 mod remote;
 mod session;
+mod share;
 mod ssh;
 mod video;
 mod vnc;
@@ -72,12 +73,7 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr) {
     };
 
     if selected.starts_with('$') {
-        send_error(
-            &mut writer,
-            "Joining existing connections is not supported yet",
-            Status::RESOURCE_NOT_FOUND,
-        )
-        .await;
+        share::join(reader, writer, &selected).await;
         return;
     }
 
@@ -102,7 +98,7 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr) {
     // gateway logs as `guacd_id`.
     let span = info_span!("connection", id = %connection_id, protocol, %peer);
     // Every protocol can go through SSH jump hosts.
-    let args: Vec<&str> = args.iter().chain(jump::ARGS).copied().collect();
+    let args: Vec<&'static str> = args.iter().chain(jump::ARGS).copied().collect();
     session(reader, writer, protocol, &args, connection_id)
         .instrument(span)
         .await;
@@ -112,7 +108,7 @@ async fn session(
     mut reader: GuacReader,
     mut writer: GuacWriter,
     protocol: &'static str,
-    args: &[&str],
+    args: &[&'static str],
     connection_id: String,
 ) {
     writer.record_metrics(protocol);
@@ -137,12 +133,19 @@ async fn session(
     let active = metrics::gauge!("molcajeted_connections_active", "protocol" => protocol);
     active.increment(1.0);
     let started = Instant::now();
-    let result = match protocol {
-        "vnc" => vnc::run(reader, writer, info, params).await,
-        "ssh" => ssh::run(reader, writer, info, params).await,
-        "rdp" => rdp::run(reader, writer, info, params).await,
-        _ => unreachable!("protocol validated above"),
-    };
+    // Others may join (`select,<connection id>`) until the session ends.
+    let owner = share::Owner::register(&connection_id, protocol, args);
+    let result = owner
+        .run(async {
+            match protocol {
+                "vnc" => vnc::run(reader, writer, info, params).await,
+                "ssh" => ssh::run(reader, writer, info, params).await,
+                "rdp" => rdp::run(reader, writer, info, params).await,
+                _ => unreachable!("protocol validated above"),
+            }
+        })
+        .await;
+    drop(owner);
     active.decrement(1.0);
     let duration = started.elapsed();
     metrics::histogram!("molcajeted_session_duration_seconds", "protocol" => protocol)

@@ -133,6 +133,10 @@ impl FrameClock {
         self.pacing = pacing;
     }
 
+    pub(super) fn pacing(&self) -> Pacing {
+        self.pacing
+    }
+
     /// A frame of `bytes` encoded bytes was ended with `sync(timestamp)`.
     pub(super) fn frame_sent(&mut self, timestamp: i64, now: Instant, bytes: usize) {
         self.pending.push_back((timestamp, now));
