@@ -11,6 +11,8 @@ import {
   UserCircleIcon,
   FilmIcon,
   ClipboardDocumentListIcon,
+  SignalIcon,
+  ClockIcon,
 } from '@heroicons/react/24/outline';
 import type {User} from '../api';
 import {href, type Route} from '../route';
@@ -64,6 +66,18 @@ export default function AppFrame({user, route, onSignOut, children}: Props) {
                   icon={UserGroupIcon}
                   href={href.groups}
                   isSelected={route.name === 'groups'}
+                />
+                <SideNavItem
+                  label="Active sessions"
+                  icon={SignalIcon}
+                  href={href.activeSessions}
+                  isSelected={route.name === 'activeSessions'}
+                />
+                <SideNavItem
+                  label="Connection history"
+                  icon={ClockIcon}
+                  href={href.history}
+                  isSelected={route.name === 'history'}
                 />
                 <SideNavItem
                   label="Recordings"

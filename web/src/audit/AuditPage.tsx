@@ -1,4 +1,4 @@
-import {useCallback, useEffect, useMemo, useState} from 'react';
+import {useCallback, useMemo, useState} from 'react';
 import {Table, pixel, useTableRowExpansion, type TableColumn} from '@astryxdesign/core/Table';
 import {HStack, VStack} from '@astryxdesign/core/Stack';
 import {Button} from '@astryxdesign/core/Button';
@@ -13,24 +13,12 @@ import {EmptyState} from '@astryxdesign/core/EmptyState';
 import {ArrowDownTrayIcon, ClipboardDocumentListIcon} from '@heroicons/react/24/outline';
 import {api, auditCsvUrl, type AuditEntry, type AuditFilter} from '../api';
 import {useApiData} from '../useApiData';
+import {useSettled} from '../useSettled';
 import PageFrame from '../shell/PageFrame';
 import AsyncContent from '../shell/AsyncContent';
 import {actionGroups, changeRows, localDayStart, type ChangeRow} from './format';
 
 const PAGE_SIZE = 50;
-/** How long typing pauses before the filters apply. */
-const TYPING_DELAY_MS = 300;
-
-/** `value`, once it has stopped changing for a moment. */
-function useSettled(value: string): string {
-  const [settled, setSettled] = useState(value);
-  useEffect(() => {
-    const timer = setTimeout(() => setSettled(value), TYPING_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, [value]);
-  return settled;
-}
-
 /** Who changed what, signed in or opened a recording; for administrators. */
 export default function AuditPage() {
   const [actor, setActor] = useState('');
