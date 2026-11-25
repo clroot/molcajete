@@ -1,0 +1,46 @@
+name: Improvement
+description: Make something that already works faster, cheaper or easier to use.
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - gateway (molcajete-gateway, tunnel, API)
+        - web UI (web/)
+        - client (molcajete-client, wasm)
+        - daemon (molcajeted)
+        - protocol (molcajete-protocol)
+        - telemetry
+        - deploy / docker
+        - docs
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is slow, costly or awkward today. Include measurements if you have them (resolution, mode, p95, dashboard panel).
+    validations:
+      required: true
+
+  - type: textarea
+    id: ideas
+    attributes:
+      label: Ideas
+      description: Possible approaches. A rough list is fine.
+      placeholder: |
+        - ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: measure
+    attributes:
+      label: How to measure
+      description: How we can tell the change worked.
+    validations:
+      required: false
