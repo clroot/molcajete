@@ -148,6 +148,20 @@ Our web client decodes one more lossless image type itself, in WebAssembly, and 
 - `--image-zstd false` (`MOLCAJETED_IMAGE_ZSTD=false`) keeps every client of a daemon on PNG. A single session stays on PNG with `?png` in its URL.
 - molcajeted now links libzstd, which the `zstd-sys` crate compiles from its bundled source: building needs a C compiler, as it already did for `ring`.
 
+### Remote display changes and mixed versions
+
+Resizing an RDP desktop to the window and choosing its scale ([architecture.md](architecture.md), section 2.8) touch all three components:
+
+| Web client | Gateway | Daemon | Result |
+| --- | --- | --- | --- |
+| new | new | new molcajeted | everything: the form, the menu, choices remembered per browser, rows disabled for servers without Display Control |
+| new | new | stock guacd | choices apply at the next connection (guacd does not apply `argv` for `dpi` and `resize-method` during a session); the rows stay enabled |
+| new | older | any | the gateway ignores `param.*`, so a remembered choice applies only once it is changed in a session; the menu shows Automatic and off until a choice is made |
+| older | any | new molcajeted | as before: the desktop resizes only with `resize-method=display-update` |
+
+- Existing RDP connections keep what they have: without `resize-method` the desktop does not follow the window. Turn the switch on in the connection form, or in the session menu for one browser.
+- molcajeted logs `Display Control availability` with `available=` once it knows, and the client's changes as `client changed the resize method` and `client changed the DPI`. The gateway logs the overrides a browser asked for in `opening tunnel`.
+
 ## Observability options
 
 Everything is off by default and costs nothing unless enabled (metrics calls are no-ops without a recorder).
