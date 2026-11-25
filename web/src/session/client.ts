@@ -37,7 +37,13 @@ export type SessionEvent =
   | {type: 'unstable'; detail: boolean}
   /** Whether the server can change the remote display during the session (molcajeted only). */
   | {type: 'display-control'; detail: boolean}
-  | {type: 'stats'; detail: SessionStats};
+  | {type: 'stats'; detail: SessionStats}
+  /** Target of the link under the pointer in a terminal, or null (molcajeted SSH only). */
+  | {type: 'link'; detail: string | null}
+  /** The terminal has no selection any more (molcajeted SSH only); a selection arrives as `clipboard`. */
+  | {type: 'selection'; detail: boolean}
+  /** The copy shortcut wrote the selection to the local clipboard, or could not. */
+  | {type: 'copy'; detail: {ok: boolean}};
 
 export interface MolcajeteSession {
   readonly mode: 'worker' | 'main';
@@ -47,6 +53,8 @@ export interface MolcajeteSession {
   disconnect(): void;
   focus(): void;
   send_clipboard(text: string): void;
+  /** Copy, paste and link shortcuts of terminals; other protocols get those keys as they are. */
+  set_terminal_shortcuts(enabled: boolean): void;
   send_argv(name: string, value: string): void;
   send_ctrl_alt_del(): void;
   set_scale_mode(mode: 'fit' | 'native'): void;

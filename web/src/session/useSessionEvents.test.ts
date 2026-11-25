@@ -9,6 +9,7 @@ const connected: SessionState = {
   isUnstable: false,
   stats: null,
   canChangeDisplay: true,
+  link: null,
 };
 
 describe('session events', () => {
@@ -26,6 +27,13 @@ describe('session events', () => {
     expect(fixed.canChangeDisplay).toBe(false);
     expect(reduce(fixed, {type: 'display-control', detail: true}).canChangeDisplay).toBe(true);
     expect(reduce(fixed, {type: 'state', detail: 'connecting'}).canChangeDisplay).toBe(true);
+  });
+
+  test('keeps the link under the pointer until it leaves or the session reconnects', () => {
+    const over = reduce(connected, {type: 'link', detail: 'https://example.com'});
+    expect(over.link).toBe('https://example.com');
+    expect(reduce(over, {type: 'link', detail: null}).link).toBeNull();
+    expect(reduce(over, {type: 'state', detail: 'connecting'}).link).toBeNull();
   });
 
   test('a disconnect keeps the error that caused it', () => {

@@ -10,6 +10,7 @@ import {Text} from '@astryxdesign/core/Text';
 import {Heading} from '@astryxdesign/core/Heading';
 import {AUTOMATIC_SCALE_LABEL, scaleOptionsWith} from './displayScale';
 import type {RemoteScale} from './displaySettings';
+import {terminalKeys} from './terminal';
 
 export type ScaleMode = 'fit' | 'native';
 
@@ -30,6 +31,8 @@ type Props = {
   isOpen: boolean;
   onOpenChange: (isOpen: boolean) => void;
   connectionName: string;
+  /** Terminals copy and paste with shortcuts, shown under the clipboard. */
+  isTerminal: boolean;
   clipboard: string;
   onClipboardChange: (text: string) => void;
   scaleMode: ScaleMode;
@@ -79,6 +82,18 @@ export default function SessionMenu(props: Props) {
                 rows={5}
                 hasSpellCheck={false}
               />
+              {props.isTerminal && (
+                <VStack gap={2}>
+                  <HStack gap={2} vAlign="center">
+                    <Kbd keys={terminalKeys.copy} />
+                    <Text color="secondary">copies the selected text</Text>
+                  </HStack>
+                  <HStack gap={2} vAlign="center">
+                    <Kbd keys={terminalKeys.paste} />
+                    <Text color="secondary">pastes from this computer</Text>
+                  </HStack>
+                </VStack>
+              )}
               <VStack gap={4}>
                 <Heading level={3}>Display</Heading>
                 {remoteDisplay && (
