@@ -42,6 +42,18 @@ const COLUMN_GAP_MERGE: u32 = 48;
 const MIN_SCROLL_ROWS: u32 = 8;
 /// Bound on pixel comparisons per frame while searching for moved blocks.
 const MAX_VERIFICATIONS: u32 = 4096;
+/// Search areas up to this size (per axis) are searched completely; larger
+/// ones are sampled every `MOVE_SAMPLE_PERIOD` pixels.
+const MOVE_FULL_SEARCH: u32 = 512;
+const MOVE_SAMPLE_PERIOD: u32 = 384;
+/// Side of a sample: holds one window position for each of the TILE×TILE
+/// ways a moved block can be offset against the tile grid.
+const MOVE_SAMPLE: u32 = 2 * TILE - 1;
+/// Number of distinct displacements tried per search area.
+const MAX_MOVE_OFFSETS: usize = 8;
+/// Changed regions at most this far apart are searched for moved blocks as
+/// one area.
+const MOVE_SEARCH_GAP: u32 = 4 * TILE;
 /// Multipliers of the 2D rolling block hash (both odd).
 const HASH_A: u64 = 0x0000_0100_0000_01b3;
 const HASH_B: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -203,32 +215,180 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// FNV-1a over 64-bit words: fast and good enough to find candidate rows;
-/// matches are always confirmed by comparing the bytes.
+/// FNV-1a over 64-bit words in four independent lanes (so the multiplies of
+/// consecutive words do not wait for each other): fast and good enough to
+/// find candidate rows; matches are always confirmed by comparing the bytes.
 fn row_hash(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    let mut words = bytes.chunks_exact(8);
+    const SEED: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    let word = |w: &[u8]| u64::from_le_bytes(w.try_into().expect("8-byte chunk"));
+    let mut lanes = [SEED, SEED ^ 1, SEED ^ 2, SEED ^ 3];
+    let mut blocks = bytes.chunks_exact(32);
+    for block in &mut blocks {
+        for (lane, w) in lanes.iter_mut().zip(block.chunks_exact(8)) {
+            *lane = (*lane ^ word(w)).wrapping_mul(PRIME);
+        }
+    }
+    let mut h = lanes
+        .into_iter()
+        .fold(SEED, |h, lane| (h ^ lane).wrapping_mul(PRIME));
+    let mut words = blocks.remainder().chunks_exact(8);
     for w in &mut words {
-        let word = u64::from_le_bytes(w.try_into().expect("8-byte chunk"));
-        h = (h ^ word).wrapping_mul(0x0100_0000_01b3);
+        h = (h ^ word(w)).wrapping_mul(PRIME);
     }
     for &b in words.remainder() {
-        h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        h = (h ^ b as u64).wrapping_mul(PRIME);
     }
     h
 }
 
-fn pixel_value(p: &[u8]) -> u64 {
-    u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as u64
+/// Hash standing for a row when rows are matched against each other, or
+/// `None` for rows that say nothing about where content moved (a single
+/// colour). Wide rows are judged by evenly spaced samples: reading every
+/// byte of every row costs more than the rest of scroll detection, and rows
+/// that only look alike in the samples are sorted out by the comparison that
+/// follows every match.
+fn row_signature(row: &[u8]) -> Option<u64> {
+    const SAMPLES: usize = 16;
+    const SAMPLE: usize = 64 * 4;
+    if row.len() <= 2 * SAMPLES * SAMPLE {
+        return (!is_uniform(row)).then(|| row_hash(row));
+    }
+    let step = (row.len() - SAMPLE) / (SAMPLES - 1) / 4 * 4;
+    let sample = |i: usize| &row[i * step..i * step + SAMPLE];
+    let first = &row[..4];
+    if (0..SAMPLES).all(|i| is_uniform_with(sample(i), first)) {
+        return None;
+    }
+    Some((0..SAMPLES).fold(0, |h, i| {
+        (h ^ row_hash(sample(i))).wrapping_mul(0x0100_0000_01b3)
+    }))
+}
+
+fn pixel_value(p: &[u8; 4]) -> u64 {
+    u32::from_le_bytes(*p) as u64
 }
 
 fn pow(base: u64, exp: u32) -> u64 {
     (0..exp).fold(1u64, |acc, _| acc.wrapping_mul(base))
 }
 
+/// Multiplicative inverse of an odd number modulo 2^64 (Newton's method:
+/// every step doubles the number of correct low bits, starting from 3).
+fn inverse(a: u64) -> u64 {
+    (0..5).fold(a, |x, _| {
+        x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)))
+    })
+}
+
+/// `HASH_A^(TILE-1-column)` for every column of a block: the weight of a
+/// pixel within the hash of its row.
+fn row_weights() -> [u64; TILE as usize] {
+    let mut weights = [1u64; TILE as usize];
+    for i in (0..TILE as usize - 1).rev() {
+        weights[i] = weights[i + 1].wrapping_mul(HASH_A);
+    }
+    weights
+}
+
+/// Whether every pixel of `row` equals `first`. A row equal to itself
+/// shifted by one pixel has a single colour, which is one `memcmp`.
+fn is_uniform_with(row: &[u8], first: &[u8]) -> bool {
+    row.len() < 4 || (row[..4] == *first && row[4..] == row[..row.len() - 4])
+}
+
 fn is_uniform(row: &[u8]) -> bool {
-    let first = &row[..4];
-    row.chunks_exact(4).all(|p| p == first)
+    row.len() < 4 || row[4..] == row[..row.len() - 4]
+}
+
+/// Index of the first pixel that differs between two rows of equal length.
+/// Whole blocks are compared first (one `memcmp` each), since long equal
+/// stretches are the common case.
+fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    const BLOCK: usize = 64;
+    let mut start = 0;
+    for (x, y) in a.chunks(BLOCK).zip(b.chunks(BLOCK)) {
+        if x != y {
+            let byte = x.iter().zip(y).position(|(p, q)| p != q)?;
+            return Some((start + byte) / 4);
+        }
+        start += x.len();
+    }
+    None
+}
+
+/// Index of the last pixel that differs between two rows of equal length.
+fn last_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    const BLOCK: usize = 64;
+    let mut end = a.len();
+    for (x, y) in a.rchunks(BLOCK).zip(b.rchunks(BLOCK)) {
+        end -= x.len();
+        if x != y {
+            let byte = x.iter().zip(y).rposition(|(p, q)| p != q)?;
+            return Some((end + byte) / 4);
+        }
+    }
+    None
+}
+
+/// Whether no pixel of `rgba` is transparent. (Without an early exit, so
+/// that the loop is vectorised: transparency is rare.)
+pub(crate) fn is_opaque(rgba: &[u8]) -> bool {
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .fold(u8::MAX, |alpha, p| alpha & p[3])
+        == u8::MAX
+}
+
+fn union(a: Rect, b: Rect) -> Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    Rect::new(
+        x,
+        y,
+        a.right().max(b.right()) - x,
+        a.bottom().max(b.bottom()) - y,
+    )
+}
+
+/// Joins rectangles closer than `gap` (in both directions) into their
+/// bounding boxes, until the results are further apart than that. Returns
+/// the boxes and, for every input rectangle, the index of its box.
+fn cluster(rects: &[Rect], gap: u32) -> (Vec<Rect>, Vec<usize>) {
+    let near = |a: &Rect, b: &Rect| {
+        a.x < b.right() + gap
+            && b.x < a.right() + gap
+            && a.y < b.bottom() + gap
+            && b.y < a.bottom() + gap
+    };
+    let mut boxes: Vec<Rect> = Vec::new();
+    let mut owner: Vec<usize> = Vec::with_capacity(rects.len());
+    for rect in rects {
+        let mut merged = *rect;
+        // Growing a box may bring further boxes within reach.
+        let mut target = None;
+        while let Some(hit) = (0..boxes.len())
+            .find(|&i| Some(i) != target && !boxes[i].is_empty() && near(&boxes[i], &merged))
+        {
+            merged = union(merged, boxes[hit]);
+            match target {
+                Some(t) => {
+                    // Fold `hit` into the box we already joined.
+                    boxes[hit] = Rect::default();
+                    owner.iter_mut().filter(|o| **o == hit).for_each(|o| *o = t);
+                }
+                None => target = Some(hit),
+            }
+        }
+        let index = target.unwrap_or_else(|| {
+            boxes.push(merged);
+            boxes.len() - 1
+        });
+        boxes[index] = merged;
+        owner.push(index);
+    }
+    (boxes, owner)
 }
 
 /// Groups indices `0..len` for which `set(i)` holds into runs, joining runs
@@ -254,6 +414,134 @@ fn runs(len: usize, max_gap: usize, set: impl Fn(usize) -> bool) -> Vec<(usize, 
         i = end;
     }
     out
+}
+
+/// Looks up the changed blocks of the new frame by hash.
+struct BlockIndex {
+    /// Open-addressed table: hash -> index of the block.
+    table: Vec<Option<(u64, u32)>>,
+    mask: usize,
+    /// One bit per hash: rejects nearly every window position without
+    /// touching the table.
+    filter: Vec<u64>,
+    filter_shift: u32,
+}
+
+impl BlockIndex {
+    fn new(wanted: &[(u32, u32, u64)]) -> Self {
+        let size = (wanted.len() * 4).next_power_of_two();
+        let filter_bits = (wanted.len() * 32).next_power_of_two().max(1024);
+        let mut index = Self {
+            table: vec![None; size],
+            mask: size - 1,
+            filter: vec![0u64; filter_bits / 64],
+            // The high bits of the hash are its best mixed ones.
+            filter_shift: 64 - filter_bits.trailing_zeros(),
+        };
+        for (i, &(_, _, h)) in wanted.iter().enumerate() {
+            let mut slot = index.home(h);
+            while index.table[slot].is_some_and(|(stored, _)| stored != h) {
+                slot = (slot + 1) & index.mask;
+            }
+            // Identical blocks share one entry; the first one wins.
+            index.table[slot].get_or_insert((h, i as u32));
+            let bit = (h >> index.filter_shift) as usize;
+            index.filter[bit / 64] |= 1 << (bit % 64);
+        }
+        index
+    }
+
+    fn home(&self, h: u64) -> usize {
+        (h ^ (h >> 29)) as usize & self.mask
+    }
+
+    fn get(&self, h: u64) -> Option<usize> {
+        let bit = (h >> self.filter_shift) as usize;
+        if self.filter[bit / 64] & (1 << (bit % 64)) == 0 {
+            return None;
+        }
+        let mut slot = self.home(h);
+        loop {
+            match self.table[slot] {
+                Some((stored, idx)) if stored == h => return Some(idx as usize),
+                Some(_) => slot = (slot + 1) & self.mask,
+                None => return None,
+            }
+        }
+    }
+}
+
+/// State of the search for the old places of the changed blocks of one area
+/// (see [`Display::find_blocks`]).
+struct BlockSearch {
+    index: BlockIndex,
+    /// Blocks whose old place is still unknown.
+    missing: Vec<bool>,
+    /// (source, destination) of the blocks found.
+    found: Vec<((u32, u32), (u32, u32))>,
+    /// Powers of `HASH_A` and of its inverse, by column.
+    up: Vec<u64>,
+    down: Vec<u64>,
+    /// Scratch buffers of the sliding window.
+    prefix: Vec<u64>,
+    ring: Vec<u64>,
+    columns: Vec<u64>,
+}
+
+impl BlockSearch {
+    fn new(wanted: &[(u32, u32, u64)]) -> Self {
+        Self {
+            index: BlockIndex::new(wanted),
+            missing: vec![true; wanted.len()],
+            found: Vec::new(),
+            up: Vec::new(),
+            down: Vec::new(),
+            prefix: Vec::new(),
+            ring: Vec::new(),
+            columns: Vec::new(),
+        }
+    }
+
+    /// Makes room for searching an area `width` pixels wide.
+    fn reserve(&mut self, width: usize) {
+        if self.up.len() >= width {
+            return;
+        }
+        let a_inverse = inverse(HASH_A);
+        let (mut u, mut d) = (1u64, 1u64);
+        self.up.clear();
+        self.down.clear();
+        for _ in 0..width {
+            self.up.push(u);
+            self.down.push(d);
+            u = u.wrapping_mul(HASH_A);
+            d = d.wrapping_mul(a_inverse);
+        }
+        self.prefix = vec![0; width + TILE as usize];
+        self.ring = vec![0; width * TILE as usize];
+        self.columns = vec![0; width];
+    }
+}
+
+/// Spans of `[start, start + len)` searched for moved blocks: all of it when
+/// short, otherwise samples at regular distances.
+fn sample_spans(start: u32, len: u32) -> Vec<(u32, u32)> {
+    if len <= MOVE_FULL_SEARCH {
+        return vec![(start, len)];
+    }
+    (0..len - TILE)
+        .step_by(MOVE_SAMPLE_PERIOD as usize)
+        .map(|offset| (start + offset, MOVE_SAMPLE.min(len - offset)))
+        .collect()
+}
+
+/// The parts of `area` searched for moved blocks.
+fn samples(area: &Rect) -> Vec<Rect> {
+    let columns = sample_spans(area.x, area.w);
+    sample_spans(area.y, area.h)
+        .into_iter()
+        .flat_map(|(y, h)| columns.iter().map(move |&(x, w)| Rect::new(x, y, w, h)))
+        .collect()
 }
 
 impl Display {
@@ -485,7 +773,7 @@ impl Display {
         stats.add(self.update_video(out));
         let mut mark = Instant::now();
         self.metrics.phase(Phase::Video, mark - started);
-        let mut phase_done = |metrics: &DisplayMetrics, phase: Phase| {
+        let mut phase_done = |metrics: &mut DisplayMetrics, phase: Phase| {
             let now = Instant::now();
             metrics.phase(phase, now - mark);
             mark = now;
@@ -503,10 +791,10 @@ impl Display {
                 stats.add(self.detect_scroll(&changed, out));
             }
         }
-        phase_done(&self.metrics, Phase::Scroll);
+        phase_done(&mut self.metrics, Phase::Scroll);
         // 2. Blocks that moved anywhere (dragged windows, panning).
         stats.add(self.detect_moves(&regions, out));
-        phase_done(&self.metrics, Phase::Moves);
+        phase_done(&mut self.metrics, Phase::Moves);
         // 3. Whatever still differs is sent as pixels.
         for region in regions {
             if let Some(changed) = self.diff_bounds(&region) {
@@ -526,9 +814,9 @@ impl Display {
                 *motion += 1.0;
             }
         }
-        phase_done(&self.metrics, Phase::Pixels);
+        phase_done(&mut self.metrics, Phase::Pixels);
         stats.add(self.refine_lossy(out));
-        phase_done(&self.metrics, Phase::Refine);
+        phase_done(&mut self.metrics, Phase::Refine);
         self.frame_bytes += stats.bytes;
         self.metrics.flushed(started.elapsed());
         stats
@@ -581,12 +869,8 @@ impl Display {
         let start = self.offset(x0, y);
         let end = self.offset(x1, y);
         let (a, b) = (&self.pixels[start..end], &self.sent[start..end]);
-        if a == b {
-            return None;
-        }
-        let pairs = || a.chunks_exact(4).zip(b.chunks_exact(4));
-        let first = pairs().position(|(p, q)| p != q)? as u32;
-        let last = pairs().rposition(|(p, q)| p != q)? as u32;
+        let first = first_diff(a, b)? as u32;
+        let last = last_diff(a, b)? as u32;
         Some(RowDiff {
             first: x0 + first,
             last: x0 + last,
@@ -609,15 +893,16 @@ impl Display {
 
     /// Hash of the `TILE`×`TILE` block at (x, y): Σ p·A^(63-col)·B^(63-row)
     /// mod 2^64 with odd A and B, so every pixel contributes. The sliding
-    /// search in [`Display::detect_moves`] maintains the same value with
-    /// a 2D rolling update.
-    fn block_hash(&self, buf: &[u8], x: u32, y: u32) -> u64 {
+    /// search in [`Display::find_blocks`] produces the same value for every
+    /// window position. `weights` comes from [`row_weights`]: weighting the
+    /// pixels (instead of Horner's rule) keeps the multiplies independent.
+    fn block_hash(&self, buf: &[u8], x: u32, y: u32, weights: &[u64; TILE as usize]) -> u64 {
         let mut cell = 0u64;
         for row in y..y + TILE {
-            let mut acc = 0u64;
-            for p in self.segment(buf, row, x, x + TILE).chunks_exact(4) {
-                acc = acc.wrapping_mul(HASH_A).wrapping_add(pixel_value(p));
-            }
+            let pixels = self.segment(buf, row, x, x + TILE).as_chunks::<4>().0;
+            let acc = pixels.iter().zip(weights).fold(0u64, |acc, (p, w)| {
+                acc.wrapping_add(pixel_value(p).wrapping_mul(*w))
+            });
             cell = cell.wrapping_mul(HASH_B).wrapping_add(acc);
         }
         cell
@@ -631,11 +916,26 @@ impl Display {
 
     /// Finds changed `TILE`-aligned blocks whose new content exists somewhere
     /// else on the client (at any offset) and copies them there.
+    ///
+    /// Content that moved leaves a change both where it was and where it is
+    /// now, so the old place is searched for only around the changes: regions
+    /// close to each other form one search area, regions far apart are
+    /// searched separately (two small changes at opposite corners must not
+    /// cost a scan of the whole screen).
+    ///
+    /// Large areas are not scanned pixel by pixel either. What moved did so
+    /// by one displacement, so it is enough to find that displacement: a
+    /// sparse grid of samples is searched, each large enough to catch one
+    /// block of anything that moved across it, and the displacements found
+    /// are then tried on every changed block. Only things smaller than the
+    /// grid spacing can slip through, and those are cheap to send as pixels.
     fn detect_moves(&mut self, regions: &[Rect], out: &mut String) -> FlushStats {
         let mut stats = FlushStats::default();
-        // Changed, non-blank, fully visible tiles of the new frame.
-        let mut wanted: Vec<(u32, u32, u64)> = Vec::new();
-        for region in regions {
+        let (areas, owner) = cluster(regions, MOVE_SEARCH_GAP);
+        let weights = row_weights();
+        // Changed, non-blank, fully visible tiles of the new frame, per area.
+        let mut wanted: Vec<Vec<(u32, u32, u64)>> = vec![Vec::new(); areas.len()];
+        for (region, &area) in regions.iter().zip(&owner) {
             let (cols, rows) = self.tiles_of(region);
             for ty in rows {
                 for tx in cols.clone() {
@@ -646,125 +946,66 @@ impl Display {
                     if self.blocks_equal(&self.pixels, x, y, &self.sent, x, y) {
                         continue;
                     }
-                    let first = self.segment(&self.pixels, y, x, x + 1).to_vec();
+                    let first = self.segment(&self.pixels, y, x, x + 1);
                     let uniform = (y..y + TILE).all(|r| {
-                        self.segment(&self.pixels, r, x, x + TILE)
-                            .chunks_exact(4)
-                            .all(|p| p == first.as_slice())
+                        is_uniform_with(self.segment(&self.pixels, r, x, x + TILE), first)
                     });
                     if !uniform {
-                        wanted.push((x, y, self.block_hash(&self.pixels, x, y)));
+                        wanted[area].push((x, y, self.block_hash(&self.pixels, x, y, &weights)));
                     }
                 }
             }
         }
-        // Searching costs O(area); only worth it for sizeable changes.
-        if wanted.len() < 2 {
-            return stats;
-        }
-
-        // Open-addressed table: hash -> index into `wanted`.
-        let size = (wanted.len() * 4).next_power_of_two();
-        let mask = size - 1;
-        let home = |h: u64| (h ^ (h >> 29)) as usize & mask;
-        let mut table: Vec<Option<(u64, usize)>> = vec![None; size];
-        for (i, &(_, _, h)) in wanted.iter().enumerate() {
-            let mut slot = home(h);
-            while table[slot].is_some_and(|(stored, _)| stored != h) {
-                slot = (slot + 1) & mask;
-            }
-            // Identical blocks share one entry; the first one wins.
-            table[slot].get_or_insert((h, i));
-        }
-
-        // Slide a TILE×TILE window over the client's content in the area
-        // spanned by the changes.
-        let area = regions
-            .iter()
-            .copied()
-            .reduce(|a, b| {
-                let x = a.x.min(b.x);
-                let y = a.y.min(b.y);
-                Rect::new(
-                    x,
-                    y,
-                    a.right().max(b.right()) - x,
-                    a.bottom().max(b.bottom()) - y,
-                )
-            })
-            .unwrap_or_default();
-        if area.w < TILE || area.h < TILE {
-            return stats;
-        }
-        let mut found: Vec<Option<(u32, u32)>> = vec![None; wanted.len()];
+        // (source, destination) of every block found.
+        let mut found: Vec<((u32, u32), (u32, u32))> = Vec::new();
         let mut verifications = 0u32;
-        let a_out = pow(HASH_A, TILE);
-        let b_out = pow(HASH_B, TILE);
-        let width = area.w as usize;
-        // Row hashes of the last TILE rows (ring buffer) and running column sums.
-        let mut ring = vec![0u64; width * TILE as usize];
-        let mut columns = vec![0u64; width];
-        let mut row_hashes = vec![0u64; width];
-        for y in area.y..area.bottom() {
-            let row = self.segment(&self.sent, y, area.x, area.right());
-            let mut acc = 0u64;
-            for i in 0..width {
-                acc = acc
-                    .wrapping_mul(HASH_A)
-                    .wrapping_add(pixel_value(&row[i * 4..i * 4 + 4]));
-                if i >= TILE as usize {
-                    let old =
-                        pixel_value(&row[(i - TILE as usize) * 4..(i - TILE as usize) * 4 + 4]);
-                    acc = acc.wrapping_sub(old.wrapping_mul(a_out));
-                }
-                row_hashes[i] = acc;
+        for (area, wanted) in areas.iter().zip(&wanted) {
+            // Searching costs O(area); only worth it for sizeable changes.
+            if wanted.len() < 2 || area.w < TILE || area.h < TILE {
+                continue;
             }
-            let slot = ((y - area.y) % TILE) as usize * width;
-            let full_rows = y - area.y >= TILE;
-            for i in 0..width {
-                let mut column = columns[i].wrapping_mul(HASH_B).wrapping_add(row_hashes[i]);
-                if full_rows {
-                    column = column.wrapping_sub(ring[slot + i].wrapping_mul(b_out));
+            let mut search = BlockSearch::new(wanted);
+            for sample in samples(area) {
+                self.find_blocks(&sample, wanted, &mut search, &mut verifications);
+            }
+            // Displacements seen, most frequent first.
+            let mut offsets: Vec<((i64, i64), u32)> = Vec::new();
+            for &((sx, sy), (dx, dy)) in &search.found {
+                let offset = (dx as i64 - sx as i64, dy as i64 - sy as i64);
+                match offsets.iter_mut().find(|(o, _)| *o == offset) {
+                    Some((_, n)) => *n += 1,
+                    None => offsets.push((offset, 1)),
                 }
-                columns[i] = column;
-                ring[slot + i] = row_hashes[i];
-                if i + 1 < TILE as usize || y + 1 < area.y + TILE {
+            }
+            offsets.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            offsets.truncate(MAX_MOVE_OFFSETS);
+            // Every changed block that one of them explains moved too.
+            for (i, &(dx, dy, _)) in wanted.iter().enumerate() {
+                if !search.missing[i] {
                     continue;
                 }
-                let h = column;
-                let mut slot = home(h);
-                let idx = loop {
-                    match table[slot] {
-                        Some((stored, idx)) if stored == h => break Some(idx),
-                        Some(_) => slot = (slot + 1) & mask,
-                        None => break None,
+                for &((ox, oy), _) in &offsets {
+                    let (sx, sy) = (dx as i64 - ox, dy as i64 - oy);
+                    if sx >= 0
+                        && sy >= 0
+                        && sx as u32 + TILE <= self.width
+                        && sy as u32 + TILE <= self.height
+                        && self.blocks_equal(&self.sent, sx as u32, sy as u32, &self.pixels, dx, dy)
+                    {
+                        search.found.push(((sx as u32, sy as u32), (dx, dy)));
+                        break;
                     }
-                };
-                let Some(idx) = idx else { continue };
-                if found[idx].is_some() || verifications >= MAX_VERIFICATIONS {
-                    continue;
-                }
-                let sx = area.x + i as u32 + 1 - TILE;
-                let sy = y + 1 - TILE;
-                let (dx, dy, _) = wanted[idx];
-                verifications += 1;
-                if (sx, sy) != (dx, dy)
-                    && self.blocks_equal(&self.sent, sx, sy, &self.pixels, dx, dy)
-                {
-                    found[idx] = Some((sx, sy));
                 }
             }
+            found.append(&mut search.found);
         }
 
         // Blocks moved by the same offset are merged into larger rectangles,
         // each sent as one copy (the client handles overlap within a copy).
         let mut by_offset: HashMap<(i64, i64), Vec<(u32, u32)>> = HashMap::new();
-        for (idx, src) in found.into_iter().enumerate() {
-            if let Some((sx, sy)) = src {
-                let (dx, dy, _) = wanted[idx];
-                let offset = (dx as i64 - sx as i64, dy as i64 - sy as i64);
-                by_offset.entry(offset).or_default().push((dx, dy));
-            }
+        for ((sx, sy), (dx, dy)) in found {
+            let offset = (dx as i64 - sx as i64, dy as i64 - sy as i64);
+            by_offset.entry(offset).or_default().push((dx, dy));
         }
         for ((ox, oy), mut tiles) in by_offset {
             tiles.sort_by_key(|&(x, y)| (y, x));
@@ -783,8 +1024,7 @@ impl Display {
                 // may have changed it); only opaque sources replace pixels.
                 let valid = (0..dst.h).all(|r| {
                     let s = self.segment(&self.sent, src.y + r, src.x, src.right());
-                    s.chunks_exact(4).all(|p| p[3] == 255)
-                        && s == self.segment(&self.pixels, dst.y + r, dst.x, dst.right())
+                    s == self.segment(&self.pixels, dst.y + r, dst.x, dst.right()) && is_opaque(s)
                 });
                 if valid {
                     self.emit_copy(&src, dst.x, dst.y, out);
@@ -793,6 +1033,94 @@ impl Display {
             }
         }
         stats
+    }
+
+    /// Slides a `TILE`×`TILE` window over the client's content inside `area`
+    /// and records in `search` where the `wanted` blocks (x, y, hash) of the
+    /// new frame are found.
+    fn find_blocks(
+        &self,
+        area: &Rect,
+        wanted: &[(u32, u32, u64)],
+        search: &mut BlockSearch,
+        verifications: &mut u32,
+    ) {
+        const T: usize = TILE as usize;
+        let b_out = pow(HASH_B, TILE);
+        let width = area.w as usize;
+        // The hash of the TILE pixels ending at column i of a row is
+        // A^i · (S(i) − S(i − TILE)) with S(i) = Σ p(j)·A^(−j) for j ≤ i:
+        // a prefix sum, where a rolling hash would chain one multiply per
+        // pixel.
+        search.reserve(width);
+        let BlockSearch {
+            up,
+            down,
+            prefix,
+            ring,
+            columns,
+            ..
+        } = search;
+        let (up, down) = (&up[..width], &down[..width]);
+        // S, shifted by TILE so that S(i − TILE) is zero for the first columns.
+        let prefix = &mut prefix[..width + T];
+        // Row hashes of the last TILE rows (ring buffer, initially zero so
+        // that leaving rows subtract nothing) and running column sums.
+        let ring = &mut ring[..width * T];
+        let columns = &mut columns[..width];
+        ring.fill(0);
+        columns.fill(0);
+        for y in area.y..area.bottom() {
+            let row = self
+                .segment(&self.sent, y, area.x, area.right())
+                .as_chunks::<4>()
+                .0;
+            let mut sum = 0u64;
+            for ((slot, p), &d) in prefix[T..].iter_mut().zip(row).zip(down) {
+                sum = sum.wrapping_add(pixel_value(p).wrapping_mul(d));
+                *slot = sum;
+            }
+            // Hash of the TILE rows ending at this one, per column.
+            let slot = ((y - area.y) as usize % T) * width;
+            for ((((column, leaving), &high), &low), &u) in columns
+                .iter_mut()
+                .zip(&mut ring[slot..slot + width])
+                .zip(&prefix[T..])
+                .zip(&prefix[..width])
+                .zip(up)
+            {
+                let hash = high.wrapping_sub(low).wrapping_mul(u);
+                *column = column
+                    .wrapping_mul(HASH_B)
+                    .wrapping_add(hash)
+                    .wrapping_sub(leaving.wrapping_mul(b_out));
+                *leaving = hash;
+            }
+            if y + 1 < area.y + TILE {
+                continue;
+            }
+            for (i, &h) in columns.iter().enumerate().skip(T - 1) {
+                let Some(idx) = search.index.get(h) else {
+                    continue;
+                };
+                if !search.missing[idx] {
+                    continue;
+                }
+                if *verifications >= MAX_VERIFICATIONS {
+                    return;
+                }
+                let sx = area.x + (i + 1 - T) as u32;
+                let sy = y + 1 - TILE;
+                let (dx, dy, _) = wanted[idx];
+                *verifications += 1;
+                if (sx, sy) != (dx, dy)
+                    && self.blocks_equal(&self.sent, sx, sy, &self.pixels, dx, dy)
+                {
+                    search.missing[idx] = false;
+                    search.found.push(((sx, sy), (dx, dy)));
+                }
+            }
+        }
     }
 
     /// Row segment `[x0, x1)` of row `y` in `buf`.
@@ -808,25 +1136,28 @@ impl Display {
         // Index the client's rows around the region by hash.
         let lo = rect.y.saturating_sub(rect.h);
         let hi = (rect.bottom() + rect.h).min(self.height);
-        let mut index: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut index: Vec<(u64, u32)> = Vec::with_capacity((hi - lo) as usize);
         for y in lo..hi {
-            let row = self.segment(&self.sent, y, x0, x1);
-            if !is_uniform(row) {
-                let list = index.entry(row_hash(row)).or_default();
-                if list.len() < 4 {
-                    list.push(y);
-                }
+            if let Some(hash) = row_signature(self.segment(&self.sent, y, x0, x1)) {
+                index.push((hash, y));
             }
         }
+        index.sort_unstable();
 
         // Every changed, non-blank row votes for the shift that explains it.
         let mut votes: HashMap<i64, u32> = HashMap::new();
         for y in rect.y..rect.bottom() {
             let new = self.segment(&self.pixels, y, x0, x1);
-            if new == self.segment(&self.sent, y, x0, x1) || is_uniform(new) {
+            if new == self.segment(&self.sent, y, x0, x1) {
                 continue;
             }
-            for &oy in index.get(&row_hash(new)).into_iter().flatten() {
+            let Some(hash) = row_signature(new) else {
+                continue;
+            };
+            let first = index.partition_point(|&(h, _)| h < hash);
+            // Repeated rows (rulers, borders) match everywhere: a few suffice.
+            let same = index[first..].iter().take_while(|&&(h, _)| h == hash);
+            for &(_, oy) in same.take(4) {
                 if oy != y && self.segment(&self.sent, oy, x0, x1) == new {
                     *votes.entry(oy as i64 - y as i64).or_default() += 1;
                 }
@@ -862,11 +1193,8 @@ impl Display {
         for (start, end) in copies {
             let src = Rect::new(x0, (start as i64 + dy) as u32, x1 - x0, end - start);
             // Only opaque sources replace the destination under source-over.
-            let opaque = (src.y..src.bottom()).all(|y| {
-                self.segment(&self.sent, y, x0, x1)
-                    .chunks_exact(4)
-                    .all(|p| p[3] == 255)
-            });
+            let opaque =
+                (src.y..src.bottom()).all(|y| is_opaque(self.segment(&self.sent, y, x0, x1)));
             if opaque {
                 self.emit_copy(&src, x0, start, out);
                 stats.copies += 1;
@@ -884,16 +1212,6 @@ impl Display {
         let mut open: Vec<(u32, u32, Rect)> = Vec::new();
         let mut merged = Vec::new();
         let (cols, rows) = self.tiles_of(rect);
-        let union = |a: Rect, b: Rect| {
-            let x = a.x.min(b.x);
-            let y = a.y.min(b.y);
-            Rect::new(
-                x,
-                y,
-                a.right().max(b.right()) - x,
-                a.bottom().max(b.bottom()) - y,
-            )
-        };
         for ty in rows {
             let mut runs_here: Vec<(u32, u32, Rect)> = Vec::new();
             for tx in cols.clone() {
@@ -1029,7 +1347,7 @@ impl Display {
             rgba: &data,
         };
         stats.pixels = rect.area();
-        let opaque = data.chunks_exact(4).all(|p| p[3] == 255);
+        let opaque = is_opaque(&data);
         if !opaque {
             // Source-over would blend with what is there: clear first.
             self.emit_fill(&rect, [0, 0, 0, 255], MODE_ROUT, out);
@@ -1360,22 +1678,27 @@ fn copy_rect(buf: &mut [u8], width: u32, src: &Rect, dx: u32, dy: u32) {
 fn copy_rect_over(buf: &mut [u8], width: u32, src: &Rect, dx: u32, dy: u32) {
     let stride = width as usize * 4;
     let row_len = src.w as usize * 4;
-    // Snapshot the source so overlapping copies read the original pixels.
-    let mut snapshot = Vec::with_capacity(row_len * src.h as usize);
-    for y in src.y..src.bottom() {
-        let s = y as usize * stride + src.x as usize * 4;
-        snapshot.extend_from_slice(&buf[s..s + row_len]);
-    }
-    for r in 0..src.h as usize {
+    let mut blended = Vec::new();
+    // Rows are moved in the order that reads every source row before it is
+    // overwritten; within a row `copy_within` handles the overlap.
+    let rows = 0..src.h as usize;
+    let order: Box<dyn Iterator<Item = usize>> = if dy <= src.y {
+        Box::new(rows)
+    } else {
+        Box::new(rows.rev())
+    };
+    for r in order {
+        let s = (src.y as usize + r) * stride + src.x as usize * 4;
         let d = (dy as usize + r) * stride + dx as usize * 4;
-        let source = &snapshot[r * row_len..(r + 1) * row_len];
-        if source.chunks_exact(4).all(|p| p[3] == 255) {
-            buf[d..d + row_len].copy_from_slice(source);
+        if is_opaque(&buf[s..s + row_len]) {
+            buf.copy_within(s..s + row_len, d);
             continue;
         }
+        blended.clear();
+        blended.extend_from_slice(&buf[s..s + row_len]);
         for (dst, s) in buf[d..d + row_len]
             .chunks_exact_mut(4)
-            .zip(source.chunks_exact(4))
+            .zip(blended.chunks_exact(4))
         {
             let a = s[3] as u32;
             if a == 255 {
@@ -1390,5 +1713,7 @@ fn copy_rect_over(buf: &mut [u8], width: u32, src: &Rect, dx: u32, dy: u32) {
     }
 }
 
+#[cfg(test)]
+mod bench;
 #[cfg(test)]
 mod tests;

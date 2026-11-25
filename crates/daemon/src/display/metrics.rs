@@ -30,6 +30,8 @@ pub(super) enum Phase {
     Refine,
 }
 
+const PHASES: usize = 5;
+
 struct ImageMetrics {
     encode: Histogram,
     bytes: Counter,
@@ -78,6 +80,7 @@ impl Timing {
 #[derive(Default)]
 struct Totals {
     flush: Timing,
+    phases: [Timing; PHASES],
     frames: u64,
     frame_bytes: u64,
     ack: Timing,
@@ -93,7 +96,7 @@ pub(super) struct DisplayMetrics {
     protocol: &'static str,
     started: Instant,
     flush: Histogram,
-    phases: [Histogram; 5],
+    phases: [Histogram; PHASES],
     frames: Counter,
     frame_bytes: Histogram,
     client_ack: Histogram,
@@ -157,8 +160,21 @@ impl DisplayMetrics {
         }
     }
 
-    pub(super) fn phase(&self, phase: Phase, elapsed: Duration) {
+    pub(super) fn phase(&mut self, phase: Phase, elapsed: Duration) {
         self.phases[phase as usize].record(elapsed);
+        self.totals.phases[phase as usize].add(elapsed);
+    }
+
+    /// Total time spent in `phase` so far.
+    #[cfg(test)]
+    pub(super) fn phase_total(&self, phase: Phase) -> Duration {
+        self.totals.phases[phase as usize].total
+    }
+
+    /// Images encoded so far as (count, total time).
+    #[cfg(test)]
+    pub(super) fn png_total(&self) -> (u64, Duration) {
+        (self.totals.png.count, self.totals.png.total)
     }
 
     pub(super) fn flushed(&mut self, elapsed: Duration) {
@@ -230,6 +246,9 @@ impl DisplayMetrics {
             encoded_bytes = t.frame_bytes,
             flush_ms_avg = t.flush.avg_ms(),
             flush_ms_max = t.flush.max_ms(),
+            scroll_ms_avg = t.phases[Phase::Scroll as usize].avg_ms(),
+            moves_ms_avg = t.phases[Phase::Moves as usize].avg_ms(),
+            pixels_ms_avg = t.phases[Phase::Pixels as usize].avg_ms(),
             client_ack_ms_avg = t.ack.avg_ms(),
             client_ack_ms_max = t.ack.max_ms(),
             png_images = t.png.count,

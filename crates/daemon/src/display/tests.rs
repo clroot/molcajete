@@ -476,3 +476,84 @@ fn fuzz_client_always_matches_framebuffer() {
         flush_into(&mut d, &mut c);
     }
 }
+
+#[test]
+fn inverse_undoes_the_hash_multiplier() {
+    assert_eq!(HASH_A.wrapping_mul(inverse(HASH_A)), 1);
+    assert_eq!(HASH_B.wrapping_mul(inverse(HASH_B)), 1);
+}
+
+#[test]
+fn far_apart_changes_form_separate_search_areas() {
+    let rects = [
+        Rect::new(0, 0, 64, 64),
+        Rect::new(4000, 2000, 64, 64),
+        Rect::new(128, 0, 64, 64),
+        Rect::new(64, 200, 64, 64),
+    ];
+    let (areas, owner) = cluster(&rects, 4 * TILE);
+    assert_eq!(owner[0], owner[2]);
+    assert_eq!(owner[0], owner[3]);
+    assert_ne!(owner[0], owner[1]);
+    assert_eq!(areas[owner[0]], Rect::new(0, 0, 192, 264));
+    assert_eq!(areas[owner[1]], rects[1]);
+}
+
+#[test]
+fn clusters_joined_by_a_later_rectangle_merge() {
+    let rects = [
+        Rect::new(0, 0, 64, 64),
+        Rect::new(1000, 0, 64, 64),
+        Rect::new(64, 0, 936, 64),
+    ];
+    let (areas, owner) = cluster(&rects, TILE);
+    assert!(owner.iter().all(|&o| o == owner[0]));
+    assert_eq!(areas[owner[0]], Rect::new(0, 0, 1064, 64));
+}
+
+#[test]
+fn row_differences_are_found_at_any_position() {
+    let a: Vec<u8> = (0..1000u32).flat_map(|i| [i as u8, 3, 5, 255]).collect();
+    assert_eq!(first_diff(&a, &a), None);
+    assert_eq!(last_diff(&a, &a), None);
+    for (first, last) in [(0usize, 0usize), (0, 999), (15, 16), (17, 500), (999, 999)] {
+        let mut b = a.clone();
+        // Change a different byte of the pixel each time.
+        b[first * 4 + first % 4] ^= 0x40;
+        b[last * 4 + last % 4] ^= 0x80;
+        assert_eq!(first_diff(&a, &b), Some(first));
+        assert_eq!(last_diff(&a, &b), Some(last));
+    }
+}
+
+#[test]
+fn windows_moved_on_a_large_screen_are_found_by_sampling() {
+    // Larger than `MOVE_FULL_SEARCH` in both directions, so only samples of
+    // the changed area are searched.
+    let (w, h) = (2000u32, 1400u32);
+    let (ww, wh) = (900u32, 700u32);
+    let (mut d, mut c, _) = setup(w, h);
+    let background = [30u8, 60, 90, 255];
+    let window: Vec<u8> = (0..wh)
+        .flat_map(|r| text_row(ww, r as u64 * 7 + 3))
+        .collect();
+    let frame = |wx: u32, wy: u32| -> Vec<u8> {
+        let mut px: Vec<u8> = background.repeat((w * h) as usize);
+        for r in 0..wh {
+            let d = (((wy + r) * w + wx) * 4) as usize;
+            let s = (r * ww * 4) as usize;
+            px[d..d + (ww * 4) as usize].copy_from_slice(&window[s..s + (ww * 4) as usize]);
+        }
+        px
+    };
+    d.put(0, 0, w, h, &frame(300, 200));
+    flush_into(&mut d, &mut c);
+    d.put(0, 0, w, h, &frame(337, 223));
+    let (stats, _) = flush_into(&mut d, &mut c);
+    assert!(stats.copies >= 1, "copies: {}", stats.copies);
+    assert!(
+        stats.pixels < (ww * wh) as u64 / 4,
+        "pixels: {}",
+        stats.pixels
+    );
+}
