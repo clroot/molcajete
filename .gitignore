@@ -5,3 +5,5 @@
 .DS_Store
 /gateway.toml
 node_modules/
+/deploy/gateway.local.toml
+.idea

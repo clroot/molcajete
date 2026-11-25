@@ -110,7 +110,8 @@ pub async fn run(
     let mut display = Display::new(
         ImageFormats::from_mimetypes(&info.image),
         params.bool("force-lossless"),
-    );
+    )
+    .with_protocol("vnc");
     session::enable_video(&mut display, &info);
     session::send_name(writer.buffer(), &server.name);
     display.resize(server.width as u32, server.height as u32, writer.buffer());

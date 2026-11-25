@@ -1,0 +1,103 @@
+// Grafana Alloy: scrape molcajete's metrics (Prometheus) and continuous CPU
+// profiles (Pyroscope) from the pods of deploy/k8s. Logs need nothing extra:
+// both processes write JSON to stdout, which the cluster's pod log pipeline
+// already ships to Loki.
+//
+// Reuses `discovery.kubernetes "pods"` from the existing Alloy config; set
+// the two write endpoints to your Prometheus (remote-write receiver enabled)
+// and Pyroscope.
+
+discovery.relabel "molcajete_telemetry" {
+  targets = discovery.kubernetes.pods.targets
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+    regex         = "molcajete"
+    action        = "keep"
+  }
+
+  // One target per container: the port named `telemetry`.
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_port_name"]
+    regex         = "telemetry"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "container"
+  }
+
+  // Pyroscope groups profiles by `service_name`: molcajete/gateway,
+  // molcajete/molcajeted.
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "service_name"
+    replacement   = "molcajete/$1"
+  }
+}
+
+prometheus.scrape "molcajete" {
+  targets         = discovery.relabel.molcajete_telemetry.output
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://prometheus.observability.svc.cluster.local:9090/api/v1/write"
+  }
+}
+
+// CPU profiles: Alloy asks /debug/pprof/profile?seconds=<interval - 1> and
+// pushes each profile to Pyroscope.
+pyroscope.scrape "molcajete" {
+  targets         = discovery.relabel.molcajete_telemetry.output
+  scrape_interval = "15s"
+  forward_to      = [pyroscope.write.default.receiver]
+
+  profiling_config {
+    profile.process_cpu {
+      enabled = true
+      path    = "/debug/pprof/profile"
+      delta   = true
+    }
+
+    // Only CPU profiles are served; turn off the Go-specific defaults.
+    profile.memory {
+      enabled = false
+    }
+
+    profile.goroutine {
+      enabled = false
+    }
+
+    profile.block {
+      enabled = false
+    }
+
+    profile.mutex {
+      enabled = false
+    }
+
+    profile.fgprof {
+      enabled = false
+    }
+  }
+}
+
+pyroscope.write "default" {
+  endpoint {
+    url = "http://pyroscope.observability.svc.cluster.local:4040"
+  }
+}

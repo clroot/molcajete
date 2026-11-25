@@ -1,0 +1,6 @@
+.git
+target
+web/pkg
+tests/browser/node_modules
+gateway.toml
+**/.DS_Store

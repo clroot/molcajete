@@ -1,0 +1,129 @@
+# Gateway and molcajeted share one pod: the gateway reaches the daemon on
+# 127.0.0.1:4822 and nothing but the gateway's HTTP port leaves the pod
+# through the Service. Both expose a port named `telemetry` (metrics, pprof)
+# that Grafana Alloy scrapes inside the cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: molcajete
+  labels:
+    app.kubernetes.io/name: molcajete
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: molcajete
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: molcajete
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: gateway
+          image: localhost:30500/molcajete-gateway:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MOLCAJETE_LOG_FORMAT
+              value: json
+            - name: MOLCAJETE_TELEMETRY_LISTEN
+              value: 0.0.0.0:9100
+            - name: MOLCAJETE_PROFILING
+              value: "true"
+            - name: MOLCAJETE_CLIENT_REPORTS
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: telemetry
+              containerPort: 9100
+          volumeMounts:
+            - name: config
+              mountPath: /etc/molcajete
+              readOnly: true
+            # The CPU profiler (--profiling) buffers samples in a temp file.
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              # With --profiling, symbolizing a profile loads the binary's
+              # line tables (~150Mi resident); without it the gateway needs
+              # only a few Mi.
+              memory: 512Mi
+
+        - name: molcajeted
+          image: localhost:30500/molcajeted:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MOLCAJETED_BIND_HOST
+              value: 127.0.0.1
+            - name: MOLCAJETE_LOG_FORMAT
+              value: json
+            - name: MOLCAJETE_TELEMETRY_LISTEN
+              value: 0.0.0.0:9101
+            - name: MOLCAJETE_PROFILING
+              value: "true"
+          ports:
+            - name: telemetry
+              containerPort: 9101
+          volumeMounts:
+            # ffmpeg (video encoders) and the CPU profiler write temporary files.
+            - name: tmp
+              mountPath: /tmp
+          # 4822 listens on 127.0.0.1 only (the Guacamole protocol has no
+          # authentication), so the kubelet cannot reach it; probe the
+          # telemetry listener instead.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: telemetry
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # Image diffing/encoding and software video encoders are the
+              # CPU-heavy part; raise this if profiles show throttling.
+              cpu: "4"
+              memory: 2Gi
+      volumes:
+        - name: config
+          secret:
+            secretName: molcajete-config
+        # Disk-backed: a memory-backed emptyDir would count against the
+        # containers' memory limits.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi

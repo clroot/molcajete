@@ -5,6 +5,7 @@ members = [
     "crates/client",
     "crates/gateway",
     "crates/daemon",
+    "crates/telemetry",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 molcajete-protocol = { path = "crates/protocol" }
+molcajete-telemetry = { path = "crates/telemetry" }
 
 anyhow = "1"
 base64 = "0.22"
@@ -34,3 +36,9 @@ inherits = "release"
 opt-level = "s"
 lto = "fat"
 panic = "abort"
+
+# Release build with line tables, so CPU profiles (pprof / Pyroscope) resolve
+# inlined frames to source lines. Used by the Docker images.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

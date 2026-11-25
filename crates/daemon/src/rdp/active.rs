@@ -120,7 +120,8 @@ impl<'a> Session<'a> {
                 let mut display = Display::new(
                     ImageFormats::from_mimetypes(&info.image),
                     settings.force_lossless,
-                );
+                )
+                .with_protocol("rdp");
                 session::enable_video(&mut display, info);
                 display
             },

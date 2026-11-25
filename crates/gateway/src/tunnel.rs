@@ -12,15 +12,16 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
 use futures_util::{SinkExt, StreamExt};
+use metrics::{Counter, counter, gauge, histogram};
 use molcajete_protocol::{InstructionBuilder, Limits, Parser, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -37,6 +38,12 @@ const READ_BUFFER_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Default)]
 pub struct TunnelRequest {
     pub connection: Option<String>,
+    /// Opaque id chosen by the browser page (`session=`), used to correlate
+    /// the tunnel with the client's performance reports.
+    pub session: Option<String>,
+    /// Address of the browser, as seen by the gateway or reported by a
+    /// trusted reverse proxy (`X-Forwarded-For`).
+    pub peer: Option<String>,
     pub info: ClientInfo,
 }
 
@@ -50,6 +57,7 @@ impl TunnelRequest {
             let value = value.into_owned();
             match key.as_ref() {
                 "connection" | "id" | "GUAC_ID" => req.connection = Some(value),
+                "session" => req.session = Some(value.chars().take(64).collect()),
                 "width" | "GUAC_WIDTH" => {
                     if let Ok(v) = value.parse() {
                         req.info.width = clamp_dimension(v);
@@ -93,16 +101,41 @@ fn close_message(status: Status) -> Message {
 }
 
 /// Entry point after the WebSocket upgrade.
-pub async fn serve(mut socket: WebSocket, state: Arc<AppState>, request: TunnelRequest) {
+pub async fn serve(socket: WebSocket, state: Arc<AppState>, request: TunnelRequest) {
+    let tunnel_id = Uuid::new_v4();
+    let span = info_span!(
+        "tunnel",
+        %tunnel_id,
+        connection = request.connection.as_deref().unwrap_or(""),
+        session = request.session.as_deref().unwrap_or(""),
+        peer = request.peer.as_deref().unwrap_or(""),
+    );
+    serve_tunnel(socket, state, request, tunnel_id)
+        .instrument(span)
+        .await;
+}
+
+async fn serve_tunnel(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    request: TunnelRequest,
+    tunnel_id: Uuid,
+) {
     let Some(connection) = request
         .connection
         .as_deref()
         .and_then(|id| state.config.connection(id))
     else {
         warn!(connection = ?request.connection, "tunnel requested for unknown connection");
+        counter!("molcajete_gateway_tunnels_rejected_total", "reason" => "unknown_connection")
+            .increment(1);
         let _ = socket.send(close_message(Status::RESOURCE_NOT_FOUND)).await;
         return;
     };
+    let labels = [
+        ("connection", connection.id.clone()),
+        ("protocol", connection.protocol.clone()),
+    ];
 
     let guacd_cfg = connection.guacd.as_ref().unwrap_or(&state.config.guacd);
     let parameters: &BTreeMap<String, String> = &connection.parameters;
@@ -114,6 +147,7 @@ pub async fn serve(mut socket: WebSocket, state: Arc<AppState>, request: TunnelR
         "opening tunnel"
     );
 
+    let handshake_started = Instant::now();
     let session = match guacd::connect(
         (guacd_cfg.host.as_str(), guacd_cfg.port),
         &connection.protocol,
@@ -125,21 +159,82 @@ pub async fn serve(mut socket: WebSocket, state: Arc<AppState>, request: TunnelR
     {
         Ok(session) => session,
         Err(err) => {
-            warn!(connection = %connection.id, error = %err, "guacd handshake failed");
+            warn!(error = %err, "guacd handshake failed");
+            counter!("molcajete_gateway_handshake_failures_total", &labels).increment(1);
             let _ = socket.send(close_message(err.status())).await;
             return;
         }
     };
+    let handshake = handshake_started.elapsed();
+    histogram!("molcajete_gateway_handshake_seconds", &labels).record(handshake);
 
-    let tunnel_id = Uuid::new_v4();
-    info!(connection = %connection.id, guacd_id = %session.id, version = %session.version, %tunnel_id, "tunnel established");
-    let status = relay(socket, session, tunnel_id).await;
-    info!(connection = %connection.id, %tunnel_id, %status, "tunnel closed");
+    info!(
+        guacd_id = %session.id,
+        version = %session.version,
+        handshake_ms = handshake.as_millis() as u64,
+        "tunnel established"
+    );
+    let active = gauge!("molcajete_gateway_tunnels_active", &labels);
+    active.increment(1.0);
+    let started = Instant::now();
+    let counters = RelayCounters {
+        to_browser: counter!(
+            "molcajete_gateway_relayed_bytes_total",
+            &with(&labels, "direction", "to_browser")
+        ),
+        to_guacd: counter!(
+            "molcajete_gateway_relayed_bytes_total",
+            &with(&labels, "direction", "to_guacd")
+        ),
+    };
+    let stats = relay(socket, session, tunnel_id, &counters).await;
+    active.decrement(1.0);
+    let duration = started.elapsed();
+    histogram!("molcajete_gateway_tunnel_duration_seconds", &labels).record(duration);
+    counter!(
+        "molcajete_gateway_tunnels_total",
+        &with(&labels, "status", stats.status.code().to_string())
+    )
+    .increment(1);
+    info!(
+        status = %stats.status,
+        duration_s = duration.as_secs_f64(),
+        bytes_to_browser = stats.to_browser,
+        bytes_to_guacd = stats.to_guacd,
+        "tunnel closed"
+    );
 }
 
-/// Pumps data in both directions until either side terminates. Returns the
-/// status that was reported to the browser.
-pub async fn relay(socket: WebSocket, session: GuacdSession, tunnel_id: Uuid) -> Status {
+fn with(
+    labels: &[(&'static str, String); 2],
+    key: &'static str,
+    value: impl Into<String>,
+) -> [(&'static str, String); 3] {
+    [labels[0].clone(), labels[1].clone(), (key, value.into())]
+}
+
+/// Byte counters of one tunnel (no-ops when metrics are disabled).
+pub struct RelayCounters {
+    pub to_browser: Counter,
+    pub to_guacd: Counter,
+}
+
+/// Outcome of [`relay`].
+#[derive(Debug, Clone, Copy)]
+pub struct RelayStats {
+    /// Status reported to the browser.
+    pub status: Status,
+    pub to_browser: u64,
+    pub to_guacd: u64,
+}
+
+/// Pumps data in both directions until either side terminates.
+pub async fn relay(
+    socket: WebSocket,
+    session: GuacdSession,
+    tunnel_id: Uuid,
+    counters: &RelayCounters,
+) -> RelayStats {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
 
@@ -161,25 +256,33 @@ pub async fn relay(socket: WebSocket, session: GuacdSession, tunnel_id: Uuid) ->
     let uuid = InstructionBuilder::new("")
         .str_arg(&tunnel_id.to_string())
         .finish();
+    let mut to_browser = 0u64;
+    let mut to_guacd = 0u64;
     let status = if out_tx.send(Message::Text(uuid.into())).await.is_err() {
         Status::SUCCESS
     } else {
         tokio::select! {
-            status = guacd_to_browser(guacd_rd, parser, &out_tx) => status,
-            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx) => status,
+            status = guacd_to_browser(guacd_rd, parser, &out_tx, &counters.to_browser, &mut to_browser) => status,
+            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &mut to_guacd) => status,
         }
     };
 
     let _ = out_tx.send(close_message(status)).await;
     drop(out_tx);
     let _ = writer.await;
-    status
+    RelayStats {
+        status,
+        to_browser,
+        to_guacd,
+    }
 }
 
 async fn guacd_to_browser(
     mut rd: OwnedReadHalf,
     mut parser: Parser,
     out: &mpsc::Sender<Message>,
+    counter: &Counter,
+    total: &mut u64,
 ) -> Status {
     let mut buf = vec![0u8; READ_BUFFER_BYTES];
     let mut message = String::with_capacity(MAX_MESSAGE_BYTES);
@@ -218,7 +321,11 @@ async fn guacd_to_browser(
                 debug!("guacd closed the connection");
                 return Status::SUCCESS;
             }
-            Ok(n) => parser.feed(&buf[..n]),
+            Ok(n) => {
+                counter.increment(n as u64);
+                *total += n as u64;
+                parser.feed(&buf[..n]);
+            }
             Err(err) => {
                 debug!(error = %err, "guacd read failed");
                 return Status::UPSTREAM_ERROR;
@@ -231,6 +338,8 @@ async fn browser_to_guacd(
     ws_rx: &mut futures_util::stream::SplitStream<WebSocket>,
     mut wr: OwnedWriteHalf,
     out: &mpsc::Sender<Message>,
+    counter: &Counter,
+    total: &mut u64,
 ) -> Status {
     let mut parser = Parser::with_limits(Limits::STRICT);
     let mut forward = Vec::with_capacity(4096);
@@ -268,8 +377,12 @@ async fn browser_to_guacd(
                 }
             }
         }
-        if !forward.is_empty() && wr.write_all(&forward).await.is_err() {
-            return Status::UPSTREAM_ERROR;
+        if !forward.is_empty() {
+            if wr.write_all(&forward).await.is_err() {
+                return Status::UPSTREAM_ERROR;
+            }
+            counter.increment(forward.len() as u64);
+            *total += forward.len() as u64;
         }
     }
     Status::SUCCESS

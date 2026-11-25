@@ -4,19 +4,21 @@
 //! client, exposes the configured connections and tunnels the Guacamole
 //! protocol between the browser (WebSocket) and guacd (TCP).
 
+mod client_report;
 mod config;
 mod guacd;
 mod tunnel;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{RawQuery, Request, State, WebSocketUpgrade};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, RawQuery, Request, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use base64::Engine;
 use clap::Parser as _;
 use serde::Serialize;
@@ -31,12 +33,30 @@ use crate::config::Config;
 #[command(version, about)]
 struct Cli {
     /// Path to the TOML configuration file.
-    #[arg(short, long, default_value = "gateway.toml")]
+    #[arg(short, long, env = "MOLCAJETE_CONFIG", default_value = "gateway.toml")]
     config: PathBuf,
+    /// Overrides `server.listen` from the configuration file.
+    #[arg(long, env = "MOLCAJETE_LISTEN")]
+    listen: Option<SocketAddr>,
+    /// Overrides `server.static_dir` from the configuration file.
+    #[arg(long, env = "MOLCAJETE_STATIC_DIR")]
+    static_dir: Option<PathBuf>,
+    /// Accept performance reports from the browser client
+    /// (`POST /api/telemetry/client`), logged and recorded as metrics.
+    #[arg(long, env = "MOLCAJETE_CLIENT_REPORTS")]
+    client_reports: bool,
+    #[command(flatten)]
+    telemetry: molcajete_telemetry::TelemetryArgs,
 }
 
 pub struct AppState {
     pub config: Config,
+    pub client_reports: bool,
+}
+
+/// Lets the page know which optional features are on.
+async fn client_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    axum::Json(serde_json::json!({ "clientReports": state.client_reports }))
 }
 
 #[derive(Serialize)]
@@ -62,10 +82,13 @@ async fn list_connections(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
 async fn websocket_tunnel(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     RawQuery(query): RawQuery,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let request = tunnel::TunnelRequest::from_query(query.as_deref().unwrap_or(""));
+    let mut request = tunnel::TunnelRequest::from_query(query.as_deref().unwrap_or(""));
+    request.peer = Some(client_address(&headers, peer));
     ws.protocols(["guacamole"])
         .max_message_size(1 << 20)
         .on_upgrade(move |socket| tunnel::serve(socket, state, request))
@@ -102,6 +125,29 @@ async fn basic_auth(State(state): State<Arc<AppState>>, request: Request, next: 
     }
 }
 
+/// The browser's address as reported by a reverse proxy, otherwise the TCP
+/// peer. Only used for logs.
+///
+/// `X-Real-IP` (set by the edge proxy) wins over `X-Forwarded-For`: proxies
+/// in between, such as the Tailscale ingress, replace `X-Forwarded-For` with
+/// their own peer address but pass `X-Real-IP` through.
+fn client_address(headers: &HeaderMap, peer: SocketAddr) -> String {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    header("x-real-ip")
+        .or_else(|| header("x-forwarded-for"))
+        .map_or_else(
+            || peer.ip().to_string(),
+            |v| format!("{v} (via {})", peer.ip()),
+        )
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -115,6 +161,11 @@ fn router(state: Arc<AppState>) -> Router {
 
     let mut app = Router::new()
         .route("/api/connections", get(list_connections))
+        .route("/api/settings", get(client_settings))
+        .route(
+            "/api/telemetry/client",
+            post(client_report::receive).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/websocket-tunnel", get(websocket_tunnel))
         .fallback_service(static_files)
         // The wasm bundle changes on every build; avoid stale caches.
@@ -127,20 +178,26 @@ fn router(state: Arc<AppState>) -> Router {
         app = app.layer(middleware::from_fn_with_state(state.clone(), basic_auth));
     }
 
-    app.layer(TraceLayer::new_for_http()).with_state(state)
+    // Liveness for Docker / Kubernetes probes. Added after the
+    // authentication layer, which therefore does not apply to it.
+    app.route("/healthz", get(|| async { "ok" }))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tower_http=warn".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
+    molcajete_telemetry::init_logging(cli.telemetry.log_format, "info,tower_http=warn,pprof=warn");
+    molcajete_telemetry::start(&cli.telemetry, "gateway").await?;
+
+    let mut config = Config::load(&cli.config)?;
+    if let Some(listen) = cli.listen {
+        config.server.listen = listen;
+    }
+    if let Some(dir) = cli.static_dir {
+        config.server.static_dir = dir;
+    }
     let listen = config.server.listen;
 
     if config.users.is_empty() && !listen.ip().is_loopback() {
@@ -150,14 +207,78 @@ async fn main() -> anyhow::Result<()> {
         warn!(dir = %config.server.static_dir.display(), "static_dir has no index.html");
     }
 
-    let state = Arc::new(AppState { config });
+    let state = Arc::new(AppState {
+        config,
+        client_reports: cli.client_reports,
+    });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!(%listen, connections = state.config.connections.len(), "gateway listening");
 
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(molcajete_telemetry::shutdown_signal())
+    .await?;
+    info!("gateway stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    use super::*;
+
+    fn app(users: &str) -> Router {
+        let dir = std::env::temp_dir().join(format!("molcajete-web-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<!doctype html>").unwrap();
+        let toml = format!(
+            "[server]\nstatic_dir = {:?}\n{users}",
+            dir.display().to_string()
+        );
+        let config: Config = ::toml::from_str(&toml).unwrap();
+        router(Arc::new(AppState {
+            config,
+            client_reports: false,
+        }))
+    }
+
+    async fn status(app: &Router, path: &str) -> StatusCode {
+        let request = Request::get(path).body(Body::empty()).unwrap();
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn serves_static_files_and_health() {
+        let app = app("");
+        assert_eq!(status(&app, "/").await, StatusCode::OK);
+        assert_eq!(status(&app, "/healthz").await, StatusCode::OK);
+        assert_eq!(status(&app, "/api/settings").await, StatusCode::OK);
+    }
+
+    #[test]
+    fn client_address_prefers_the_edge_proxy_header() {
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_address(&headers, peer), "10.0.0.2");
+        headers.insert("x-forwarded-for", "100.96.0.1, 10.0.0.1".parse().unwrap());
+        assert_eq!(client_address(&headers, peer), "100.96.0.1 (via 10.0.0.2)");
+        headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(client_address(&headers, peer), "203.0.113.7 (via 10.0.0.2)");
+    }
+
+    #[tokio::test]
+    async fn health_skips_authentication() {
+        let app = app("[[users]]\nusername = \"a\"\npassword = \"b\"\n");
+        assert_eq!(status(&app, "/").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status(&app, "/api/connections").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(status(&app, "/healthz").await, StatusCode::OK);
+    }
 }

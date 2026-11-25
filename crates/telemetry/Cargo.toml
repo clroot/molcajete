@@ -1,0 +1,27 @@
+[package]
+name = "molcajete-telemetry"
+description = "Logging, Prometheus metrics and pprof CPU profiling shared by the molcajete gateway and daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["profiling"]
+# `/debug/pprof/profile` and `/debug/pprof/flamegraph` (pprof-rs, SIGPROF sampling).
+profiling = ["dep:pprof"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+clap = { version = "4", features = ["derive", "env"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+tokio = { version = "1", features = ["net", "rt", "signal", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+pprof = { version = "0.15", optional = true, default-features = false, features = ["prost-codec", "flamegraph"] }

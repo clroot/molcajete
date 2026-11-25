@@ -1,0 +1,38 @@
+# Gateway configuration for the container deployment (deploy/compose.yml,
+# deploy/k8s). It holds passwords: keep the real file out of git (mount it,
+# or store it as a Kubernetes Secret / SealedSecret).
+#
+# `server.listen` and `server.static_dir` are set by the image
+# (MOLCAJETE_LISTEN, MOLCAJETE_STATIC_DIR) and need not be repeated here.
+
+# molcajeted runs next to the gateway: a separate compose service, or a
+# second container in the same Kubernetes pod (then use host = "127.0.0.1").
+[guacd]
+host = "molcajeted"
+port = 4822
+
+# Required as soon as the gateway is reachable from outside (reverse proxy).
+[[users]]
+username = "admin"
+password = "change-me"
+
+[[connections]]
+id = "desktop"
+name = "Desktop (VNC)"
+protocol = "vnc"
+[connections.parameters]
+hostname = "192.168.0.10"
+port = "5900"
+password = "change-me"
+
+# [[connections]]
+# id = "windows"
+# name = "Windows (RDP)"
+# protocol = "rdp"
+# [connections.parameters]
+# hostname = "192.168.0.20"
+# port = "3389"
+# username = "user"
+# password = "change-me"
+# security = "any"
+# ignore-cert = "true"

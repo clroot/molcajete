@@ -18,6 +18,7 @@
 //! next comparison and gets sent as pixels.
 
 pub mod encode;
+mod metrics;
 mod video;
 
 use std::collections::{HashMap, VecDeque};
@@ -27,6 +28,7 @@ use base64::Engine;
 use molcajete_protocol::InstructionBuilder;
 
 use encode::Region;
+use metrics::{DisplayMetrics, ImageKind, Phase, timed};
 
 /// Largest raw chunk carried by one `blob` (same as libguac).
 const BLOB_MAX_BYTES: usize = 6048;
@@ -185,6 +187,13 @@ pub struct Display {
     video_support: Option<video::VideoSupport>,
     /// The video stream currently covering a busy area.
     video: Option<video::ActiveVideo>,
+    metrics: DisplayMetrics,
+}
+
+impl Drop for Display {
+    fn drop(&mut self) {
+        self.metrics.summary();
+    }
 }
 
 fn now_ms() -> i64 {
@@ -274,7 +283,26 @@ impl Display {
             last_cursor: None,
             video_support: None,
             video: None,
+            metrics: DisplayMetrics::disabled(),
         }
+    }
+
+    /// Labels this display's metrics with the remote desktop protocol.
+    pub fn with_protocol(mut self, protocol: &'static str) -> Self {
+        self.metrics = DisplayMetrics::new(protocol);
+        self
+    }
+
+    /// Encodes `region` (timed), returning the bytes.
+    fn encode_image(&mut self, kind: ImageKind, region: &Region) -> Option<Vec<u8>> {
+        let (bytes, elapsed) = timed(|| match kind {
+            ImageKind::Png => encode::encode_png(region).ok(),
+            ImageKind::Jpeg => encode::encode_jpeg(region, 80).ok(),
+        });
+        let bytes = bytes?;
+        let pixels = region.width as u64 * region.height as u64;
+        self.metrics.image(kind, elapsed, bytes.len(), pixels);
+        Some(bytes)
     }
 
     pub fn width(&self) -> u32 {
@@ -449,11 +477,19 @@ impl Display {
 
     /// Sends everything that differs between the framebuffer and the client.
     pub fn flush(&mut self, out: &mut String) -> FlushStats {
+        let started = Instant::now();
         let mut stats = FlushStats::default();
         self.decay();
-        self.last_flush = Instant::now();
+        self.last_flush = started;
         // Busy areas may be covered by a video stream instead of images.
         stats.add(self.update_video(out));
+        let mut mark = Instant::now();
+        self.metrics.phase(Phase::Video, mark - started);
+        let mut phase_done = |metrics: &DisplayMetrics, phase: Phase| {
+            let now = Instant::now();
+            metrics.phase(phase, now - mark);
+            mark = now;
+        };
         let regions = self.dirty_regions();
         self.dirty.iter_mut().for_each(|d| *d = false);
         let mut sent_tiles = vec![false; self.dirty.len()];
@@ -467,8 +503,10 @@ impl Display {
                 stats.add(self.detect_scroll(&changed, out));
             }
         }
+        phase_done(&self.metrics, Phase::Scroll);
         // 2. Blocks that moved anywhere (dragged windows, panning).
         stats.add(self.detect_moves(&regions, out));
+        phase_done(&self.metrics, Phase::Moves);
         // 3. Whatever still differs is sent as pixels.
         for region in regions {
             if let Some(changed) = self.diff_bounds(&region) {
@@ -488,8 +526,11 @@ impl Display {
                 *motion += 1.0;
             }
         }
+        phase_done(&self.metrics, Phase::Pixels);
         stats.add(self.refine_lossy(out));
+        phase_done(&self.metrics, Phase::Refine);
         self.frame_bytes += stats.bytes;
+        self.metrics.flushed(started.elapsed());
         stats
     }
 
@@ -947,7 +988,7 @@ impl Display {
                     height: tile.h,
                     rgba: &data,
                 };
-                if let Ok(bytes) = encode::encode_png(&region) {
+                if let Some(bytes) = self.encode_image(ImageKind::Png, &region) {
                     stats.images += 1;
                     stats.bytes += bytes.len();
                     stats.pixels += tile.area();
@@ -1011,15 +1052,13 @@ impl Display {
             && self.average_heat(&rect) >= HOT
             && encode::color_complexity(&region) > 256;
         let encoded = if lossy {
-            encode::encode_jpeg(&region, 80)
-                .ok()
+            self.encode_image(ImageKind::Jpeg, &region)
                 .map(|b| ("image/jpeg", b, true))
         } else {
             None
         };
         let Some((mimetype, bytes, is_lossy)) = encoded.or_else(|| {
-            encode::encode_png(&region)
-                .ok()
+            self.encode_image(ImageKind::Png, &region)
                 .map(|b| ("image/png", b, false))
         }) else {
             return stats;
@@ -1198,6 +1237,8 @@ impl Display {
         self.pending_syncs.push_back((ts, now));
         self.last_frame = Some(now);
         self.last_frame_bytes = std::mem::take(&mut self.frame_bytes);
+        self.metrics
+            .frame(self.last_frame_bytes, self.pending_syncs.len());
         *out += &InstructionBuilder::new("sync").arg(ts).arg(1).finish();
     }
 
@@ -1209,7 +1250,9 @@ impl Display {
             }
             self.pending_syncs.pop_front();
             if ts == timestamp {
-                let sample = sent_at.elapsed().min(MAX_LAG_COMPENSATION);
+                let elapsed = sent_at.elapsed();
+                self.metrics.acked(elapsed);
+                let sample = elapsed.min(MAX_LAG_COMPENSATION);
                 self.lag = (self.lag * 3 + sample) / 4;
             }
         }

@@ -1,0 +1,44 @@
+# molcajete on a single Docker host: web gateway + molcajeted.
+#
+#   cp deploy/gateway.toml deploy/gateway.local.toml   # edit connections/users
+#   docker compose -f deploy/compose.yml up -d --build
+#   open http://127.0.0.1:8080
+#
+# Telemetry (metrics, pprof) listens on its own ports, published on loopback
+# only; logs are JSON on stdout (`docker compose logs`).
+name: molcajete
+
+x-telemetry: &telemetry
+  MOLCAJETE_LOG_FORMAT: json
+  MOLCAJETE_TELEMETRY_LISTEN: 0.0.0.0:9100
+  MOLCAJETE_PROFILING: "true"
+  RUST_LOG: info,tower_http=warn,pprof=warn
+
+services:
+  gateway:
+    build:
+      context: ..
+      target: gateway
+    image: molcajete-gateway:local
+    environment:
+      <<: *telemetry
+      MOLCAJETE_CLIENT_REPORTS: "true"
+    volumes:
+      - ./gateway.local.toml:/etc/molcajete/gateway.toml:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9100:9100"
+    depends_on:
+      - molcajeted
+    restart: unless-stopped
+
+  molcajeted:
+    build:
+      context: ..
+      target: daemon
+    image: molcajeted:local
+    environment:
+      <<: *telemetry
+    ports:
+      - "127.0.0.1:9101:9100"
+    restart: unless-stopped

@@ -1,6 +1,7 @@
 // Minimal UI shell around the wasm client: connection list, session view,
 // side menu (Ctrl+Alt+Shift), clipboard and credential prompts.
 import { MolcajeteSession } from "./molcajete.js";
+import { SessionReporter, clientReportsEnabled } from "./client-report.js";
 
 // `?main` runs the client on the main thread instead of a worker.
 const forceMainThread = new URLSearchParams(location.search).has("main");
@@ -10,6 +11,7 @@ const $ = (id) => document.getElementById(id);
 const views = { home: $("home"), session: $("session") };
 let client = null;
 let currentConnection = null;
+let reporter = null;
 let connectionNames = new Map();
 
 function show(view) {
@@ -133,6 +135,7 @@ function handleEvent(type, detail) {
       document.body.classList.toggle("unstable", detail);
       break;
     case "stats":
+      reporter?.add(detail);
       if (!$("stats").hidden) $("stats").textContent = formatStats(detail);
       break;
   }
@@ -149,10 +152,16 @@ async function startSession(id) {
     client.set_scale_mode($("scale-mode").value);
   }
   setOverlay({ title: "Connecting…", busy: true });
-  client.connect(client.tunnel_url(tunnelBase(), id));
+  reporter?.stop();
+  reporter = (await clientReportsEnabled()) ? new SessionReporter(id, client.mode) : null;
+  let url = client.tunnel_url(tunnelBase(), id);
+  if (reporter) url += `&session=${encodeURIComponent(reporter.session)}`;
+  client.connect(url);
 }
 
 function endSession() {
+  reporter?.stop();
+  reporter = null;
   client?.disconnect();
   currentConnection = null;
   document.title = "molcajete";
@@ -196,5 +205,6 @@ $("disconnect").addEventListener("click", () => (location.hash = ""));
 $("overlay-home").addEventListener("click", () => (location.hash = ""));
 $("overlay-reconnect").addEventListener("click", () => currentConnection && startSession(currentConnection));
 window.addEventListener("hashchange", route);
+window.addEventListener("pagehide", () => reporter?.flush({ beacon: true }));
 
 route();

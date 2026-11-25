@@ -19,11 +19,12 @@ mod vnc;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::Parser as _;
 use molcajete_protocol::{InstructionBuilder, Status};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn};
+use tracing::{Instrument as _, info, info_span, warn};
 
 use crate::io::{GuacReader, GuacWriter};
 
@@ -31,20 +32,37 @@ use crate::io::{GuacReader, GuacWriter};
 #[command(version, about)]
 struct Cli {
     /// Address to listen on.
-    #[arg(short = 'b', long, default_value = "127.0.0.1")]
+    #[arg(
+        short = 'b',
+        long,
+        env = "MOLCAJETED_BIND_HOST",
+        default_value = "127.0.0.1"
+    )]
     bind_host: String,
     /// Port to listen on.
-    #[arg(short = 'l', long, default_value_t = 4822)]
+    #[arg(
+        short = 'l',
+        long,
+        env = "MOLCAJETED_BIND_PORT",
+        default_value_t = 4822
+    )]
     bind_port: u16,
     /// ffmpeg binary used for additional video encoders (default: `ffmpeg`
     /// from PATH, if present).
-    #[arg(long)]
+    #[arg(long, env = "MOLCAJETED_FFMPEG")]
     ffmpeg: Option<PathBuf>,
     /// Video codecs that may be used for busy screen areas, most preferred
     /// first among those the client supports: any of `av1`, `h265`, `h264`,
     /// or `none` to always send images.
-    #[arg(long, value_delimiter = ',', default_value = "av1,h265,h264")]
+    #[arg(
+        long,
+        env = "MOLCAJETED_VIDEO",
+        value_delimiter = ',',
+        default_value = "av1,h265,h264"
+    )]
     video: Vec<String>,
+    #[command(flatten)]
+    telemetry: molcajete_telemetry::TelemetryArgs,
 }
 
 /// Sends an `error` instruction and flushes.
@@ -58,6 +76,16 @@ pub async fn send_error(writer: &mut GuacWriter, message: &str, status: Status) 
     let _ = writer.flush().await;
 }
 
+/// Counts a finished (or refused) connection.
+fn connection_done(protocol: &'static str, result: &'static str) {
+    metrics::counter!(
+        "molcajeted_connections_total",
+        "protocol" => protocol,
+        "result" => result,
+    )
+    .increment(1);
+}
+
 async fn handle(stream: TcpStream, peer: SocketAddr) {
     let _ = stream.set_nodelay(true);
     let (rd, wr) = stream.into_split();
@@ -68,6 +96,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr) {
         Ok(s) => s,
         Err(err) => {
             warn!(%peer, error = %err, "handshake failed");
+            connection_done("unknown", "handshake_failed");
             return;
         }
     };
@@ -83,12 +112,13 @@ async fn handle(stream: TcpStream, peer: SocketAddr) {
     }
 
     let connection_id = format!("${}", uuid::Uuid::new_v4());
-    let args = match selected.as_str() {
-        "vnc" => vnc::ARGS,
-        "ssh" => ssh::ARGS,
-        "rdp" => rdp::ARGS,
+    let (protocol, args) = match selected.as_str() {
+        "vnc" => ("vnc", vnc::ARGS),
+        "ssh" => ("ssh", ssh::ARGS),
+        "rdp" => ("rdp", rdp::ARGS),
         other => {
             warn!(%peer, protocol = other, "unsupported protocol requested");
+            connection_done("unknown", "unsupported");
             send_error(
                 &mut writer,
                 &format!("Protocol \"{other}\" is not supported"),
@@ -98,42 +128,67 @@ async fn handle(stream: TcpStream, peer: SocketAddr) {
             return;
         }
     };
+    // Everything logged for this connection carries its id, which the
+    // gateway logs as `guacd_id`.
+    let span = info_span!("connection", id = %connection_id, protocol, %peer);
+    session(reader, writer, protocol, args, connection_id)
+        .instrument(span)
+        .await;
+}
+
+async fn session(
+    mut reader: GuacReader,
+    mut writer: GuacWriter,
+    protocol: &'static str,
+    args: &[&str],
+    connection_id: String,
+) {
+    writer.record_metrics(protocol);
     let (info, params) =
         match handshake::negotiate(&mut reader, &mut writer, args, &connection_id).await {
             Ok(v) => v,
             Err(err) => {
-                warn!(%peer, error = %err, "handshake failed");
+                warn!(error = %err, "handshake failed");
+                connection_done(protocol, "handshake_failed");
                 return;
             }
         };
     info!(
-        %peer,
-        id = %connection_id,
-        protocol = %selected,
         width = info.width,
         height = info.height,
+        dpi = info.dpi,
+        image = ?info.image,
+        video = ?info.video,
         "connection established"
     );
-    let result = match selected.as_str() {
+    let active = metrics::gauge!("molcajeted_connections_active", "protocol" => protocol);
+    active.increment(1.0);
+    let started = Instant::now();
+    let result = match protocol {
         "vnc" => vnc::run(reader, writer, info, params).await,
         "ssh" => ssh::run(reader, writer, info, params).await,
         "rdp" => rdp::run(reader, writer, info, params).await,
         _ => unreachable!("protocol validated above"),
     };
-    if let Err(err) = result {
-        warn!(id = %connection_id, error = %err, "session ended with error");
+    active.decrement(1.0);
+    let duration = started.elapsed();
+    metrics::histogram!("molcajeted_session_duration_seconds", "protocol" => protocol)
+        .record(duration);
+    match result {
+        Ok(()) => connection_done(protocol, "ok"),
+        Err(err) => {
+            connection_done(protocol, "error");
+            warn!(error = %err, "session ended with error");
+        }
     }
-    info!(id = %connection_id, "connection closed");
+    info!(duration_s = duration.as_secs_f64(), "connection closed");
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
     let cli = Cli::parse();
+    molcajete_telemetry::init_logging(cli.telemetry.log_format, "info,pprof=warn");
+    molcajete_telemetry::start(&cli.telemetry, "molcajeted").await?;
     let allowed: Vec<_> = cli
         .video
         .iter()
@@ -154,13 +209,15 @@ async fn main() -> anyhow::Result<()> {
     }
     let listener = TcpListener::bind((cli.bind_host.as_str(), cli.bind_port)).await?;
     info!(addr = %listener.local_addr()?, "molcajeted listening");
+    let shutdown = molcajete_telemetry::shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 tokio::spawn(handle(stream, peer));
             }
-            _ = tokio::signal::ctrl_c() => {
+            () = &mut shutdown => {
                 info!("shutting down");
                 return Ok(());
             }

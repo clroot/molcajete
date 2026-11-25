@@ -264,6 +264,11 @@ impl Display {
                 return FlushStats::default();
             }
         };
+        metrics::counter!(
+            "molcajeted_video_streams_total",
+            "codec" => super::metrics::codec_label(config.codec),
+        )
+        .increment(1);
         info!(
             codec = ?config.codec,
             x = rect.x,
@@ -335,6 +340,7 @@ impl Display {
     fn video_failed(&mut self, err: &VideoError) {
         if let Some(support) = &mut self.video_support {
             support.failures += 1;
+            metrics::counter!("molcajeted_video_failures_total").increment(1);
             warn!(error = %err, failures = support.failures, "video encoder failed");
             if support.failures >= MAX_FAILURES {
                 warn!("video mode disabled after repeated encoder failures");
@@ -375,7 +381,9 @@ impl Display {
         }
         let video = self.video.as_mut().expect("checked above");
         let encoder = video.encoder.get_mut().unwrap_or_else(|e| e.into_inner());
-        let encoded = match encoder.encode(&frame, key) {
+        let codec = encoder.codec();
+        let (result, encode_time) = super::metrics::timed(|| encoder.encode(&frame, key));
+        let encoded = match result {
             Ok(encoded) => encoded,
             Err(err) => {
                 self.stop_video(out);
@@ -394,6 +402,8 @@ impl Display {
         encode_frame(&mut framed, timestamp, encoded.key, &encoded.data);
         video.frames += 1;
         video.bytes += framed.len();
+        self.metrics
+            .video_frame(codec, encoded.key, encode_time, framed.len());
         let b64 = base64::engine::general_purpose::STANDARD;
         for chunk in framed.chunks(BLOB_MAX_BYTES) {
             *out += &InstructionBuilder::new("blob")
