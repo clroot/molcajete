@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo/molcajete-mark.svg" alt="molcajete logo" width="160">
+</p>
+
 # molcajete
 
 **molcajete** (the stone mortar guacamole is made in) is a Rust
