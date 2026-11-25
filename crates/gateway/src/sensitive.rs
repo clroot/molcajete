@@ -29,8 +29,16 @@ pub const REDACTED: &str = "[redacted]";
 /// Whether a value named `name` (a connection parameter, a user field, a
 /// key of a JSON object) is a secret. Case-insensitive; `_` and `-` are
 /// the same.
+///
+/// Connection parameters that are secrets are also encrypted in the
+/// database and never returned by the API ([`crate::secrets`]);
+/// `web/src/connections/secrets.ts` mirrors this function for the form.
 pub fn is_secret(name: &str) -> bool {
     let name = name.trim().to_ascii_lowercase().replace('_', "-");
+    // Patterns that recognize a prompt, such as telnet's `password-regex`.
+    if name.ends_with("-regex") {
+        return false;
+    }
     SECRET_NAMES.contains(&name.as_str()) || SECRET_PARTS.iter().any(|part| name.contains(part))
 }
 
@@ -79,10 +87,24 @@ mod tests {
             "gateway-password",
             "client-key",
             "client_secret",
+            "jump-host-password",
+            "jump-host-private-key",
+            "jump-host-passphrase",
+            "jump-host-3-password",
+            "jump-host-4-private-key",
         ] {
             assert!(is_secret(name), "{name}");
         }
-        for name in ["hostname", "username", "port", "domain", "public-key"] {
+        for name in [
+            "hostname",
+            "username",
+            "port",
+            "domain",
+            "public-key",
+            "jump-host-host-key",
+            "jump-host-2-host-key",
+            "password-regex",
+        ] {
             assert!(!is_secret(name), "{name}");
         }
     }

@@ -1,28 +1,27 @@
 // Connection parameters that hold credentials. The gateway encrypts them
 // at rest and never sends them back: the form only writes them.
+//
+// Mirrors `is_secret` in `crates/gateway/src/sensitive.rs` (a test compares
+// the lists): `password`, `private-key`, `sftp-passphrase`,
+// `jump-host-2-password`, … but not `jump-host-host-key` or telnet's
+// `password-regex`.
 
-/**
- * Same list as `SENSITIVE_PARAMETERS` in `crates/gateway/src/secrets.rs`
- * (a test compares them). Every protocol field of kind `password` must be
- * on it.
- */
-export const SENSITIVE_PARAMETERS: readonly string[] = [
+/** Names that are secrets wherever they appear (`SECRET_NAMES`). */
+export const SECRET_NAMES: readonly string[] = [
   'password',
   'passphrase',
   'private-key',
-  'sftp-password',
-  'sftp-passphrase',
-  'sftp-private-key',
-  'gateway-password',
   'client-key',
-  // SSH jump hosts: the single hop, and hops 1 to 4 of a chain.
-  ...['jump-host', 'jump-host-1', 'jump-host-2', 'jump-host-3', 'jump-host-4'].flatMap(prefix => [
-    `${prefix}-password`,
-    `${prefix}-private-key`,
-    `${prefix}-passphrase`,
-  ]),
+  'client-secret',
+  'secret',
+  'token',
 ];
 
+/** Parts of a name that make it a secret (`SECRET_PARTS`). */
+export const SECRET_PARTS: readonly string[] = ['password', 'passphrase', 'private-key', 'secret'];
+
 export function isSensitive(name: string): boolean {
-  return SENSITIVE_PARAMETERS.includes(name.trim());
+  const normalized = name.trim().toLowerCase().replaceAll('_', '-');
+  if (normalized.endsWith('-regex')) return false;
+  return SECRET_NAMES.includes(normalized) || SECRET_PARTS.some(part => normalized.includes(part));
 }

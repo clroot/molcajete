@@ -103,22 +103,6 @@ fn is_secret_row(name: &str, value: &str) -> bool {
     secrets::is_sensitive(name) || secrets::is_sealed(value)
 }
 
-/// `WHERE` condition matching the rows that may hold credentials; bind its
-/// values with [`bind_secret_rows`].
-fn secret_rows_filter() -> String {
-    let names = vec!["?"; secrets::SENSITIVE_PARAMETERS.len()].join(", ");
-    format!("(parameter_name IN ({names}) OR parameter_value LIKE 'enc:v1:%')")
-}
-
-type AnyQuery<'q> = sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>;
-
-fn bind_secret_rows(mut query: AnyQuery<'_>) -> AnyQuery<'_> {
-    for name in secrets::SENSITIVE_PARAMETERS {
-        query = query.bind(*name);
-    }
-    query
-}
-
 fn guacd_port(row: &AnyRow) -> Result<Option<u16>, sqlx::Error> {
     Ok(row
         .try_get::<Option<i64>, _>("guacd_port")?
@@ -235,14 +219,14 @@ impl Database {
     /// The decrypted credentials of a connection, for the guacd handshake
     /// only.
     pub async fn connection_secrets(&self, id: &str) -> DbResult<BTreeMap<String, String>> {
-        let sql = format!(
+        let rows = query!(
+            self,
             "SELECT parameter_name, parameter_value FROM molcajete_connection_parameter \
-             WHERE connection_id = ? AND {}",
-            secret_rows_filter()
-        );
-        let rows = bind_secret_rows(query!(self, &sql).bind(id))
-            .fetch_all(&self.pool)
-            .await?;
+             WHERE connection_id = ?"
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
         let mut values = BTreeMap::new();
         for r in &rows {
             let name: String = r.try_get("parameter_name")?;
@@ -441,7 +425,7 @@ impl Database {
 
     /// Run on every start: encrypts credentials stored in plain text (by a
     /// gateway before encryption, or under a name newly added to
-    /// [`secrets::SENSITIVE_PARAMETERS`]), all in one transaction, and
+    /// [`crate::sensitive`]), all in one transaction, and
     /// checks that every encrypted value is under a configured key.
     /// Returns how many values were encrypted.
     pub async fn seal_plaintext_secrets(&self) -> DbResult<usize> {
@@ -482,14 +466,15 @@ impl Database {
         rewrite: impl Fn(&str, &str, &str) -> Result<Option<String>, SecretError>,
     ) -> DbResult<usize> {
         let mut tx = self.pool.begin().await?;
-        let sql = format!(
+        // Which names are secrets is decided in Rust (`is_secret_row`), so
+        // every row is read; a gateway stores a few thousand at most.
+        let rows = query!(
+            self,
             "SELECT connection_id, parameter_name, parameter_value \
-             FROM molcajete_connection_parameter WHERE {}",
-            secret_rows_filter()
-        );
-        let rows = bind_secret_rows(query!(self, &sql))
-            .fetch_all(&mut *tx)
-            .await?;
+             FROM molcajete_connection_parameter"
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         let mut changed = 0;
         for r in &rows {
             let id: String = r.try_get("connection_id")?;

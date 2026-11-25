@@ -31,48 +31,13 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 
-/// Connection parameters whose values are credentials. These are encrypted
-/// in the database and never returned by the API.
-///
-/// Keep in sync with `SENSITIVE_PARAMETERS` in
-/// `web/src/connections/secrets.ts`. Adding a name is enough: plain values
-/// already stored under it are encrypted on the next start.
-pub const SENSITIVE_PARAMETERS: &[&str] = &[
-    // Every protocol.
-    "password",
-    // SSH.
-    "passphrase",
-    "private-key",
-    // SFTP file transfer next to VNC, RDP and SSH.
-    "sftp-password",
-    "sftp-passphrase",
-    "sftp-private-key",
-    // RDP: Remote Desktop Gateway.
-    "gateway-password",
-    // Kubernetes: the client certificate's private key.
-    "client-key",
-    // SSH jump hosts: the single hop, and hops 1 to 4 of a chain. Their
-    // `-host-key` parameters are public keys.
-    "jump-host-password",
-    "jump-host-private-key",
-    "jump-host-passphrase",
-    "jump-host-1-password",
-    "jump-host-1-private-key",
-    "jump-host-1-passphrase",
-    "jump-host-2-password",
-    "jump-host-2-private-key",
-    "jump-host-2-passphrase",
-    "jump-host-3-password",
-    "jump-host-3-private-key",
-    "jump-host-3-passphrase",
-    "jump-host-4-password",
-    "jump-host-4-private-key",
-    "jump-host-4-passphrase",
-];
-
-/// Whether `name` is a connection parameter that holds a credential.
+/// Whether connection parameter `name` holds a credential, which is
+/// encrypted in the database and never returned by the API. The gateway's
+/// one list of secret names, [`crate::sensitive::is_secret`], decides:
+/// adding a name there is enough, plain values already stored under it are
+/// encrypted on the next start.
 pub fn is_sensitive(name: &str) -> bool {
-    SENSITIVE_PARAMETERS.contains(&name)
+    crate::sensitive::is_secret(name)
 }
 
 /// Environment variable holding the key (base64 of 32 bytes).
