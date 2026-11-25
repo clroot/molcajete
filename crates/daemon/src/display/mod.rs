@@ -23,7 +23,7 @@ mod pacing;
 mod source;
 mod video;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1071,7 +1071,9 @@ impl Display {
 
         // Blocks moved by the same offset are merged into larger rectangles,
         // each sent as one copy (the client handles overlap within a copy).
-        let mut by_offset: HashMap<(i64, i64), Vec<(u32, u32)>> = HashMap::new();
+        // (In a fixed order, so that the output does not depend on a hash
+        // seed.)
+        let mut by_offset: BTreeMap<(i64, i64), Vec<(u32, u32)>> = BTreeMap::new();
         for ((sx, sy), (dx, dy)) in found {
             let offset = (dx as i64 - sx as i64, dy as i64 - sy as i64);
             by_offset.entry(offset).or_default().push((dx, dy));
@@ -1232,7 +1234,9 @@ impl Display {
                 }
             }
         }
-        let Some((&dy, &count)) = votes.iter().max_by_key(|(dy, n)| (**n, -dy.abs())) else {
+        // Ties go to the smaller shift, and then to the downward one, so
+        // that the result does not depend on the order of the map.
+        let Some((&dy, &count)) = votes.iter().max_by_key(|&(&dy, &n)| (n, -dy.abs(), dy)) else {
             return FlushStats::default();
         };
         if count < MIN_SCROLL_ROWS {
