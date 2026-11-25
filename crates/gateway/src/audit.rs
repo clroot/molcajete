@@ -94,6 +94,14 @@ pub mod action {
     pub const RECORDING_DOWNLOAD: &str = "recording.download";
     pub const RECORDING_DELETE: &str = "recording.delete";
 
+    /// At start, connection credentials stored in plain text were encrypted
+    /// (`count`): the first start after upgrading, or a name newly treated
+    /// as a secret.
+    pub const SECRETS_ENCRYPT: &str = "secrets.encrypt";
+    /// `rotate-key` re-encrypted stored credentials (`count`) with the
+    /// current key (`keyId`).
+    pub const SECRETS_ROTATE: &str = "secrets.rotate";
+
     pub const ALL: &[&str] = &[
         LOGIN_SUCCESS,
         LOGIN_FAILURE,
@@ -124,6 +132,8 @@ pub mod action {
         CONNECTION_ACCESS,
         RECORDING_DOWNLOAD,
         RECORDING_DELETE,
+        SECRETS_ENCRYPT,
+        SECRETS_ROTATE,
     ];
 }
 

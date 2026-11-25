@@ -324,6 +324,11 @@ async fn main() -> anyhow::Result<()> {
             .rotate_secrets()
             .await
             .context("re-encrypting the stored connection credentials")?;
+        let entry = audit::Entry::new(audit::action::SECRETS_ROTATE)
+            .source("command line")
+            .detail("count", rotated)
+            .detail("keyId", db.secret_key_id().unwrap_or_default());
+        audit::record(&db, entry).await;
         eprintln!(
             "Re-encrypted {rotated} stored credential(s). Every stored credential is now under \
              the current key; previous keys can be removed from the configuration."
@@ -355,6 +360,10 @@ async fn main() -> anyhow::Result<()> {
             count = sealed,
             "encrypted stored connection credentials that were in plain text"
         );
+        let entry = audit::Entry::new(audit::action::SECRETS_ENCRYPT)
+            .source("gateway start")
+            .detail("count", sealed);
+        audit::record(&db, entry).await;
     }
     bootstrap::seed(&db, &config).await?;
     if config.recordings.enabled {
@@ -2051,13 +2060,60 @@ mod tests {
             )
             .await;
         assert_eq!(updated.status(), StatusCode::OK);
+        // Stored credentials are not decrypted to compare them: each one
+        // sent again counts as changed.
         let updated = only_entry(&app, &admin, "connection.update").await;
+        let replaced = serde_json::json!({ "from": "[redacted]", "to": "[redacted]" });
         assert_eq!(
             updated["changes"],
             serde_json::json!({
                 "parameters.hostname": { "from": "10.0.0.9", "to": "10.0.0.10" },
-                "parameters.password": { "from": "[redacted]", "to": "[redacted]" },
+                "parameters.password": replaced,
+                "parameters.private-key": replaced,
+                "parameters.passphrase": replaced,
             })
+        );
+        let text = updated.to_string();
+        assert!(
+            !text.contains("rdp-secret") && !text.contains("enc:v1:"),
+            "{text}"
+        );
+
+        // Saved without credentials: they are kept, and no change shows.
+        let renamed = app
+            .json(
+                Method::PUT,
+                "/api/connections/jump",
+                Some(&admin),
+                serde_json::json!({
+                    "id": "jump", "name": "Jump host 2", "protocol": "ssh",
+                    "parameters": { "hostname": "10.0.0.10" }
+                }),
+            )
+            .await;
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let entries = audit(&app, &admin, "action=connection.update").await;
+        assert_eq!(
+            entries[0]["changes"],
+            serde_json::json!({ "name": { "from": "Jump host", "to": "Jump host 2" } })
+        );
+        // A cleared credential shows as removed.
+        let cleared = app
+            .json(
+                Method::PUT,
+                "/api/connections/jump",
+                Some(&admin),
+                serde_json::json!({
+                    "id": "jump", "name": "Jump host 2", "protocol": "ssh",
+                    "parameters": { "hostname": "10.0.0.10" }, "clearSecrets": ["passphrase"]
+                }),
+            )
+            .await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let entries = audit(&app, &admin, "action=connection.update").await;
+        assert_eq!(
+            entries[0]["changes"],
+            serde_json::json!({ "parameters.passphrase": { "from": "[redacted]", "to": null } })
         );
 
         // Grants.
@@ -2107,13 +2163,13 @@ mod tests {
             audit(&app, &admin, "action=connection&actor=admin")
                 .await
                 .len(),
-            5
+            7
         );
         assert_eq!(
             audit(&app, &admin, "target=jump&targetType=connection")
                 .await
                 .len(),
-            5
+            7
         );
         assert_eq!(audit(&app, &admin, "actor=bob").await.len(), 0);
         assert_eq!(audit(&app, &admin, "limit=2").await.len(), 2);

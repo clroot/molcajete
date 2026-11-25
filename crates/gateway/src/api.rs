@@ -1,7 +1,7 @@
 //! JSON API: login sessions, connections, folders, users, groups,
 //! recordings and the audit log.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::Json;
@@ -388,9 +388,34 @@ pub async fn create_connection(
         .by(&admin)
         .from(&address)
         .target(target::CONNECTION, &created.id, &created.name)
-        .changes(audit::diff(&Value::Null, &json!(created)));
+        .changes(audit::diff(
+            &Value::Null,
+            &audit_view(&created, &BTreeSet::new()),
+        ));
     audit::record(&state.db, entry).await;
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// A connection as the audit log sees it: each stored credential as
+/// `"stored"`, or `"replaced"` when `replaced` names it, so the log shows
+/// that a credential was set, changed or removed but never its value
+/// (encrypted or not). `storedSecrets` is left out, being the same news.
+fn audit_view(c: &ConnectionRecord, replaced: &BTreeSet<String>) -> Value {
+    let mut value = json!(c);
+    if let Some(map) = value.as_object_mut() {
+        map.remove("storedSecrets");
+        if let Some(Value::Object(parameters)) = map.get_mut("parameters") {
+            for name in &c.stored_secrets {
+                let mark = if replaced.contains(name) {
+                    "replaced"
+                } else {
+                    "stored"
+                };
+                parameters.insert(name.clone(), mark.into());
+            }
+        }
+    }
+    value
 }
 
 pub async fn update_connection(
@@ -404,11 +429,21 @@ pub async fn update_connection(
     let c = validate_connection(body)?;
     let before = state.db.connection(&c.id).await?;
     let updated = state.db.update_connection(&c).await?;
+    // Credentials given a value: the audit log shows they changed.
+    let replaced = c
+        .parameters
+        .keys()
+        .filter(|name| updated.stored_secrets.contains(*name))
+        .cloned()
+        .collect();
     let entry = Entry::new(action::CONNECTION_UPDATE)
         .by(&admin)
         .from(&address)
         .target(target::CONNECTION, &updated.id, &updated.name)
-        .changes(audit::diff(&json!(before), &json!(updated)));
+        .changes(audit::diff(
+            &audit_view(&before, &BTreeSet::new()),
+            &audit_view(&updated, &replaced),
+        ));
     audit::record(&state.db, entry).await;
     Ok(Json(updated))
 }
@@ -425,7 +460,10 @@ pub async fn delete_connection(
         .by(&admin)
         .from(&address)
         .target(target::CONNECTION, &id, &before.name)
-        .changes(audit::diff(&json!(before), &Value::Null));
+        .changes(audit::diff(
+            &audit_view(&before, &BTreeSet::new()),
+            &Value::Null,
+        ));
     audit::record(&state.db, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }

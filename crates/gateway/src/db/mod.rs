@@ -154,6 +154,11 @@ impl Database {
         self
     }
 
+    /// The id of the key new credentials are encrypted with.
+    pub fn secret_key_id(&self) -> Option<&str> {
+        self.secrets.as_deref().map(SecretKeys::current_id)
+    }
+
     fn secrets(&self) -> Result<&SecretKeys, SecretError> {
         self.secrets.as_deref().ok_or(SecretError::NoKey)
     }
