@@ -9,6 +9,7 @@ use tracing::{debug, trace, warn};
 use super::pixel::{self, BYTES_PER_PIXEL};
 use super::zrle::ZrleDecoder;
 use super::{RfbError, RfbEvent, Screen, SharedState, encoding, hextile, lock_shared};
+use crate::remote::CountingStream;
 
 const FRAMEBUFFER_UPDATE: u8 = 0;
 const SET_COLOUR_MAP_ENTRIES: u8 = 1;
@@ -25,7 +26,7 @@ const MAX_CURSOR_SIZE: u16 = 1024;
 
 /// Read half of an RFB connection, including all decoder state.
 pub struct RfbReader {
-    input: BufReader<OwnedReadHalf>,
+    input: BufReader<CountingStream<OwnedReadHalf>>,
     width: u16,
     height: u16,
     /// Rectangles left in the FramebufferUpdate being processed, if one is in progress.
@@ -45,7 +46,7 @@ enum RectOutcome {
 
 impl RfbReader {
     pub(super) fn new(
-        input: BufReader<OwnedReadHalf>,
+        input: BufReader<CountingStream<OwnedReadHalf>>,
         width: u16,
         height: u16,
         shared: Arc<Mutex<SharedState>>,

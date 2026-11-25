@@ -233,6 +233,8 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | `molcajeted_unacked_frames` | histogram | protocol | Frames still unacknowledged when a frame is sent |
 | `molcajeted_socket_write_seconds` | histogram | protocol | Time blocked in `write_all`; grows when the gateway or browser cannot keep up (backpressure) |
 | `molcajeted_sent_bytes_total` | counter | protocol | Bytes sent to the gateway |
+| `molcajeted_remote_received_bytes_total` | counter | protocol | Bytes read from the remote server's socket (`rdp`: TLS records, handshake included; `vnc`) |
+| `molcajeted_remote_decode_seconds` | histogram | protocol | `rdp` only: decoding one PDU from the server (IronRDP, bitmap decompression included) and copying its graphics updates into the display |
 | `molcajeted_connections_active`, `molcajeted_connections_total` | gauge, counter | protocol, result | Connections and how they ended |
 | `molcajeted_session_duration_seconds` | histogram | protocol | Session length |
 
@@ -304,6 +306,11 @@ histogram_quantile(0.95, sum by (le) (rate(molcajeted_client_ack_seconds_bucket[
 histogram_quantile(0.95, sum by (le) (rate(molcajete_client_rtt_seconds_bucket[5m])))
 histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_receive_seconds_bucket[5m])))
 histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_lag_seconds_bucket[5m])))
+
+# what taking pixels in costs: bytes received from the remote server,
+# and decoding time as a fraction of one core
+sum by (protocol) (rate(molcajeted_remote_received_bytes_total[5m]))
+sum by (protocol) (rate(molcajeted_remote_decode_seconds_sum[5m]))
 
 # socket write waits (backpressure)
 histogram_quantile(0.99, sum by (le) (rate(molcajeted_socket_write_seconds_bucket[5m])))

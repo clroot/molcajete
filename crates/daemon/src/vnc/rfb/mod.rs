@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
 
+use crate::remote::{self, CountingStream};
+
 pub use reader::RfbReader;
 pub use writer::RfbWriter;
 
@@ -264,6 +266,7 @@ pub async fn connect(
     let stream = TcpStream::connect((options.host.as_str(), options.port)).await?;
     stream.set_nodelay(true)?;
     let (read_half, mut write_half) = stream.into_split();
+    let read_half = CountingStream::new(read_half, remote::received_bytes("vnc"));
     let mut input = BufReader::with_capacity(READ_BUFFER_SIZE, read_half);
 
     let info = handshake::run(&mut input, &mut write_half, options).await?;

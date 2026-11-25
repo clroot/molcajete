@@ -12,6 +12,7 @@ mod display;
 mod handshake;
 mod io;
 mod rdp;
+mod remote;
 mod session;
 mod ssh;
 mod video;
