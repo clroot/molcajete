@@ -193,13 +193,19 @@ export class MolcajeteSession {
       this.#canvas.style.cursor = cssCursor(detail);
       return;
     }
+    // Audio forwarded by the worker is played here and not reported.
     if (type === "audio-start") {
       this.#audioContext ??= new AudioContext();
       this.#players.set(detail.stream, new PcmPlayer(this.#audioContext, detail));
-    } else if (type === "audio-data") {
+      return;
+    }
+    if (type === "audio-data") {
       this.#players.get(detail.stream)?.play(detail.data);
-    } else if (type === "audio-end") {
+      return;
+    }
+    if (type === "audio-end") {
       this.#players.delete(detail.stream);
+      return;
     }
     if (type === "state" && detail === "connected") this.focus();
     this.#handler?.(type, detail);

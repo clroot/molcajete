@@ -31,7 +31,7 @@ const initialState: SessionState = {
   stats: null,
 };
 
-function reduce(state: SessionState, action: Action): SessionState {
+export function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case 'state':
       if (action.detail === 'connecting' || action.detail === 'waiting')
@@ -68,6 +68,9 @@ function reduce(state: SessionState, action: Action): SessionState {
     case 'name':
       // guacd reports the protocol's own name ("vnc"); the page shows the
       // configured connection name instead.
+      return state;
+    default:
+      // The client may report events this page does not use.
       return state;
   }
 }
