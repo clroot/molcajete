@@ -2,23 +2,30 @@ import {useState, type FormEvent} from 'react';
 import {VStack} from '@astryxdesign/core/Stack';
 import {TextInput} from '@astryxdesign/core/TextInput';
 import {Switch} from '@astryxdesign/core/Switch';
+import {Selector} from '@astryxdesign/core/Selector';
+import {MultiSelector} from '@astryxdesign/core/MultiSelector';
 import {Banner} from '@astryxdesign/core/Banner';
 import {Divider} from '@astryxdesign/core/Divider';
-import {CheckboxList, CheckboxListItem} from '@astryxdesign/core/CheckboxList';
 import {Text} from '@astryxdesign/core/Text';
-import {api, errorMessage, type ConnectionSummary, type UserDetail} from '../api';
+import {api, errorMessage, type Role, type UserDetail} from '../api';
 import {FormActions, FormDrawerLayout} from '../shell/FormDrawer';
 import {MIN_PASSWORD_LENGTH, PASSWORD_RULE, isPasswordTooShort} from '../auth/password';
-import {protocolLabel} from '../connections/protocols';
+import {ROLES, roleLabel} from '../access/roles';
+import GrantFields from '../access/GrantFields';
+import type {Choices} from './UserDrawer';
 
 const FORM_ID = 'user-form';
 
 export type UserFormValues = {
   username: string;
-  isAdmin: boolean;
+  role: Role;
   disabled: boolean;
-  /** Ids of the granted connections. */
+  /** Ids of the user's groups. */
+  groups: string[];
+  /** Ids of the connections granted directly. */
   connections: string[];
+  /** Ids of the folders granted directly. */
+  folders: string[];
 };
 
 type Props = {
@@ -26,20 +33,28 @@ type Props = {
   userId: string | null;
   title: string;
   initial: UserFormValues;
-  connections: ConnectionSummary[];
+  choices: Choices;
   /** The signed-in administrator cannot demote or disable themselves. */
   isSelf: boolean;
   onClose: () => void;
   onSaved: (user: UserDetail) => void;
 };
 
-export default function UserFormView({userId, title, initial, connections, isSelf, onClose, onSaved}: Props) {
+const RANK: Record<Role, number> = {user: 0, connection_manager: 1, admin: 2};
+
+export default function UserFormView({userId, title, initial, choices, isSelf, onClose, onSaved}: Props) {
   const isNew = userId === null;
   const [values, setValues] = useState(initial);
   const [password, setPassword] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
   const update = (patch: Partial<UserFormValues>) => setValues(v => ({...v, ...patch}));
+
+  // The highest role among the selected groups raises the user's own.
+  const groupRole = choices.groups
+    .filter(g => values.groups.includes(g.id))
+    .reduce<Role>((best, g) => (RANK[g.role] > RANK[best] ? g.role : best), 'user');
+  const effectiveRole = RANK[groupRole] > RANK[values.role] ? groupRole : values.role;
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -107,14 +122,33 @@ export default function UserFormView({userId, title, initial, connections, isSel
           <Divider />
 
           <VStack gap={4}>
-            <Switch
-              label="Administrator"
-              description="Manages connections and users, and can open every connection."
-              value={values.isAdmin}
-              onChange={isAdmin => update({isAdmin})}
+            <Selector
+              label="Role"
+              value={values.role}
+              onChange={role => role && update({role: role as Role})}
+              options={ROLES}
               isDisabled={isSelf}
-              disabledMessage="You cannot remove your own administrator access."
+              disabledMessage="You cannot change your own role."
             />
+            <MultiSelector
+              label="Groups"
+              description="The user also gets each group's role and access."
+              value={values.groups}
+              onChange={groups => update({groups})}
+              options={choices.groups.map(g => ({
+                value: g.id,
+                label: g.name,
+                description: roleLabel(g.role),
+              }))}
+              triggerDisplay="badges"
+              placeholder="No groups"
+              hasSearch
+              searchPlaceholder="Search groups"
+              emptyText="There are no groups yet."
+            />
+            {effectiveRole !== values.role && (
+              <Text color="secondary">Through a group, this user's role is {roleLabel(effectiveRole)}.</Text>
+            )}
             <Switch
               label="Disabled"
               description="Blocks sign-in and ends the user's sessions."
@@ -127,43 +161,19 @@ export default function UserFormView({userId, title, initial, connections, isSel
 
           <Divider />
 
-          <GrantedConnections
-            isAdmin={values.isAdmin}
-            connections={connections}
-            granted={values.connections}
-            onChange={ids => update({connections: ids})}
-          />
+          {effectiveRole === 'user' ? (
+            <GrantFields
+              subject="this user"
+              grants={values}
+              folders={choices.folders}
+              connections={choices.connections}
+              onChange={({connections, folders}) => update({connections, folders})}
+            />
+          ) : (
+            <Text color="secondary">Connection managers and administrators can open every connection.</Text>
+          )}
         </VStack>
       </form>
     </FormDrawerLayout>
-  );
-}
-
-type GrantedConnectionsProps = {
-  isAdmin: boolean;
-  connections: ConnectionSummary[];
-  granted: string[];
-  onChange: (ids: string[]) => void;
-};
-
-function GrantedConnections({isAdmin, connections, granted, onChange}: GrantedConnectionsProps) {
-  if (isAdmin) return <Text color="secondary">Administrators can open every connection.</Text>;
-  if (connections.length === 0) return <Text color="secondary">There are no connections to grant yet.</Text>;
-  return (
-    <CheckboxList
-      label="Connections"
-      description="The connections this user can see and open."
-      value={granted}
-      onChange={onChange}
-      hasDividers>
-      {connections.map(c => (
-        <CheckboxListItem
-          key={c.id}
-          value={c.id}
-          label={c.name}
-          description={[protocolLabel(c.protocol), c.hostname].filter(Boolean).join(' · ')}
-        />
-      ))}
-    </CheckboxList>
   );
 }

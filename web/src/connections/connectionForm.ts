@@ -11,6 +11,8 @@ export type ConnectionForm = {
   protocol: string;
   guacdHost: string;
   guacdPort: string;
+  /** Folder id, '' for the top level; only used when creating. */
+  parentId: string;
   /** Values of the fields the current protocol shows. */
   fields: Record<string, string>;
   /** Every other guacd parameter, edited as free name/value pairs. */
@@ -44,8 +46,17 @@ function joinParameters(form: ConnectionForm): Record<string, string> {
   return parameters;
 }
 
-export function emptyConnectionForm(): ConnectionForm {
-  return {id: '', name: '', protocol: 'vnc', guacdHost: '', guacdPort: '', fields: {}, extras: []};
+export function emptyConnectionForm(parentId: string | null = null): ConnectionForm {
+  return {
+    id: '',
+    name: '',
+    protocol: 'vnc',
+    guacdHost: '',
+    guacdPort: '',
+    parentId: parentId ?? '',
+    fields: {},
+    extras: [],
+  };
 }
 
 export function toConnectionForm(c: Connection): ConnectionForm {
@@ -55,6 +66,7 @@ export function toConnectionForm(c: Connection): ConnectionForm {
     protocol: c.protocol,
     guacdHost: c.guacdHost ?? '',
     guacdPort: c.guacdPort == null ? '' : String(c.guacdPort),
+    parentId: c.parentId ?? '',
     ...splitParameters(c.protocol, c.parameters),
   };
 }
@@ -108,6 +120,7 @@ export function toConnection(form: ConnectionForm): FormResult {
       guacdHost: guacdHost || null,
       guacdPort: guacdHost && guacdPort ? Number(guacdPort) : null,
       parameters: joinParameters(form),
+      ...(form.parentId ? {parentId: form.parentId} : {}),
     },
   };
 }

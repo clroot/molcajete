@@ -1,5 +1,5 @@
 import {useCallback} from 'react';
-import {api, type ConnectionSummary, type UserDetail} from '../api';
+import {api, type ConnectionSummary, type Folder, type Group, type UserDetail} from '../api';
 import {FormDrawer, FormDrawerLayout} from '../shell/FormDrawer';
 import AsyncContent from '../shell/AsyncContent';
 import type {DrawerState} from '../shell/drawerState';
@@ -13,15 +13,24 @@ type Props = {
   onSaved: (user: UserDetail) => void;
 };
 
-const NEW_USER: UserFormValues = {username: '', isAdmin: false, disabled: false, connections: []};
+const NEW_USER: UserFormValues = {
+  username: '',
+  role: 'user',
+  disabled: false,
+  groups: [],
+  connections: [],
+  folders: [],
+};
 
-type Loaded = {values: UserFormValues; connections: ConnectionSummary[]};
+export type Choices = {connections: ConnectionSummary[]; folders: Folder[]; groups: Group[]};
+
+type Loaded = {values: UserFormValues; choices: Choices};
 
 /** Creates a user, or edits one; the form mounts once its data has loaded. */
 export default function UserDrawer({state, currentUserId, onClose, onSaved}: Props) {
   const userId = state.mode === 'edit' ? state.id : null;
   return (
-    <FormDrawer isOpen={state.mode !== 'closed'} title="User" width={440} onClose={onClose}>
+    <FormDrawer isOpen={state.mode !== 'closed'} title="User" width={480} onClose={onClose}>
       {state.mode !== 'closed' && (
         <LoadedUserForm
           key={userId ?? 'new'}
@@ -45,11 +54,23 @@ type LoadedUserFormProps = {
 
 function LoadedUserForm({userId, isSelf, onClose, onSaved}: LoadedUserFormProps) {
   const load = useCallback(async (): Promise<Loaded> => {
-    const [user, connections] = await Promise.all([
+    const [user, connections, folders, groups] = await Promise.all([
       userId === null ? null : api.user(userId),
       api.connections(),
+      api.folders(),
+      api.groups(),
     ]);
-    return {values: user ?? NEW_USER, connections};
+    const values = user
+      ? {
+          username: user.username,
+          role: user.role,
+          disabled: user.disabled,
+          groups: user.groups,
+          connections: user.connections,
+          folders: user.folders,
+        }
+      : NEW_USER;
+    return {values, choices: {connections, folders, groups}};
   }, [userId]);
   const data = useApiData(load);
   const title = userId === null ? 'New user' : 'Edit user';
@@ -68,7 +89,7 @@ function LoadedUserForm({userId, isSelf, onClose, onSaved}: LoadedUserFormProps)
       userId={userId}
       title={title}
       initial={data.data.values}
-      connections={data.data.connections}
+      choices={data.data.choices}
       isSelf={isSelf}
       onClose={onClose}
       onSaved={onSaved}

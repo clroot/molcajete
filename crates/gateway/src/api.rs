@@ -1,6 +1,6 @@
-//! JSON API: login sessions, connections and users.
+//! JSON API: login sessions, connections, folders, users and groups.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::Json;
@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::AppState;
-use crate::auth::{self, AdminUser, CurrentUser};
-use crate::db::{ConnectionRecord, DbError, NewUser, User, UserUpdate};
+use crate::auth::{self, AdminUser, ConnectionManager, CurrentUser};
+use crate::db::{
+    Access, ConnectionRecord, DbError, Folder, Group, GroupUpdate, NewUser, Principal, Role,
+    Target, User, UserUpdate,
+};
 
 /// Error response: `{"error": "<message>"}` with a status code.
 #[derive(Debug)]
@@ -37,8 +40,13 @@ impl ApiError {
         Self::new(StatusCode::UNAUTHORIZED, "Sign in to continue.")
     }
 
-    pub fn forbidden() -> Self {
-        Self::new(StatusCode::FORBIDDEN, "Only administrators can do this.")
+    /// For a user whose role is below `required`.
+    pub fn forbidden(required: Role) -> Self {
+        let who = match required {
+            Role::Admin => "Only administrators can do this.",
+            _ => "Only connection managers and administrators can do this.",
+        };
+        Self::new(StatusCode::FORBIDDEN, who)
     }
 
     pub fn not_found() -> Self {
@@ -51,6 +59,10 @@ impl From<DbError> for ApiError {
         match err {
             DbError::NotFound => Self::not_found(),
             DbError::Conflict => Self::new(StatusCode::CONFLICT, "That name is already taken."),
+            DbError::LastAdmin => {
+                Self::bad_request("At least one enabled administrator must remain.")
+            }
+            DbError::Invalid(message) => Self::bad_request(message),
             DbError::Other(err) => {
                 error!(error = %err, "database error");
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Database error.")
@@ -177,17 +189,12 @@ pub async fn list_connections(
     State(state): State<Arc<AppState>>,
     CurrentUser(user): CurrentUser,
 ) -> ApiResult<impl IntoResponse> {
-    Ok(Json(
-        state
-            .db
-            .connection_summaries(&user.id, user.is_admin)
-            .await?,
-    ))
+    Ok(Json(state.db.connection_summaries(&user).await?))
 }
 
 pub async fn get_connection(
     State(state): State<Arc<AppState>>,
-    AdminUser(_): AdminUser,
+    ConnectionManager(_): ConnectionManager,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ConnectionRecord>> {
     Ok(Json(state.db.connection(&id).await?))
@@ -240,12 +247,13 @@ fn validate_connection(mut c: ConnectionRecord) -> ApiResult<ConnectionRecord> {
         parameters.insert(name, value);
     }
     c.parameters = parameters;
+    c.parent_id = c.parent_id.filter(|p| !p.is_empty());
     Ok(c)
 }
 
 pub async fn create_connection(
     State(state): State<Arc<AppState>>,
-    AdminUser(admin): AdminUser,
+    ConnectionManager(admin): ConnectionManager,
     Json(body): Json<ConnectionRecord>,
 ) -> ApiResult<(StatusCode, Json<ConnectionRecord>)> {
     let c = validate_connection(body)?;
@@ -266,7 +274,7 @@ pub async fn create_connection(
 
 pub async fn update_connection(
     State(state): State<Arc<AppState>>,
-    AdminUser(admin): AdminUser,
+    ConnectionManager(admin): ConnectionManager,
     Path(id): Path<String>,
     Json(mut body): Json<ConnectionRecord>,
 ) -> ApiResult<Json<ConnectionRecord>> {
@@ -279,11 +287,181 @@ pub async fn update_connection(
 
 pub async fn delete_connection(
     State(state): State<Arc<AppState>>,
-    AdminUser(admin): AdminUser,
+    ConnectionManager(admin): ConnectionManager,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     state.db.delete_connection(&id).await?;
     info!(by = %admin.username, connection = %id, "connection deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParentRequest {
+    /// The folder to move into; `null` for the top level.
+    parent_id: Option<String>,
+}
+
+fn parent(body: &ParentRequest) -> Option<&str> {
+    body.parent_id.as_deref().filter(|p| !p.is_empty())
+}
+
+pub async fn move_connection(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(by): ConnectionManager,
+    Path(id): Path<String>,
+    Json(body): Json<ParentRequest>,
+) -> ApiResult<StatusCode> {
+    state.db.move_connection(&id, parent(&body)).await?;
+    info!(by = %by.username, connection = %id, folder = ?parent(&body), "connection moved");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Access: who is granted a connection or a folder
+
+pub async fn get_connection_access(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(_): ConnectionManager,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Access>> {
+    state.db.connection(&id).await?;
+    Ok(Json(state.db.access(Target::Connection, &id).await?))
+}
+
+pub async fn set_connection_access(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(by): ConnectionManager,
+    Path(id): Path<String>,
+    Json(body): Json<Access>,
+) -> ApiResult<Json<Access>> {
+    state.db.connection(&id).await?;
+    state.db.set_access(Target::Connection, &id, &body).await?;
+    info!(by = %by.username, connection = %id, "connection access changed");
+    Ok(Json(state.db.access(Target::Connection, &id).await?))
+}
+
+pub async fn get_folder_access(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(_): ConnectionManager,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Access>> {
+    state.db.folder(&id).await?;
+    Ok(Json(state.db.access(Target::Folder, &id).await?))
+}
+
+pub async fn set_folder_access(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(by): ConnectionManager,
+    Path(id): Path<String>,
+    Json(body): Json<Access>,
+) -> ApiResult<Json<Access>> {
+    state.db.folder(&id).await?;
+    state.db.set_access(Target::Folder, &id, &body).await?;
+    info!(by = %by.username, folder = %id, "folder access changed");
+    Ok(Json(state.db.access(Target::Folder, &id).await?))
+}
+
+// ---------------------------------------------------------------------------
+// Folders
+
+/// Every folder for connection managers and administrators; for other
+/// users the folders that hold (at any depth) a connection they can open.
+pub async fn list_folders(
+    State(state): State<Arc<AppState>>,
+    CurrentUser(user): CurrentUser,
+) -> ApiResult<Json<Vec<Folder>>> {
+    let folders = state.db.list_folders().await?;
+    if user.effective_role.can_manage_connections() {
+        return Ok(Json(folders));
+    }
+    let parents: HashMap<&str, Option<&str>> = folders
+        .iter()
+        .map(|f| (f.id.as_str(), f.parent_id.as_deref()))
+        .collect();
+    let mut visible = HashSet::new();
+    for connection in state.db.connection_summaries(&user).await? {
+        let mut folder = connection.parent_id;
+        while let Some(id) = folder {
+            if !visible.insert(id.clone()) {
+                break;
+            }
+            folder = parents
+                .get(id.as_str())
+                .copied()
+                .flatten()
+                .map(str::to_owned);
+        }
+    }
+    Ok(Json(
+        folders
+            .into_iter()
+            .filter(|f| visible.contains(&f.id))
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRequest {
+    name: String,
+    /// Where a new folder goes; `null` for the top level.
+    #[serde(default)]
+    parent_id: Option<String>,
+}
+
+fn validate_folder_name(name: &str) -> ApiResult<String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 255 || name.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("The name needs 1–255 characters."));
+    }
+    Ok(name.to_owned())
+}
+
+pub async fn create_folder(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(by): ConnectionManager,
+    Json(body): Json<FolderRequest>,
+) -> ApiResult<(StatusCode, Json<Folder>)> {
+    let name = validate_folder_name(&body.name)?;
+    let parent_id = body.parent_id.as_deref().filter(|p| !p.is_empty());
+    let folder = state.db.create_folder(&name, parent_id).await?;
+    info!(by = %by.username, folder = %folder.id, name = %folder.name, "folder created");
+    Ok((StatusCode::CREATED, Json(folder)))
+}
+
+/// Renames the folder; moving is `PUT /api/folders/{id}/parent`.
+pub async fn rename_folder(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(by): ConnectionManager,
+    Path(id): Path<String>,
+    Json(body): Json<FolderRequest>,
+) -> ApiResult<Json<Folder>> {
+    let name = validate_folder_name(&body.name)?;
+    let folder = state.db.rename_folder(&id, &name).await?;
+    info!(by = %by.username, folder = %id, name = %folder.name, "folder renamed");
+    Ok(Json(folder))
+}
+
+pub async fn move_folder(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(by): ConnectionManager,
+    Path(id): Path<String>,
+    Json(body): Json<ParentRequest>,
+) -> ApiResult<Json<Folder>> {
+    let folder = state.db.move_folder(&id, parent(&body)).await?;
+    info!(by = %by.username, folder = %id, into = ?parent(&body), "folder moved");
+    Ok(Json(folder))
+}
+
+/// Deletes the folder; what it holds moves up into its parent.
+pub async fn delete_folder(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(by): ConnectionManager,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    state.db.delete_folder(&id).await?;
+    info!(by = %by.username, folder = %id, "folder deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -295,12 +473,29 @@ pub async fn delete_connection(
 pub struct UserDetail {
     #[serde(flatten)]
     user: User,
+    /// Connections granted to the user directly.
     connections: Vec<String>,
+    /// Folders granted to the user directly.
+    folders: Vec<String>,
+    /// Ids of the user's groups.
+    groups: Vec<String>,
 }
 
+async fn user_detail(state: &AppState, user: User) -> ApiResult<UserDetail> {
+    let grants = state.db.grants(Principal::User, &user.id).await?;
+    let groups = state.db.user_group_ids(&user.id).await?;
+    Ok(UserDetail {
+        user,
+        connections: grants.connections,
+        folders: grants.folders,
+        groups,
+    })
+}
+
+/// Every user; connection managers need the list to grant connections.
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
-    AdminUser(_): AdminUser,
+    ConnectionManager(_): ConnectionManager,
 ) -> ApiResult<Json<Vec<User>>> {
     Ok(Json(state.db.list_users().await?))
 }
@@ -311,8 +506,7 @@ pub async fn get_user(
     Path(id): Path<String>,
 ) -> ApiResult<Json<UserDetail>> {
     let user = state.db.user(&id).await?;
-    let connections = state.db.user_connection_ids(&id).await?;
-    Ok(Json(UserDetail { user, connections }))
+    Ok(Json(user_detail(&state, user).await?))
 }
 
 #[derive(Deserialize)]
@@ -321,10 +515,25 @@ pub struct UserRequest {
     username: Option<String>,
     /// Required when creating; leaving it out keeps the current password.
     password: Option<String>,
+    role: Option<Role>,
+    /// Before roles: `true` is `role: "admin"`, `false` is `role: "user"`.
+    /// Ignored when `role` is given.
     is_admin: Option<bool>,
     disabled: Option<bool>,
-    /// Ids of the granted connections; leaving it out keeps them.
+    /// Ids of the connections granted directly; leaving it out keeps them.
     connections: Option<Vec<String>>,
+    /// Ids of the folders granted directly; leaving it out keeps them.
+    folders: Option<Vec<String>>,
+    /// Ids of the user's groups; leaving it out keeps them.
+    groups: Option<Vec<String>>,
+}
+
+impl UserRequest {
+    fn role(&self) -> Option<Role> {
+        self.role.or(self
+            .is_admin
+            .map(|admin| if admin { Role::Admin } else { Role::User }))
+    }
 }
 
 fn validate_username(name: &str) -> ApiResult<String> {
@@ -344,13 +553,30 @@ fn username_taken(err: DbError) -> ApiError {
     }
 }
 
+/// Applies the memberships and grants of a user or group request.
+async fn apply_grants(
+    state: &AppState,
+    principal: Principal,
+    id: &str,
+    connections: Option<&[String]>,
+    folders: Option<&[String]>,
+) -> ApiResult<()> {
+    if let Some(ids) = connections {
+        state.db.set_granted_connections(principal, id, ids).await?;
+    }
+    if let Some(ids) = folders {
+        state.db.set_granted_folders(principal, id, ids).await?;
+    }
+    Ok(())
+}
+
 pub async fn create_user(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
     Json(body): Json<UserRequest>,
 ) -> ApiResult<(StatusCode, Json<UserDetail>)> {
     let username = validate_username(body.username.as_deref().unwrap_or(""))?;
-    let password = body.password.unwrap_or_default();
+    let password = body.password.clone().unwrap_or_default();
     auth::check_password_policy(&password)?;
     let hash = auth::hash_password_blocking(password).await?;
     let user = state
@@ -358,17 +584,25 @@ pub async fn create_user(
         .create_user(NewUser {
             username: &username,
             password_hash: &hash,
-            is_admin: body.is_admin.unwrap_or(false),
+            role: body.role().unwrap_or_default(),
             disabled: body.disabled.unwrap_or(false),
         })
         .await
         .map_err(username_taken)?;
-    if let Some(ids) = &body.connections {
-        state.db.set_user_connections(&user.id, ids).await?;
+    if let Some(ids) = &body.groups {
+        state.db.set_user_groups(&user.id, ids).await?;
     }
+    apply_grants(
+        &state,
+        Principal::User,
+        &user.id,
+        body.connections.as_deref(),
+        body.folders.as_deref(),
+    )
+    .await?;
     info!(by = %admin.username, username = %user.username, "user created");
-    let connections = state.db.user_connection_ids(&user.id).await?;
-    Ok((StatusCode::CREATED, Json(UserDetail { user, connections })))
+    let user = state.db.user(&user.id).await?;
+    Ok((StatusCode::CREATED, Json(user_detail(&state, user).await?)))
 }
 
 pub async fn update_user(
@@ -378,25 +612,20 @@ pub async fn update_user(
     Json(body): Json<UserRequest>,
 ) -> ApiResult<Json<UserDetail>> {
     let current = state.db.user(&id).await?;
-    let demotes = body.is_admin == Some(false) || body.disabled == Some(true);
-    if demotes && current.is_admin && !current.disabled {
-        if current.id == admin.id {
-            return Err(ApiError::bad_request(
-                "You cannot remove your own administrator access or disable yourself.",
-            ));
-        }
-        if state.db.count_other_admins(&current.id).await? == 0 {
-            return Err(ApiError::bad_request(
-                "At least one enabled administrator must remain.",
-            ));
-        }
+    let role = body.role();
+    let demotes_self =
+        role.is_some_and(|r| r != current.role && r != Role::Admin) || body.disabled == Some(true);
+    if current.id == admin.id && demotes_self {
+        return Err(ApiError::bad_request(
+            "You cannot remove your own administrator access or disable yourself.",
+        ));
     }
     let username = body
         .username
         .as_deref()
         .map(validate_username)
         .transpose()?;
-    let hash = match body.password.filter(|p| !p.is_empty()) {
+    let hash = match body.password.clone().filter(|p| !p.is_empty()) {
         Some(password) => {
             auth::check_password_policy(&password)?;
             Some(auth::hash_password_blocking(password).await?)
@@ -410,18 +639,26 @@ pub async fn update_user(
             UserUpdate {
                 username: username.as_deref(),
                 password_hash: hash.as_deref(),
-                is_admin: body.is_admin,
+                role,
                 disabled: body.disabled,
             },
         )
         .await
         .map_err(username_taken)?;
-    if let Some(ids) = &body.connections {
-        state.db.set_user_connections(&id, ids).await?;
+    if let Some(ids) = &body.groups {
+        state.db.set_user_groups(&id, ids).await?;
     }
+    apply_grants(
+        &state,
+        Principal::User,
+        &id,
+        body.connections.as_deref(),
+        body.folders.as_deref(),
+    )
+    .await?;
     info!(by = %admin.username, username = %user.username, "user updated");
-    let connections = state.db.user_connection_ids(&id).await?;
-    Ok(Json(UserDetail { user, connections }))
+    let user = state.db.user(&id).await?;
+    Ok(Json(user_detail(&state, user).await?))
 }
 
 pub async fn delete_user(
@@ -433,13 +670,156 @@ pub async fn delete_user(
         return Err(ApiError::bad_request("You cannot delete your own account."));
     }
     let user = state.db.user(&id).await?;
-    if user.is_admin && !user.disabled && state.db.count_other_admins(&id).await? == 0 {
-        return Err(ApiError::bad_request(
-            "At least one enabled administrator must remain.",
-        ));
-    }
     state.db.delete_user(&id).await?;
     info!(by = %admin.username, username = %user.username, "user deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Groups
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupDetail {
+    #[serde(flatten)]
+    group: Group,
+    /// Ids of the members.
+    members: Vec<String>,
+    /// Connections granted to the group directly.
+    connections: Vec<String>,
+    /// Folders granted to the group directly.
+    folders: Vec<String>,
+}
+
+async fn group_detail(state: &AppState, id: &str) -> ApiResult<GroupDetail> {
+    let group = state.db.group(id).await?;
+    let grants = state.db.grants(Principal::Group, id).await?;
+    Ok(GroupDetail {
+        group,
+        members: state.db.group_member_ids(id).await?,
+        connections: grants.connections,
+        folders: grants.folders,
+    })
+}
+
+/// Every group; connection managers need the list to grant connections.
+pub async fn list_groups(
+    State(state): State<Arc<AppState>>,
+    ConnectionManager(_): ConnectionManager,
+) -> ApiResult<Json<Vec<Group>>> {
+    Ok(Json(state.db.list_groups().await?))
+}
+
+pub async fn get_group(
+    State(state): State<Arc<AppState>>,
+    AdminUser(_): AdminUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<GroupDetail>> {
+    Ok(Json(group_detail(&state, &id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupRequest {
+    name: Option<String>,
+    role: Option<Role>,
+    /// Ids of the members; leaving it out keeps them.
+    members: Option<Vec<String>>,
+    /// Ids of the connections granted; leaving it out keeps them.
+    connections: Option<Vec<String>>,
+    /// Ids of the folders granted; leaving it out keeps them.
+    folders: Option<Vec<String>>,
+}
+
+fn validate_group_name(name: &str) -> ApiResult<String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "The group name needs 1–128 characters.",
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn group_name_taken(err: DbError) -> ApiError {
+    match err {
+        DbError::Conflict => {
+            ApiError::new(StatusCode::CONFLICT, "That group name is already taken.")
+        }
+        err => err.into(),
+    }
+}
+
+pub async fn create_group(
+    State(state): State<Arc<AppState>>,
+    AdminUser(admin): AdminUser,
+    Json(body): Json<GroupRequest>,
+) -> ApiResult<(StatusCode, Json<GroupDetail>)> {
+    let name = validate_group_name(body.name.as_deref().unwrap_or(""))?;
+    let group = state
+        .db
+        .create_group(&name, body.role.unwrap_or_default())
+        .await
+        .map_err(group_name_taken)?;
+    if let Some(ids) = &body.members {
+        state.db.set_group_members(&group.id, ids).await?;
+    }
+    apply_grants(
+        &state,
+        Principal::Group,
+        &group.id,
+        body.connections.as_deref(),
+        body.folders.as_deref(),
+    )
+    .await?;
+    info!(by = %admin.username, group = %group.name, "group created");
+    Ok((
+        StatusCode::CREATED,
+        Json(group_detail(&state, &group.id).await?),
+    ))
+}
+
+pub async fn update_group(
+    State(state): State<Arc<AppState>>,
+    AdminUser(admin): AdminUser,
+    Path(id): Path<String>,
+    Json(body): Json<GroupRequest>,
+) -> ApiResult<Json<GroupDetail>> {
+    let name = body.name.as_deref().map(validate_group_name).transpose()?;
+    let group = state
+        .db
+        .update_group(
+            &id,
+            GroupUpdate {
+                name: name.as_deref(),
+                role: body.role,
+            },
+        )
+        .await
+        .map_err(group_name_taken)?;
+    if let Some(ids) = &body.members {
+        state.db.set_group_members(&id, ids).await?;
+    }
+    apply_grants(
+        &state,
+        Principal::Group,
+        &id,
+        body.connections.as_deref(),
+        body.folders.as_deref(),
+    )
+    .await?;
+    info!(by = %admin.username, group = %group.name, "group updated");
+    Ok(Json(group_detail(&state, &id).await?))
+}
+
+pub async fn delete_group(
+    State(state): State<Arc<AppState>>,
+    AdminUser(admin): AdminUser,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let group = state.db.group(&id).await?;
+    state.db.delete_group(&id).await?;
+    info!(by = %admin.username, group = %group.name, "group deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -458,6 +838,7 @@ mod tests {
                 (" hostname ".into(), "10.0.0.5".into()),
                 ("empty".into(), String::new()),
             ]),
+            parent_id: Some(String::new()),
         }
     }
 
@@ -466,6 +847,7 @@ mod tests {
         let c = validate_connection(record("desk-1")).unwrap();
         assert_eq!((c.name.as_str(), c.protocol.as_str()), ("Desktop", "vnc"));
         assert_eq!((c.guacd_host, c.guacd_port), (None, None));
+        assert_eq!(c.parent_id, None);
         assert_eq!(
             c.parameters,
             BTreeMap::from([("hostname".into(), "10.0.0.5".into())])

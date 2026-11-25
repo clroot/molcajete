@@ -71,10 +71,30 @@ cargo run -p molcajete-gateway -- --config gateway.toml
 
 ### Users and connections
 
-Like Guacamole's JDBC authentication, the gateway keeps users, connections,
-their parameters and permissions in a database, managed from the web UI
-(*Connections* and *Users*). Administrators see and manage everything; other
-users see only the connections granted to them.
+Like Guacamole's JDBC authentication, the gateway keeps users, groups,
+connections, folders, their parameters and permissions in a database,
+managed from the web UI (*Connections*, *Users* and *Groups*).
+
+- **Roles.** Each user and each group has one of three roles; a user's
+  role is the highest of their own and their groups':
+  - *User* opens the connections granted to them.
+  - *Connection manager* also opens every connection, creates, edits,
+    moves and deletes connections and folders, and grants them to users
+    and groups. Users, groups and roles are out of reach.
+  - *Administrator* does everything, including users, groups and roles.
+    At least one enabled administrator always remains.
+- **Groups.** Connections and folders can be granted to a group instead of
+  to each member. Removing someone from a group takes away what the group
+  gave them and leaves their own grants.
+- **Folders.** Connections live in a tree of folders. A grant on a folder
+  covers every connection below it, in subfolders too, so moving a
+  connection into or out of a folder changes who can open it. Deleting a
+  folder moves what it holds up one level.
+
+A user can open the union of the connections granted to them, to their
+groups, and below the folders granted to either; the tunnel refuses any
+other connection as unknown. Grants are set from the user or group drawer,
+or from a connection's or folder's *Access…* action.
 
 ```toml
 [database]

@@ -20,7 +20,7 @@ export default function PageFrame({title, description, action, children}: Props)
       height="fill"
       header={
         <LayoutHeader hasDivider padding={4}>
-          <HStack gap={3} vAlign="center" hAlign="between">
+          <HStack gap={3} vAlign="center" hAlign="between" wrap="wrap">
             <VStack gap={0.5}>
               <Heading level={1}>{title}</Heading>
               {description && <Text color="secondary">{description}</Text>}

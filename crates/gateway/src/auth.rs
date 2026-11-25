@@ -19,7 +19,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::AppState;
 use crate::api::ApiError;
-use crate::db::{DbError, User};
+use crate::db::{DbError, Role, User};
 
 pub const SESSION_COOKIE: &str = "molcajete_session";
 pub const MIN_PASSWORD_LENGTH: usize = 8;
@@ -156,7 +156,18 @@ impl FromRequestParts<Arc<AppState>> for CurrentUser {
     }
 }
 
-/// A signed-in administrator; 401 when signed out, 403 for other users.
+/// The signed-in user if their effective role is at least `role`; 401 when
+/// signed out, 403 for users with a lesser role.
+async fn user_with_role(parts: &Parts, state: &AppState, role: Role) -> Result<User, ApiError> {
+    let user = user_from_headers(state, &parts.headers).await?;
+    if user.effective_role < role {
+        return Err(ApiError::forbidden(role));
+    }
+    Ok(user)
+}
+
+/// A signed-in administrator ([`Role::Admin`]): manages users, groups and
+/// roles, and everything a [`ConnectionManager`] does.
 pub struct AdminUser(pub User);
 
 impl FromRequestParts<Arc<AppState>> for AdminUser {
@@ -166,11 +177,25 @@ impl FromRequestParts<Arc<AppState>> for AdminUser {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let user = user_from_headers(state, &parts.headers).await?;
-        if !user.is_admin {
-            return Err(ApiError::forbidden());
-        }
-        Ok(Self(user))
+        user_with_role(parts, state, Role::Admin).await.map(Self)
+    }
+}
+
+/// A signed-in connection manager or administrator
+/// ([`Role::ConnectionManager`] or higher): manages connections and
+/// folders and grants them to users and groups.
+pub struct ConnectionManager(pub User);
+
+impl FromRequestParts<Arc<AppState>> for ConnectionManager {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        user_with_role(parts, state, Role::ConnectionManager)
+            .await
+            .map(Self)
     }
 }
 

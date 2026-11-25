@@ -1,5 +1,5 @@
 import {useCallback} from 'react';
-import {api, type Connection} from '../api';
+import {api, type Connection, type Folder} from '../api';
 import {FormDrawer, FormDrawerLayout} from '../shell/FormDrawer';
 import AsyncContent from '../shell/AsyncContent';
 import type {DrawerState} from '../shell/drawerState';
@@ -9,27 +9,41 @@ import ConnectionFormView from './ConnectionFormView';
 
 type Props = {
   state: DrawerState;
+  folders: Folder[];
+  /** Where a new connection goes by default; null for the top level. */
+  newConnectionFolder: string | null;
   onClose: () => void;
   onSaved: (connection: Connection) => void;
 };
 
 /** Creates a connection, or edits one once it has loaded. */
-export default function ConnectionDrawer({state, onClose, onSaved}: Props) {
+export default function ConnectionDrawer({state, folders, newConnectionFolder, onClose, onSaved}: Props) {
   return (
     <FormDrawer isOpen={state.mode !== 'closed'} title="Connection" width={480} onClose={onClose}>
       {state.mode === 'create' && (
-        <ConnectionFormView isNew initial={emptyConnectionForm()} onClose={onClose} onSaved={onSaved} />
+        <ConnectionFormView
+          isNew
+          initial={emptyConnectionForm(newConnectionFolder)}
+          folders={folders}
+          onClose={onClose}
+          onSaved={onSaved}
+        />
       )}
       {state.mode === 'edit' && (
-        <EditConnection key={state.id} id={state.id} onClose={onClose} onSaved={onSaved} />
+        <EditConnection key={state.id} id={state.id} folders={folders} onClose={onClose} onSaved={onSaved} />
       )}
     </FormDrawer>
   );
 }
 
-type EditProps = {id: string; onClose: () => void; onSaved: (connection: Connection) => void};
+type EditProps = {
+  id: string;
+  folders: Folder[];
+  onClose: () => void;
+  onSaved: (connection: Connection) => void;
+};
 
-function EditConnection({id, onClose, onSaved}: EditProps) {
+function EditConnection({id, folders, onClose, onSaved}: EditProps) {
   const fetchConnection = useCallback(() => api.connection(id), [id]);
   const connection = useApiData(fetchConnection);
 
@@ -48,6 +62,7 @@ function EditConnection({id, onClose, onSaved}: EditProps) {
     <ConnectionFormView
       isNew={false}
       initial={toConnectionForm(connection.data)}
+      folders={folders}
       onClose={onClose}
       onSaved={onSaved}
     />

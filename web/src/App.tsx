@@ -7,6 +7,7 @@ import AppFrame from './shell/AppFrame';
 import LoginPage from './auth/LoginPage';
 import ConnectionsPage from './connections/ConnectionsPage';
 import UsersPage from './users/UsersPage';
+import GroupsPage from './groups/GroupsPage';
 import SessionPage from './session/SessionPage';
 
 type Auth = {status: 'checking'} | {status: 'signedOut'} | {status: 'signedIn'; user: User};
@@ -54,6 +55,8 @@ function SignedInApp({user, onSignOut}: {user: User; onSignOut: () => void}) {
     <AppFrame user={user} route={route} onSignOut={onSignOut}>
       {route.name === 'users' && user.isAdmin ? (
         <UsersPage currentUser={user} />
+      ) : route.name === 'groups' && user.isAdmin ? (
+        <GroupsPage />
       ) : (
         <ConnectionsPage user={user} />
       )}

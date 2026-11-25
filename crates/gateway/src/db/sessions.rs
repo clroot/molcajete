@@ -59,7 +59,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::super::tests::every_backend;
-    use super::super::{NewUser, UserUpdate};
+    use super::super::{NewUser, Role, UserUpdate};
     use super::*;
 
     #[tokio::test]
@@ -70,7 +70,7 @@ mod tests {
                 .create_user(NewUser {
                     username: "s",
                     password_hash: "h",
-                    is_admin: false,
+                    role: Role::User,
                     disabled: false,
                 })
                 .await

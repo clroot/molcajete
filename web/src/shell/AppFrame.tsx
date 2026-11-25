@@ -5,6 +5,7 @@ import {SideNav, SideNavHeading, SideNavItem, SideNavSection} from '@astryxdesig
 import {
   ComputerDesktopIcon,
   UsersIcon,
+  UserGroupIcon,
   KeyIcon,
   ArrowRightStartOnRectangleIcon,
   UserCircleIcon,
@@ -49,12 +50,20 @@ export default function AppFrame({user, route, onSignOut, children}: Props) {
               isSelected={route.name === 'connections'}
             />
             {user.isAdmin && (
-              <SideNavItem
-                label="Users"
-                icon={UsersIcon}
-                href={href.users}
-                isSelected={route.name === 'users'}
-              />
+              <>
+                <SideNavItem
+                  label="Users"
+                  icon={UsersIcon}
+                  href={href.users}
+                  isSelected={route.name === 'users'}
+                />
+                <SideNavItem
+                  label="Groups"
+                  icon={UserGroupIcon}
+                  href={href.groups}
+                  isSelected={route.name === 'groups'}
+                />
+              </>
             )}
           </SideNavSection>
         </SideNav>

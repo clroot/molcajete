@@ -104,11 +104,11 @@ Between molcajete components, stream data (images, video, audio) travels as raw 
 
 ### 2.2 molcajete-gateway
 
-- Built on axum. Serves the JSON API (`/api/auth/*`, `/api/connections`, `/api/users`), `/websocket-tunnel` and the static files (`web/dist`).
+- Built on axum. Serves the JSON API (`/api/auth/*`, `/api/connections`, `/api/folders`, `/api/users`, `/api/groups`), `/websocket-tunnel` and the static files (`web/dist`).
 - After the WebSocket upgrade it performs the guacd handshake; on failure it closes with the status code in the close reason (like the Java web app).
 - guacd → browser: the bytes read are cut into instructions by the parser and batched into one message of up to 64 KiB, sent immediately when the next read would block. For a client on the binary subprotocol the messages are binary and made of records instead (section 2.6): records from molcajeted are batched as they are, without looking inside; instructions from a stock guacd are parsed as before and their `blob` data is decoded from base64 on the way.
 - browser → guacd: validated with `Limits::STRICT` and forwarded verbatim. Internal pings are answered directly.
-- Configuration: TOML (`gateway.example.toml`) for the server itself. Users, connections (each may name its own guacd), parameters, permissions and login sessions are stored in PostgreSQL, MySQL/MariaDB or SQLite through sqlx's `Any` driver, with per-dialect migrations in `crates/gateway/migrations/`, like Guacamole's JDBC authentication extensions. Passwords are Argon2id hashes; sessions are cookies whose SHA-256 is stored.
+- Configuration: TOML (`gateway.example.toml`) for the server itself. Users, groups and their roles, connections (each may name its own guacd) in a tree of folders, parameters, grants of connections and folders to users and groups, and login sessions are stored in PostgreSQL, MySQL/MariaDB or SQLite through sqlx's `Any` driver, with per-dialect migrations in `crates/gateway/migrations/`, like Guacamole's JDBC authentication extensions. Roles are fixed (`user`, `connection_manager`, `admin`) and checked by request extractors (`AdminUser`, `ConnectionManager`); the connections a user may open are found with one recursive query over direct, group and folder grants. Passwords are Argon2id hashes; sessions are cookies whose SHA-256 is stored.
 
 ### 2.3 molcajete-client: GPU renderer design
 
