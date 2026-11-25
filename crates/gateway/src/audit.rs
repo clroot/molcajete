@@ -275,14 +275,18 @@ fn log(entry: &AuditEntry) {
 /// `null` for a record that did not exist yet or no longer does):
 /// `{"field": {"from": …, "to": …}}`. Nested objects are flattened
 /// (`parameters.hostname`); lists of strings show what was added and
-/// removed (`{"added": […], "removed": […]}`). Secrets are redacted by
-/// [`record`].
+/// removed (`{"added": […], "removed": […]}`). A missing field and `null`
+/// are the same. Secrets are redacted by [`record`].
 pub fn diff(before: &Value, after: &Value) -> Value {
     let (before, after) = (flatten(before), flatten(after));
     let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
     let mut changes = Map::new();
+    let get = |map: &BTreeMap<String, Value>, key: &str| -> Option<Value> {
+        map.get(key).filter(|v| !v.is_null()).cloned()
+    };
     for key in keys {
-        let (old, new) = (before.get(key), after.get(key));
+        let (old, new) = (get(&before, key), get(&after, key));
+        let (old, new) = (old.as_ref(), new.as_ref());
         if old == new {
             continue;
         }
@@ -432,7 +436,10 @@ mod tests {
             })
         );
         assert_eq!(
-            diff(&Value::Null, &json!({ "name": "x", "groups": ["g"] })),
+            diff(
+                &Value::Null,
+                &json!({ "name": "x", "groups": ["g"], "port": null })
+            ),
             json!({
                 "name": { "from": null, "to": "x" },
                 "groups": { "added": ["g"] },
