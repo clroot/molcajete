@@ -165,7 +165,14 @@ cargo test --workspace                       # unit tests (protocol, gateway, gu
 scripts/build-web.sh                         # then: renderer pixel, keyboard/IME, binary tunnel and playback tests
 (cd tests/browser && npm install && npm test)
 (cd tests/browser && node video.test.mjs)    # video decoding (needs ffmpeg with libx264/libsvtav1)
+scripts/fuzz.sh 60                           # each fuzz target for 60 s (needs nightly and cargo-fuzz)
 ```
+
+The fuzz targets in `fuzz/` feed arbitrary bytes to every parser that reads
+an untrusted party: the instruction parser, binary records, zstd images and
+video frames, and in molcajeted the handshake and client input, the VNC
+client and the SSH terminal; a weekly GitHub Actions job runs them
+([architecture](docs/architecture.md#71-tests)).
 
 The browser tests feed Guacamole instructions directly into the wasm client in
 headless Chromium and compare layer/canvas pixels with what the HTML canvas
