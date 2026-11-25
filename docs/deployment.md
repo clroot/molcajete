@@ -401,6 +401,18 @@ The history grows by one row per session, so a busy gateway may want a shorter p
 | `max_lifetime_days` | `365` | The longest a new token may be valid, in days. Every token has an expiry; tokens already created keep theirs when this is lowered. |
 | `ticket_ttl_seconds` | `60` | How long a one-time session link can be opened. |
 
+### `[sharing]`
+
+[Share links and watching sessions](administration.md#sharing-a-session).
+
+| Key | Default | |
+| --- | --- | --- |
+| `links` | `true` | Users may share their open sessions through links. `false` hides *Sharing* in the session menu and refuses existing links. |
+| `shadowing` | `true` | Administrators may watch any open session (*Watch* in *Active sessions*). |
+| `max_link_minutes` | `1440` | The longest a share link may last, in minutes; the menu offers the choices up to it. |
+
+Links and joined sessions are kept in the gateway's memory, like the open sessions, so with several replicas a link works only on the replica serving its session.
+
 ### `[[users]]`
 
 Administrators created at startup when no user with that username exists yet. Existing users and their passwords are left alone, so changing a password here later has no effect; use the web UI or `set-password`.
@@ -500,7 +512,7 @@ Gateways from this change on keep [connection credentials](administration.md#sto
 
 ### Configuration files
 
-The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`, `[history]`, `[api_tokens]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour, with one exception: since `[server] trusted_proxies` was added, `X-Real-IP` and `X-Forwarded-For` are read only from the proxies it lists. A gateway behind a proxy needs it set, or every client has the proxy's address in logs, in the audit log and for [failed sign-in limits](administration.md#repeated-failed-sign-ins).
+The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`, `[history]`, `[api_tokens]`, `[sharing]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour, with one exception: since `[server] trusted_proxies` was added, `X-Real-IP` and `X-Forwarded-For` are read only from the proxies it lists. A gateway behind a proxy needs it set, or every client has the proxy's address in logs, in the audit log and for [failed sign-in limits](administration.md#repeated-failed-sign-ins).
 
 ## Mixed versions
 
@@ -514,6 +526,7 @@ Old and new versions of the web client, the gateway and molcajeted work together
 | Frame pacing by apply time: the frame interval follows how long the client takes to apply a frame, not the whole round trip | Web client and molcajeted (an extra `sync` argument each way); any gateway relays it | Daemon older or stock guacd: neither side asks, and pacing is as before. Client older or stock: it ignores the extra argument and molcajeted paces by the smoothed round trip. | `molcajeted_client_apply_seconds` stays empty for clients that do not report. `molcajeted_unacked_frames` stays within the window (3 frames for RDP and VNC, 2 for SSH). |
 | Terminal copy, paste and links | Shortcuts and toasts in the web client; links and clearing the selection on click in molcajeted (SSH) | Stock guacd (SSH, telnet, Kubernetes): shortcuts and toasts but no links, and after a click clears the selection the copy shortcut still copies the previous one. Client older with new molcajeted: links are underlined but cannot be opened. | |
 | Session recordings | Gateway only (it records and indexes; the player ships with it) | Any daemon, stock guacd included. Recorded sessions offer the daemon only stock formats, so molcajeted sends PNG and JPEG instead of zstd images and video, unless the connection has `record-molcajete-formats`; those recordings play only in molcajete's player. | `record` in the gateway's `opening tunnel`; `recording the session` and `recording complete` in its log. `[recordings] enabled = false` for every connection. |
+| Sharing a session and watching it (share links, shadowing) | Gateway (links, joining with `select,<connection id>`) and web UI (the menu, `#/join/`, *Watch*); the daemon must support joining | Stock guacd: works; it enforces `read-only` itself, but keeps joined users after the owner leaves, so the gateway disconnects them. molcajeted before joining was added refuses with `RESOURCE_NOT_FOUND` (*This session is not available*). Web UI older: no Sharing section or Watch button, though the API works. Gateway older: no links; the `join`/`shadow` tunnel parameters are ignored. | `joined a session` in the gateway's log and `user joined` in molcajeted's; `molcajeted_joined_users_active`. `[sharing] links = false`, `shadowing = false`. |
 | SSH jump hosts: reach the server through bastions | molcajeted only (the `jump-hosts` and `jump-host-*` parameters); the form section is in the web UI, and any gateway passes the parameters and the `required` prompts through | Stock guacd and older molcajeted do not ask for these parameters, so they are never sent; the daemon connects to the server directly, which usually fails because only the bastion can reach it. Web UI older: the parameters can still be set under *Advanced*. | `connected through jump hosts` in molcajeted's log; remove `jump-hosts` from the connection to connect directly. |
 
 - molcajeted serves the stock Guacamole web application and guacamole-common-js as well; those clients use none of the extensions above.
