@@ -18,6 +18,8 @@ use tracing::info;
 pub(super) enum ImageKind {
     Png,
     Jpeg,
+    /// `molcajete_protocol::zimage`.
+    Zstd,
 }
 
 /// Steps of [`super::Display::flush`].
@@ -91,6 +93,8 @@ struct Totals {
     png_bytes: u64,
     jpeg: Timing,
     jpeg_bytes: u64,
+    zstd: Timing,
+    zstd_bytes: u64,
     video: Timing,
     video_bytes: u64,
 }
@@ -107,6 +111,7 @@ pub(super) struct DisplayMetrics {
     unacked: Histogram,
     png: ImageMetrics,
     jpeg: ImageMetrics,
+    zstd: ImageMetrics,
     totals: Totals,
 }
 
@@ -132,6 +137,7 @@ impl DisplayMetrics {
             unacked: Histogram::noop(),
             png: image(),
             jpeg: image(),
+            zstd: image(),
             totals: Totals::default(),
         }
     }
@@ -163,6 +169,7 @@ impl DisplayMetrics {
             unacked: histogram!("molcajeted_unacked_frames", &labels),
             png: ImageMetrics::new(protocol, "png"),
             jpeg: ImageMetrics::new(protocol, "jpeg"),
+            zstd: ImageMetrics::new(protocol, "zstd"),
             totals: Totals::default(),
         }
     }
@@ -178,10 +185,18 @@ impl DisplayMetrics {
         self.totals.phases[phase as usize].total
     }
 
-    /// Images encoded so far as (count, total time).
+    /// Lossless images (PNG and zstd) encoded so far as (count, total
+    /// time).
     #[cfg(test)]
-    pub(super) fn png_total(&self) -> (u64, Duration) {
-        (self.totals.png.count, self.totals.png.total)
+    pub(super) fn lossless_total(&self) -> (u64, Duration) {
+        let t = &self.totals;
+        (t.png.count + t.zstd.count, t.png.total + t.zstd.total)
+    }
+
+    /// zstd images encoded so far.
+    #[cfg(test)]
+    pub(super) fn zstd_count(&self) -> u64 {
+        self.totals.zstd.count
     }
 
     pub(super) fn flushed(&mut self, elapsed: Duration) {
@@ -216,6 +231,11 @@ impl DisplayMetrics {
                 &self.jpeg,
                 &mut self.totals.jpeg,
                 &mut self.totals.jpeg_bytes,
+            ),
+            ImageKind::Zstd => (
+                &self.zstd,
+                &mut self.totals.zstd,
+                &mut self.totals.zstd_bytes,
             ),
         };
         m.encode.record(elapsed);
@@ -273,6 +293,10 @@ impl DisplayMetrics {
             jpeg_bytes = t.jpeg_bytes,
             jpeg_ms_avg = t.jpeg.avg_ms(),
             jpeg_ms_max = t.jpeg.max_ms(),
+            zstd_images = t.zstd.count,
+            zstd_bytes = t.zstd_bytes,
+            zstd_ms_avg = t.zstd.avg_ms(),
+            zstd_ms_max = t.zstd.max_ms(),
             video_frames = t.video.count,
             video_bytes = t.video_bytes,
             video_encode_ms_avg = t.video.avg_ms(),

@@ -1,8 +1,13 @@
 //! Image encoding for display updates.
 //!
 //! Lossless updates use PNG, as an 8-bit palette image when the region has at
-//! most 256 colours (typical for UI and text) and RGB otherwise. Frequently
-//! updated, colourful regions may use JPEG when the client supports it.
+//! most 256 colours (typical for UI and text) and RGB otherwise. Clients
+//! that announce the zstd image type (`molcajete_protocol::zimage`) get it
+//! instead of PNG wherever it is the better choice ([`ZstdEncoder`]).
+//! Frequently updated, colourful regions may use JPEG when the client
+//! supports it.
+
+use molcajete_protocol::zimage;
 
 /// DEFLATE setting of display updates. On text, level 4 is 4 to 5 times
 /// faster than zlib's default (6) for 5% more bytes; level 1 saves another
@@ -130,16 +135,90 @@ pub fn encode_png_with(
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_filter(png::Filter::Adaptive);
-        let rgb: Vec<u8> = region
-            .rgba
-            .chunks_exact(4)
-            .flat_map(|p| [p[0], p[1], p[2]])
-            .collect();
         let mut writer = encoder.write_header()?;
-        writer.write_image_data(&rgb)?;
+        writer.write_image_data(&rgb_of(region))?;
         writer.finish()?;
     }
     Ok(out)
+}
+
+fn rgb_of(region: &Region) -> Vec<u8> {
+    region
+        .rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect()
+}
+
+/// Zstandard level of zstd images. On recorded sessions level 3 takes 4 to
+/// 11% fewer bytes than level 1 for 5% more time, and level 5 another 2 to
+/// 3% for up to twice the time (docs/architecture.md, section 2.7).
+const ZSTD_LEVEL: i32 = 3;
+
+/// An RGB region is sent as a zstd image when at least this share of its
+/// pixels repeats the pixel to the left, which tells screen content from
+/// photographs: 94% and more in the windows and pages of recorded sessions,
+/// 3 to 15% in photographs. Zstandard has no row filter, so a photograph
+/// takes a quarter to three quarters more bytes than as PNG, while a window
+/// takes about 40% fewer.
+const FLAT_SHARE: (usize, usize) = (3, 4);
+
+/// [`is_flat`] looks at one row in this many.
+const FLAT_ROW_STEP: usize = 4;
+
+/// Whether an RGB region looks like screen content rather than a
+/// photograph.
+fn is_flat(region: &Region) -> bool {
+    let row = region.width as usize * 4;
+    let (mut same, mut pairs) = (0usize, 0usize);
+    for line in region.rgba.chunks_exact(row).step_by(FLAT_ROW_STEP) {
+        let pixels = line.as_chunks::<4>().0;
+        same += pixels.windows(2).filter(|p| p[0] == p[1]).count();
+        pairs += pixels.len() - 1;
+    }
+    same * FLAT_SHARE.1 >= pairs * FLAT_SHARE.0
+}
+
+/// Encoder of zstd images (`molcajete_protocol::zimage`). A session keeps
+/// one, so that the compression context is reused for every image.
+pub struct ZstdEncoder {
+    context: zstd::bulk::Compressor<'static>,
+}
+
+impl ZstdEncoder {
+    pub fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            context: zstd::bulk::Compressor::new(ZSTD_LEVEL)?,
+        })
+    }
+
+    /// Encodes an opaque region, or returns `None` where PNG is the better
+    /// choice: for a photograph ([`FLAT_SHARE`]) and for a size the format
+    /// cannot carry. A region of up to 256 colours is always encoded.
+    pub fn encode(&mut self, region: &Region) -> Option<Vec<u8>> {
+        if !zimage::fits(region.width, region.height) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(region.rgba.len() / 16 + 64);
+        let raw = if let Some((palette, indices)) = palettize(region) {
+            zimage::write_header(&mut out, region.width, region.height, Some(&palette));
+            let bits = zimage::index_bits(palette.len() / 3);
+            pack_indices(&indices, region.width, region.height, bits)
+        } else if is_flat(region) {
+            zimage::write_header(&mut out, region.width, region.height, None);
+            rgb_of(region)
+        } else {
+            return None;
+        };
+        let header = out.len();
+        out.resize(header + zstd::zstd_safe::compress_bound(raw.len()), 0);
+        let written = self
+            .context
+            .compress_to_buffer(&raw, &mut out[header..])
+            .ok()?;
+        out.truncate(header + written);
+        Some(out)
+    }
 }
 
 /// Lossy JPEG encoding (opaque regions only).
@@ -266,6 +345,102 @@ mod tests {
         .unwrap();
         let (_, _, rgb) = decode(&bytes);
         assert_eq!(rgb, rgb_of(&rgba));
+    }
+
+    fn region(width: u32, height: u32, rgba: &[u8]) -> Region<'_> {
+        Region {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    /// `colors` colours in runs of `run` pixels.
+    fn runs(width: u32, height: u32, colors: u32, run: u32) -> Vec<u8> {
+        let mut state = 0x9E37_79B9u32;
+        let mut color = [0u8; 4];
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for i in 0..width * height {
+            if i % run == 0 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let c = state % colors;
+                color = [c as u8, (c >> 8) as u8, (c >> 16) as u8, 255];
+            }
+            rgba.extend_from_slice(&color);
+        }
+        rgba
+    }
+
+    #[test]
+    fn zstd_images_round_trip() {
+        let mut encoder = ZstdEncoder::new().unwrap();
+        let mut decoder = zimage::Decoder::default();
+        let mut decoded = Vec::new();
+        let shapes = [
+            (1, 1),
+            (1, 300),
+            (300, 1),
+            (5, 3),
+            (17, 9),
+            (640, 480),
+            // More than the 2 MiB window of the compression level, as
+            // indices and as RGB.
+            (2400, 1300),
+        ];
+        for (w, h) in shapes {
+            // 1, 2, 4 and 8 bits per index, then RGB.
+            for colors in [1, 2, 4, 16, 200, 1 << 24] {
+                for run in [1, 9] {
+                    let rgba = runs(w, h, colors, run);
+                    let rgb = palettize(&region(w, h, &rgba)).is_none();
+                    let encoded = encoder.encode(&region(w, h, &rgba));
+                    // Only RGB in which every pixel differs is left to PNG.
+                    assert_eq!(
+                        encoded.is_none(),
+                        rgb && run == 1 && w > 1,
+                        "{w}x{h} {colors}"
+                    );
+                    let Some(encoded) = encoded else { continue };
+                    assert_eq!(encoded[0] == 1, rgb, "{w}x{h} {colors}: kind");
+                    assert_eq!(decoder.decode(&encoded, &mut decoded), Ok((w, h)));
+                    assert!(decoded == rgba, "{w}x{h}, {colors} colours, runs of {run}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_zstd_images_span_records() {
+        // Text-like noise does not compress below a record (64 KiB).
+        let rgba = runs(800, 600, 200, 1);
+        let encoded = ZstdEncoder::new().unwrap().encode(&region(800, 600, &rgba));
+        let encoded = encoded.expect("indexed");
+        assert!(encoded.len() > 64 * 1024, "{} bytes", encoded.len());
+        let mut decoded = Vec::new();
+        let size = zimage::Decoder::default().decode(&encoded, &mut decoded);
+        assert_eq!(size, Ok((800, 600)));
+        assert!(decoded == rgba);
+    }
+
+    #[test]
+    fn sizes_the_format_cannot_carry_are_left_to_png() {
+        let mut encoder = ZstdEncoder::new().unwrap();
+        // Wider than 16 bits.
+        let rgba = [1u8, 2, 3, 255].repeat(70_000);
+        assert!(encoder.encode(&region(70_000, 1, &rgba)).is_none());
+        assert!(encoder.encode(&region(1, 70_000, &rgba)).is_none());
+        assert!(encoder.encode(&region(35_000, 2, &rgba)).is_some());
+    }
+
+    #[test]
+    fn screen_content_is_told_from_photographs() {
+        // Runs of 8 pixels: 7 of 8 pixels repeat their neighbour.
+        assert!(is_flat(&region(256, 64, &runs(256, 64, 1 << 24, 8))));
+        // Runs of 2: half of them do, which is below three quarters.
+        assert!(!is_flat(&region(256, 64, &runs(256, 64, 1 << 24, 2))));
+        assert!(!is_flat(&region(256, 64, &runs(256, 64, 1 << 24, 1))));
     }
 
     #[test]

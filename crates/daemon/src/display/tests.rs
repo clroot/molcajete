@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use base64::Engine;
-use molcajete_protocol::parse_all;
+use molcajete_protocol::{parse_all, zimage};
 
 use super::*;
 
@@ -13,6 +13,9 @@ struct Client {
     pixels: Vec<u8>,
     rect: Option<Rect>,
     streams: HashMap<i32, (String, i32, i32, i32, Vec<u8>)>,
+    /// The client's own decoder of zstd images.
+    zstd: zimage::Decoder,
+    zstd_images: usize,
 }
 
 impl Client {
@@ -23,6 +26,8 @@ impl Client {
             pixels: Vec::new(),
             rect: None,
             streams: HashMap::new(),
+            zstd: zimage::Decoder::default(),
+            zstd_images: 0,
         }
     }
 
@@ -108,8 +113,16 @@ impl Client {
                     if layer != 0 {
                         continue;
                     }
-                    assert_eq!(mime, "image/png", "tests run lossless");
-                    let (w, h, rgba) = decode_png(&data);
+                    let (w, h, rgba) = match mime.as_str() {
+                        "image/png" => decode_png(&data),
+                        zimage::MIMETYPE => {
+                            let mut rgba = Vec::new();
+                            let (w, h) = self.zstd.decode(&data, &mut rgba).expect("zstd image");
+                            self.zstd_images += 1;
+                            (w, h, rgba)
+                        }
+                        other => panic!("{other}: tests run lossless"),
+                    };
                     for r in 0..h {
                         for c in 0..w {
                             let s = ((r * w + c) * 4) as usize;
@@ -173,8 +186,40 @@ fn text_row(width: u32, seed: u64) -> Vec<u8> {
         .collect()
 }
 
+/// A block of screen content with more than 256 colours: runs of one
+/// colour, a new colour for every run.
+fn window_block(width: u32, height: u32, seed: u64) -> Vec<u8> {
+    let mut rng = Rng(seed | 1);
+    let mut block = Vec::with_capacity((width * height * 4) as usize);
+    let mut color = [0u8; 4];
+    for i in 0..width * height {
+        if i % 8 == 0 {
+            let v = rng.next();
+            color = [v as u8, (v >> 8) as u8, (v >> 16) as u8, 255];
+        }
+        block.extend_from_slice(&color);
+    }
+    block
+}
+
+/// A block in which every pixel has another colour, like a photograph.
+fn photo_block(width: u32, height: u32, seed: u64) -> Vec<u8> {
+    let mut rng = Rng(seed | 1);
+    (0..width * height)
+        .flat_map(|_| {
+            let v = rng.next();
+            [v as u8, (v >> 8) as u8, (v >> 16) as u8, 255]
+        })
+        .collect()
+}
+
 fn setup(w: u32, h: u32) -> (Display, Client, Output) {
-    let mut d = Display::new(ImageFormats { jpeg: false }, true);
+    setup_for(w, h, false)
+}
+
+/// A display and its client, which accepts zstd images or PNG only.
+fn setup_for(w: u32, h: u32, zstd: bool) -> (Display, Client, Output) {
+    let mut d = Display::new(ImageFormats { jpeg: false, zstd }, true);
     let mut out = Output::text();
     d.resize(w, h, &mut out);
     let mut c = Client::new();
@@ -435,7 +480,13 @@ fn binary_output_carries_the_same_frame_as_raw_bytes() {
         .collect();
     // The same screen, flushed once as text and once as records.
     let frame = |mut out: Output| {
-        let mut d = Display::new(ImageFormats { jpeg: false }, true);
+        let mut d = Display::new(
+            ImageFormats {
+                jpeg: false,
+                zstd: false,
+            },
+            true,
+        );
         d.resize(300, 300, &mut out);
         d.put(0, 0, 300, 300, &noise);
         let stats = d.flush(&mut out);
@@ -485,7 +536,13 @@ fn binary_output_carries_the_same_frame_as_raw_bytes() {
 
 #[test]
 fn busy_areas_go_lossy_then_get_refined() {
-    let mut d = Display::new(ImageFormats { jpeg: true }, false);
+    let mut d = Display::new(
+        ImageFormats {
+            jpeg: true,
+            zstd: false,
+        },
+        false,
+    );
     let mut out = Output::text();
     d.resize(256, 256, &mut out);
     let mut rng = Rng(5);
@@ -552,12 +609,27 @@ fn time_an_ack_waited_unread_is_not_lag() {
 /// every flush the simulated client must equal the framebuffer exactly.
 #[test]
 fn fuzz_client_always_matches_framebuffer() {
+    let mut zstd_images = 0;
     for seed in 1..=40u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let (mut w, mut h) = (64 + rng.below(200), 64 + rng.below(160));
-        let (mut d, mut c, _) = setup(w, h);
+        // Every other client accepts zstd images.
+        let zstd = seed % 2 == 0;
+        let (mut d, mut c, _) = setup_for(w, h, zstd);
         for step in 0..60 {
-            match rng.below(11) {
+            match rng.below(13) {
+                11 | 12 => {
+                    // Many colours: a window (zstd image, RGB) or a
+                    // photograph (PNG for every client).
+                    let (x, y) = (rng.below(w), rng.below(h));
+                    let (rw, rh) = (1 + rng.below(w - x), 1 + rng.below(h - y));
+                    let block = if rng.below(2) == 0 {
+                        window_block(rw, rh, rng.next())
+                    } else {
+                        photo_block(rw, rh, rng.next())
+                    };
+                    d.put(x, y, rw, rh, &block);
+                }
                 0..=3 => {
                     let (x, y) = (rng.below(w), rng.below(h));
                     let (rw, rh) = (1 + rng.below(w - x), 1 + rng.below(h - y));
@@ -626,7 +698,66 @@ fn fuzz_client_always_matches_framebuffer() {
             }
         }
         flush_into(&mut d, &mut c);
+        assert!(zstd || c.zstd_images == 0, "zstd image for a PNG client");
+        zstd_images += c.zstd_images;
     }
+    assert!(zstd_images > 50, "{zstd_images} zstd images");
+}
+
+/// The mimetypes of the images in `out`, in order.
+fn image_types(out: &str) -> Vec<String> {
+    parse_all(out)
+        .expect("valid protocol")
+        .iter()
+        .filter(|i| i.opcode == "img")
+        .map(|i| i.arg(3).to_owned())
+        .collect()
+}
+
+#[test]
+fn zstd_images_go_to_clients_that_announce_them() {
+    let png = ["image/png", "image/jpeg", "image/webp"];
+    let formats = ImageFormats::from_mimetypes(&png);
+    assert!(formats.jpeg && !formats.zstd);
+    let ours = [png.as_slice(), &[zimage::MIMETYPE]].concat();
+    assert!(ImageFormats::from_mimetypes(&ours).zstd);
+    // A later version of the type is another type.
+    assert!(!ImageFormats::from_mimetypes(&["image/x-molcajete-zstd-v2"]).zstd);
+
+    for zstd in [false, true] {
+        let (mut d, mut c, _) = setup_for(200, 100, zstd);
+        let text: Vec<u8> = (0..40).flat_map(|r| text_row(200, r)).collect();
+        d.put(0, 0, 200, 40, &text);
+        let (stats, out) = flush_into(&mut d, &mut c);
+        assert_eq!(stats.images, 1);
+        let expected = if zstd { zimage::MIMETYPE } else { "image/png" };
+        assert_eq!(image_types(&out), [expected]);
+        assert_eq!(c.zstd_images, zstd as usize);
+    }
+}
+
+#[test]
+fn photographs_and_transparency_stay_png() {
+    let (mut d, mut c, _) = setup_for(320, 200, true);
+    // A window with more than 256 colours is a zstd image (RGB).
+    d.put(0, 0, 160, 60, &window_block(160, 60, 1));
+    let (_, out) = flush_into(&mut d, &mut c);
+    assert_eq!(image_types(&out), [zimage::MIMETYPE]);
+    // A photograph is smaller as PNG.
+    d.put(0, 100, 160, 60, &photo_block(160, 60, 2));
+    let (_, out) = flush_into(&mut d, &mut c);
+    assert_eq!(image_types(&out), ["image/png"]);
+    // The format has no alpha: a region with transparent pixels is PNG.
+    let mut holes = text_row(64, 3).repeat(8);
+    holes[..4].fill(0);
+    holes[64 * 4 * 5 + 4..][..4].fill(0);
+    d.put(200, 0, 64, 8, &holes);
+    let (_, out) = flush_into(&mut d, &mut c);
+    assert_eq!(image_types(&out), ["image/png"]);
+    // And so is the cursor, which is drawn with its alpha channel.
+    let mut out = Output::text();
+    d.set_cursor(0, 0, 16, 16, &[0x80; 16 * 16 * 4], &mut out);
+    assert_eq!(image_types(&out), ["image/png"]);
 }
 
 #[test]

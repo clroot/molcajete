@@ -256,7 +256,14 @@ mod tests {
         use crate::io::Output;
 
         let heavy_frame = |pacing| {
-            let mut d = Display::new(ImageFormats { jpeg: false }, true).with_pacing(pacing);
+            let mut d = Display::new(
+                ImageFormats {
+                    jpeg: false,
+                    zstd: false,
+                },
+                true,
+            )
+            .with_pacing(pacing);
             let mut out = Output::text();
             d.frame_bytes = 100_000;
             d.sync(&mut out);

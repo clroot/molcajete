@@ -8,3 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+
+# Decoder of the zstd image type (pure Rust: it also runs in the wasm client).
+ruzstd = { version = "0.8", default-features = false }

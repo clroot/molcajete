@@ -61,6 +61,15 @@ struct Cli {
         default_value = "av1,h265,h264"
     )]
     video: Vec<String>,
+    /// Send lossless updates as zstd images to the clients that announce
+    /// the type (molcajete's web client); `false` keeps every client on PNG.
+    #[arg(
+        long,
+        env = "MOLCAJETED_IMAGE_ZSTD",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    image_zstd: bool,
     #[command(flatten)]
     telemetry: molcajete_telemetry::TelemetryArgs,
 }
@@ -190,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     molcajete_telemetry::init_logging(cli.telemetry.log_format, "info,pprof=warn");
     molcajete_telemetry::start(&cli.telemetry, "molcajeted").await?;
+    display::set_zstd_images(cli.image_zstd);
     let allowed: Vec<_> = cli
         .video
         .iter()

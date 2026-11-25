@@ -10,8 +10,8 @@
 //! against the mirror. Content that moved vertically (scrolling) is found
 //! with row hashes and turned into cheap `copy` instructions; what still
 //! differs afterwards is trimmed to changed row bands and column runs and
-//! encoded (solid fill, palette/RGB PNG, or JPEG for busy photographic areas,
-//! later refined losslessly once the area calms down).
+//! encoded (solid fill, palette/RGB PNG or a zstd image, or JPEG for busy
+//! photographic areas, later refined losslessly once the area calms down).
 //!
 //! Because emitted instructions are replayed on the mirror, every optimisation
 //! is self-correcting: a wrong guess simply shows up as a difference in the
@@ -23,9 +23,11 @@ mod pacing;
 mod video;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use molcajete_protocol::InstructionBuilder;
+use molcajete_protocol::zimage;
 
 use crate::io::Output;
 
@@ -130,12 +132,26 @@ impl Rect {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImageFormats {
     pub jpeg: bool,
+    /// The zstd image type (`molcajete_protocol::zimage`), which only
+    /// molcajete clients announce.
+    pub zstd: bool,
+}
+
+/// Whether zstd images are sent to the clients that accept them
+/// (`--image-zstd`).
+static ZSTD_IMAGES: AtomicBool = AtomicBool::new(true);
+
+/// Turns zstd images on or off for the connections that follow.
+pub fn set_zstd_images(enabled: bool) {
+    ZSTD_IMAGES.store(enabled, Ordering::Relaxed);
 }
 
 impl ImageFormats {
     pub fn from_mimetypes<S: AsRef<str>>(mimetypes: &[S]) -> Self {
+        let has = |mimetype: &str| mimetypes.iter().any(|m| m.as_ref() == mimetype);
         Self {
-            jpeg: mimetypes.iter().any(|m| m.as_ref() == "image/jpeg"),
+            jpeg: has("image/jpeg"),
+            zstd: has(zimage::MIMETYPE) && ZSTD_IMAGES.load(Ordering::Relaxed),
         }
     }
 }
@@ -189,6 +205,8 @@ pub struct Display {
     last_decay: Instant,
     last_flush: Instant,
     formats: ImageFormats,
+    /// Encoder of zstd images, for a client that accepts them.
+    zstd: Option<encode::ZstdEncoder>,
     lossless: bool,
     next_stream: i32,
     last_sync: Option<i64>,
@@ -563,6 +581,10 @@ impl Display {
             last_decay: Instant::now(),
             last_flush: Instant::now(),
             formats,
+            zstd: formats
+                .zstd
+                .then(|| encode::ZstdEncoder::new().ok())
+                .flatten(),
             lossless,
             next_stream: 0,
             last_sync: None,
@@ -593,11 +615,27 @@ impl Display {
         let (bytes, elapsed) = timed(|| match kind {
             ImageKind::Png => encode::encode_png(region).ok(),
             ImageKind::Jpeg => encode::encode_jpeg(region, 80).ok(),
+            ImageKind::Zstd => self.zstd.as_mut().and_then(|z| z.encode(region)),
         });
         let bytes = bytes?;
         let pixels = region.width as u64 * region.height as u64;
         self.metrics.image(kind, elapsed, bytes.len(), pixels);
         Some(bytes)
+    }
+
+    /// Encodes `region` losslessly, returning the mimetype and the bytes: a
+    /// zstd image if the client accepts them, the region is opaque (the
+    /// format has no alpha) and the encoder takes it, otherwise PNG.
+    fn encode_lossless(
+        &mut self,
+        region: &Region,
+        opaque: bool,
+    ) -> Option<(&'static str, Vec<u8>)> {
+        if opaque && let Some(bytes) = self.encode_image(ImageKind::Zstd, region) {
+            return Some((zimage::MIMETYPE, bytes));
+        }
+        self.encode_image(ImageKind::Png, region)
+            .map(|bytes| ("image/png", bytes))
     }
 
     pub fn width(&self) -> u32 {
@@ -1384,14 +1422,15 @@ impl Display {
                     height: tile.h,
                     rgba: &data,
                 };
-                if let Some(bytes) = self.encode_image(ImageKind::Png, &region) {
+                let opaque = is_opaque(&data);
+                if let Some((mimetype, bytes)) = self.encode_lossless(&region, opaque) {
                     stats.images += 1;
                     stats.bytes += bytes.len();
                     stats.pixels += tile.area();
                     self.emit_image(
                         0,
                         MODE_OVER,
-                        "image/png",
+                        mimetype,
                         tile.x as i32,
                         tile.y as i32,
                         &bytes,
@@ -1454,8 +1493,8 @@ impl Display {
             None
         };
         let Some((mimetype, bytes, is_lossy)) = encoded.or_else(|| {
-            self.encode_image(ImageKind::Png, &region)
-                .map(|b| ("image/png", b, false))
+            self.encode_lossless(&region, opaque)
+                .map(|(mimetype, b)| (mimetype, b, false))
         }) else {
             return stats;
         };

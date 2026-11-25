@@ -209,11 +209,21 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
+/// Runs a scenario twice: for a client that takes PNG only, and for one
+/// that also takes zstd images.
+fn run(name: &str, mut step: impl FnMut(u32, &mut Desktop, &mut Display)) {
+    for zstd in [false, true] {
+        run_format(name, zstd, &mut step);
+    }
+}
+
 /// Sends the initial desktop, then times the flush of every frame produced
 /// by `step` (which changes the desktop and reports the changes).
-fn run(name: &str, mut step: impl FnMut(u32, &mut Desktop, &mut Display)) {
+fn run_format(name: &str, zstd: bool, step: &mut impl FnMut(u32, &mut Desktop, &mut Display)) {
+    let formats = ImageFormats { jpeg: true, zstd };
+    let format = if zstd { "zstd" } else { "png" };
     let mut desktop = Desktop::new();
-    let mut display = Display::new(ImageFormats { jpeg: true }, false);
+    let mut display = Display::new(formats, false);
     let mut out = Output::text();
     display.resize(WIDTH, HEIGHT, &mut out);
     step(0, &mut desktop, &mut display);
@@ -223,7 +233,7 @@ fn run(name: &str, mut step: impl FnMut(u32, &mut Desktop, &mut Display)) {
 
     let phases = [Phase::Scroll, Phase::Moves, Phase::Pixels];
     let before = phases.map(|p| display.metrics.phase_total(p));
-    let (png_before, png_time_before) = display.metrics.png_total();
+    let (_, encode_time_before) = display.metrics.lossless_total();
     let mut times = Vec::new();
     let mut stats = FlushStats::default();
     let mut wire = Wire::default();
@@ -242,28 +252,26 @@ fn run(name: &str, mut step: impl FnMut(u32, &mut Desktop, &mut Display)) {
     times.sort();
     let n = FRAMES as f64;
     let phase = |i: usize| ms(display.metrics.phase_total(phases[i]) - before[i]) / n;
-    let (png, png_time) = display.metrics.png_total();
+    let (_, encode_time) = display.metrics.lossless_total();
     println!(
-        "bench {name:<8} flush avg {:7.2} p50 {:7.2} max {:7.2} ms | scroll {:6.2} moves {:6.2} pixels {:6.2} (png {:6.2}) ms | images {:6.1} copies {:5.1} fills {:5.1} kB {:7.1} per frame",
+        "bench {name:<8} {format:<4} flush avg {:7.2} p50 {:7.2} max {:7.2} ms | scroll {:6.2} moves {:6.2} pixels {:6.2} (encode {:6.2}) ms | images {:6.1} ({:5.1} zstd) copies {:5.1} fills {:5.1} kB {:7.1} per frame",
         ms(times.iter().sum::<Duration>()) / n,
         ms(times[times.len() / 2]),
         ms(*times.last().expect("frames")),
         phase(0),
         phase(1),
         phase(2),
-        ms(png_time - png_time_before) / n,
+        ms(encode_time - encode_time_before) / n,
         (stats.images as f64) / n,
+        display.metrics.zstd_count() as f64 / n,
         stats.copies as f64 / n,
         stats.fills as f64 / n,
         stats.bytes as f64 / 1024.0 / n,
     );
-    // Images sent as JPEG stay lossy; everything else must match exactly.
-    let _ = png - png_before;
-
     // The same frames once more, written as binary records, to compare what
     // goes over the tunnel (untimed).
     let mut desktop = Desktop::new();
-    let mut display = Display::new(ImageFormats { jpeg: true }, false);
+    let mut display = Display::new(formats, false);
     let mut out = Output::binary();
     display.resize(WIDTH, HEIGHT, &mut out);
     step(0, &mut desktop, &mut display);
@@ -278,7 +286,7 @@ fn run(name: &str, mut step: impl FnMut(u32, &mut Desktop, &mut Display)) {
         binary.add(&out);
     }
     println!(
-        "wire  {name:<8} text {:8.1} kB in {:6.1} blobs | binary {:8.1} kB in {:6.1} blobs per frame ({:+.1}%) | images {:.1} / {:.1} kB per frame",
+        "wire  {name:<8} {format:<4} text {:8.1} kB in {:6.1} blobs | binary {:8.1} kB in {:6.1} blobs per frame ({:+.1}%) | images {:.1} / {:.1} kB per frame",
         wire.bytes as f64 / 1024.0 / n,
         wire.blobs as f64 / n,
         binary.bytes as f64 / 1024.0 / n,
@@ -421,13 +429,11 @@ fn scatter() {
     });
 }
 
-/// Time and size of PNG encoding per DEFLATE setting, on the kinds of
-/// images a session sends: a page of text, single lines and a photograph.
-#[test]
-#[ignore = "benchmark"]
-fn png_levels() {
-    use png::DeflateCompression::{FdeflateUltraFast, Level};
+/// Sets of images (width, height, RGBA) of the kinds a session sends: a
+/// page of text, single lines, a photograph, and the page in tile bands.
+type ImageSets = Vec<(&'static str, Vec<(u32, u32, Vec<u8>)>)>;
 
+fn image_sets() -> ImageSets {
     let doc = Document::new();
     let desktop = Desktop::new();
     let page = doc.render(3200, 0, 2200);
@@ -451,7 +457,17 @@ fn png_levels() {
             .map(|b| (3200, (b.len() / (3200 * 4)) as u32, b.to_vec()))
             .collect(),
     ));
-    for (name, set) in &images {
+    images
+}
+
+/// Time and size of PNG encoding per DEFLATE setting, on the kinds of
+/// images a session sends: a page of text, single lines and a photograph.
+#[test]
+#[ignore = "benchmark"]
+fn png_levels() {
+    use png::DeflateCompression::{FdeflateUltraFast, Level};
+
+    for (name, set) in &image_sets() {
         for compression in [
             FdeflateUltraFast,
             Level(1),
@@ -479,5 +495,43 @@ fn png_levels() {
                 bytes as f64 / 1024.0
             );
         }
+    }
+}
+
+/// Time and size of zstd images next to PNG on the same images, and what
+/// it costs to find out that an image is better left to PNG (the
+/// photograph).
+#[test]
+#[ignore = "benchmark"]
+fn zstd_images() {
+    let mut encoder = encode::ZstdEncoder::new().expect("zstd");
+    for (name, set) in &image_sets() {
+        let regions = || {
+            set.iter().map(|(width, height, rgba)| Region {
+                width: *width,
+                height: *height,
+                rgba,
+            })
+        };
+        let started = Instant::now();
+        let png: usize = regions()
+            .map(|r| encode::encode_png(&r).expect("png").len())
+            .sum();
+        let png_time = started.elapsed();
+        let started = Instant::now();
+        let zstd: Vec<usize> = regions()
+            .filter_map(|r| encoder.encode(&r))
+            .map(|bytes| bytes.len())
+            .collect();
+        let zstd_time = started.elapsed();
+        println!(
+            "{name:<6} png {:8.2} ms {:9.1} kB | zstd {:8.2} ms {:9.1} kB for {} of {} images",
+            ms(png_time),
+            png as f64 / 1024.0,
+            ms(zstd_time),
+            zstd.iter().sum::<usize>() as f64 / 1024.0,
+            zstd.len(),
+            set.len(),
+        );
     }
 }
