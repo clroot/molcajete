@@ -6,16 +6,26 @@ import {Collapsible} from '@astryxdesign/core/Collapsible';
 import {Heading} from '@astryxdesign/core/Heading';
 import {Text} from '@astryxdesign/core/Text';
 import {PlusIcon, TrashIcon} from '@heroicons/react/24/outline';
-import {extraParameter, isGuacdPortValid, type ConnectionForm, type ExtraParameter} from './connectionForm';
+import {
+  extraParameter,
+  isGuacdPortValid,
+  otherStoredSecrets,
+  type ConnectionForm,
+  type ExtraParameter,
+} from './connectionForm';
+import ParameterInput, {type StoredSecret} from './ParameterInput';
+import {isSensitive} from './secrets';
 
 type Props = {
   form: ConnectionForm;
   onChange: (patch: Partial<ConnectionForm>) => void;
+  storedSecret: (name: string) => StoredSecret | undefined;
 };
 
 /** guacd override and free parameters, collapsed unless already in use. */
-export default function AdvancedSettings({form, onChange}: Props) {
-  const isInUse = form.extras.length > 0 || form.guacdHost !== '';
+export default function AdvancedSettings({form, onChange, storedSecret}: Props) {
+  const otherSecrets = otherStoredSecrets(form);
+  const isInUse = form.extras.length > 0 || form.guacdHost !== '' || otherSecrets.length > 0;
   return (
     <Collapsible defaultIsOpen={isInUse} trigger={<Heading level={3}>Advanced</Heading>}>
       <VStack gap={5} paddingBlockStart={3}>
@@ -39,6 +49,19 @@ export default function AdvancedSettings({form, onChange}: Props) {
             status={isGuacdPortValid(form) ? undefined : {type: 'error', message: 'Enter a port number.'}}
           />
         </VStack>
+        {otherSecrets.length > 0 && (
+          <VStack gap={4}>
+            {otherSecrets.map(name => (
+              <ParameterInput
+                key={name}
+                field={{name, label: name, kind: 'password'}}
+                value={form.fields[name] ?? ''}
+                onChange={value => onChange({fields: {...form.fields, [name]: value}})}
+                secret={storedSecret(name)}
+              />
+            ))}
+          </VStack>
+        )}
         <ExtraParameters extras={form.extras} onChange={extras => onChange({extras})} />
       </VStack>
     </Collapsible>
@@ -74,6 +97,8 @@ function ExtraParameters({extras, onChange}: ExtraParametersProps) {
             label="Value"
             value={row.value}
             onChange={value => replace(row.key, {value})}
+            type={isSensitive(row.name) ? 'password' : 'text'}
+            autoComplete={isSensitive(row.name) ? 'new-password' : 'off'}
             hasSpellCheck={false}
             width="100%"
           />

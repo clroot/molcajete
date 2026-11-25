@@ -74,7 +74,16 @@ export type Connection = {
   protocol: string;
   guacdHost: string | null;
   guacdPort: number | null;
+  /**
+   * guacd parameters. Stored credentials (see `isSensitive`) never come
+   * back: they are named in `storedSecrets` instead, and saving without
+   * one keeps the stored value.
+   */
   parameters: Record<string, string>;
+  /** Credentials that have a stored value; read only. */
+  storedSecrets?: string[];
+  /** Stored credentials to remove when saving. */
+  clearSecrets?: string[];
   /** Where a new connection goes; editing does not move it. */
   parentId?: string | null;
   /** molcajete's own settings, never sent to guacd (see `ATTRIBUTES`). */

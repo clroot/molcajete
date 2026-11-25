@@ -39,7 +39,12 @@ const port = (defaultPort: number): ParameterField => ({
   placeholder: String(defaultPort),
 });
 const username: ParameterField = {name: 'username', label: 'Username', kind: 'text'};
-const password: ParameterField = {name: 'password', label: 'Password', kind: 'password'};
+const password: ParameterField = {
+  name: 'password',
+  label: 'Password',
+  kind: 'password',
+  description: 'Leave it empty to type it in when connecting instead of storing it.',
+};
 
 export const PROTOCOLS: Protocol[] = [
   {

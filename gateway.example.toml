@@ -19,6 +19,12 @@ port = 4822
 # url = "postgres://molcajete:secret@127.0.0.1/molcajete"
 # url = "mysql://molcajete:secret@127.0.0.1/molcajete"
 
+# Connection passwords and keys are encrypted in the database with this key
+# (base64 of 32 bytes: `openssl rand -base64 32`). Without one, the gateway
+# generates <server.data_dir>/secret.key; back it up with the database.
+# [secrets]
+# key_file = "/etc/molcajete/secret.key"   # or key = "...", or MOLCAJETE_SECRET_KEY
+
 # Sessions of connections with "Record sessions" on (in the web UI, or
 # `attributes = { record-sessions = "true" }` below) are written here.
 # [recordings]

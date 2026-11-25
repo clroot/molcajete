@@ -49,7 +49,7 @@ Each user and each user group has one of three roles. A user's effective role, t
 | Connection manager | `connection_manager` | Also open every connection; create, edit, move and delete connections and folders; grant them to users and groups. Cannot manage users, groups, roles or recordings. |
 | Administrator | `admin` | Everything, including users, groups, roles and recordings. |
 
-Connection managers see the full parameters of every connection, passwords included, and can turn recording on or off for a connection, but only administrators can open the recordings.
+Connection managers see the parameters of every connection except [stored credentials](#stored-credentials), which nobody can read back, administrators included. They can turn recording on or off for a connection, but only administrators can open the recordings.
 
 ## User groups
 
@@ -75,8 +75,6 @@ Connection managers and administrators create and edit connections under *Connec
 - **recording** settings ([session recordings](#session-recordings));
 - the **folder** it is in.
 
-When a connection leaves out credentials the remote server asks for (for example an empty username or password), the daemon asks for them and the browser shows a *Credentials required* dialog when the session starts.
-
 Deleting a connection takes it away from everyone. Sessions that are open keep running until they disconnect; recordings of the connection are kept.
 
 Connections can also be written in `gateway.toml`. They are imported once, when no connection with that id exists yet; afterwards the web UI is where they are changed:
@@ -96,6 +94,8 @@ ignore-cert = "true"
 ```
 
 The attributes are the recording switches below: `record-sessions`, `record-exclude-mouse`, `record-keys` and `record-molcajete-formats`, each `"true"` when on. Unlike parameters they are never sent to the daemon.
+
+A password written in `[connections.parameters]` is encrypted in the database like one typed in the form, but it stays readable in `gateway.toml`. Remove it from the file once the connection is imported, or leave it out and type it in the form.
 
 ### SSH jump hosts
 
@@ -123,6 +123,14 @@ jump-host-host-key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF8z..."
 ```
 
 The host name and port of the connection are resolved and reached by the last jump host, not by molcajeted. Each session opens its own SSH connections to the jump hosts.
+
+### Stored credentials
+
+The credentials of a connection are the parameters whose name contains `password`, `passphrase`, `private-key` or `secret` (`password`, `sftp-password`, `gateway-password` for an RDP gateway, `jump-host-2-private-key`, …), and `client-key` (Kubernetes) and `token`, whether typed in a form field or added under *Advanced*. Patterns such as telnet's `password-regex` are not credentials, nor are host keys (`jump-host-host-key`), which are public.
+
+- **They are write-only.** Once saved, nobody can read them back, administrators included: the form shows a stored one as an empty field saying *Saved — type to replace*. Typing a new value replaces it, saving without touching it keeps it, and the trash button next to it removes it when you save.
+- **They are encrypted in the database** with a key the database does not hold, and decrypted only to open a session. Someone with a copy of the database, or a backup of it, does not get them without the key. Keeping that key and backing it up is described in [deployment](deployment.md#secrets).
+- **They don't have to be stored at all.** Leave the password (or username) empty and the remote server asks for it: the browser shows a *Credentials required* dialog when the session starts, and what is typed there goes to the daemon for that session only. SSH and Telnet ask in the terminal instead.
 
 ### Folders
 
@@ -293,10 +301,11 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | `oidc.user.create`, `oidc.user.link`, `oidc.user.rename`, `oidc.user.groups`, `oidc.user.role` | What the provider changed at sign-in: a user created on their first sign-in or linked to their identity, renamed after the provider, groups or role set from the provider's groups. The actor is the user signing in. |
 | `user.create`, `user.update`, `user.delete` | Users, including their role, disabled state, groups and grants. A password set by an administrator shows as a changed `password`. |
 | `group.create`, `group.update`, `group.delete` | Groups, including their role, members and grants. |
-| `connection.create`, `connection.update`, `connection.delete`, `connection.move` | Connections and their parameters and settings. |
+| `connection.create`, `connection.update`, `connection.delete`, `connection.move` | Connections and their parameters and settings. A [stored credential](#stored-credentials) shows only as set, replaced (any value typed again, even the same one) or removed, never its value. |
 | `connection.access`, `folder.access` | Who is granted a connection or folder (users and groups added and removed). |
 | `folder.create`, `folder.rename`, `folder.move`, `folder.delete` | Folders. |
 | `recording.download`, `recording.delete` | Recordings downloaded (playing one back in the page is not recorded) or deleted. |
+| `secrets.encrypt`, `secrets.rotate` | Stored credentials encrypted at start because they were in plain text (`count`), and re-encrypted by `rotate-key` (`count`, `keyId`). No actor. |
 
 The names are stable, so filters and alert rules can rely on them; `GET /api/audit/actions` lists them.
 
@@ -346,5 +355,7 @@ curl -b cookies -OJ 'https://molcajete.example.com/api/recordings/<id>/file?down
 curl -b cookies 'https://molcajete.example.com/api/audit?action=login.failure&limit=20'
 curl -b cookies -OJ 'https://molcajete.example.com/api/audit?target=office-pc&format=csv'
 ```
+
+A connection read from `/api/connections/{id}` leaves its [credentials](#stored-credentials) out of `parameters` and names the stored ones in `storedSecrets`. Sending a connection back without a credential keeps the stored value, so a script can read, change and write a connection without knowing its password; a new value in `parameters` replaces it, and `"clearSecrets": ["password"]` removes it.
 
 Users carry `role` and, for scripts written before roles, `isAdmin` (true for an effective role of administrator). Requests that create or change a user accept either; `role` wins when both are given. Leaving a field out of a `PUT` keeps its current value, including lists of members, groups and grants.

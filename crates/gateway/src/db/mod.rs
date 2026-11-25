@@ -19,6 +19,7 @@ mod users;
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
@@ -26,7 +27,9 @@ use sqlx::AnyPool;
 use sqlx::any::AnyPoolOptions;
 use sqlx::migrate::Migrator;
 
+use crate::secrets::{SecretError, SecretKeys};
 pub use audit::{AuditEntry, AuditFilter};
+
 pub use connections::{ConnectionRecord, attributes};
 pub use folders::Folder;
 pub use grants::{Access, Principal, Target};
@@ -89,6 +92,9 @@ pub enum DbError {
     /// The request does not make sense, e.g. a folder moved into itself.
     #[error("{0}")]
     Invalid(String),
+    /// A stored credential could not be encrypted or decrypted.
+    #[error(transparent)]
+    Secret(#[from] SecretError),
     #[error(transparent)]
     Other(#[from] sqlx::Error),
 }
@@ -109,6 +115,9 @@ pub type DbResult<T> = Result<T, DbError>;
 pub struct Database {
     pool: AnyPool,
     dialect: Dialect,
+    /// Encrypts and decrypts stored connection credentials; see
+    /// [`Database::with_secrets`].
+    secrets: Option<Arc<SecretKeys>>,
 }
 
 impl Database {
@@ -121,7 +130,11 @@ impl Database {
             .connect(url)
             .await
             .with_context(|| format!("connecting to the {} database", dialect.name()))?;
-        let db = Self { pool, dialect };
+        let db = Self {
+            pool,
+            dialect,
+            secrets: None,
+        };
         migrator(dialect)
             .run(&db.pool)
             .await
@@ -132,6 +145,22 @@ impl Database {
     /// URL of the SQLite database used when none is configured.
     pub fn sqlite_url(path: &Path) -> String {
         format!("sqlite://{}?mode=rwc", path.display())
+    }
+
+    /// Uses `keys` for connection credentials. Without keys, connections
+    /// with credentials can be neither saved nor opened.
+    pub fn with_secrets(mut self, keys: SecretKeys) -> Self {
+        self.secrets = Some(Arc::new(keys));
+        self
+    }
+
+    /// The id of the key new credentials are encrypted with.
+    pub fn secret_key_id(&self) -> Option<&str> {
+        self.secrets.as_deref().map(SecretKeys::current_id)
+    }
+
+    fn secrets(&self) -> Result<&SecretKeys, SecretError> {
+        self.secrets.as_deref().ok_or(SecretError::NoKey)
     }
 
     pub fn dialect(&self) -> Dialect {
@@ -181,7 +210,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&Database::sqlite_url(&dir.path().join("test.db")), 2)
             .await
-            .unwrap();
+            .unwrap()
+            .with_secrets(crate::secrets::tests::keys());
         (db, dir)
     }
 
@@ -193,7 +223,10 @@ pub(crate) mod tests {
         let mut all = vec![(db, Some(dir))];
         for var in ["MOLCAJETE_TEST_POSTGRES_URL", "MOLCAJETE_TEST_MYSQL_URL"] {
             if let Ok(url) = std::env::var(var) {
-                let db = Database::open(&url, 2).await.unwrap();
+                let db = Database::open(&url, 2)
+                    .await
+                    .unwrap()
+                    .with_secrets(crate::secrets::tests::keys());
                 reset(&db).await;
                 all.push((db, None));
             }
@@ -295,6 +328,7 @@ pub(crate) mod tests {
             let old = Database {
                 pool: pool.clone(),
                 dialect,
+                secrets: None,
             };
             if dialect == Dialect::Mysql {
                 query!(old, "SET FOREIGN_KEY_CHECKS = 0")

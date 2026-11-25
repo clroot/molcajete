@@ -15,6 +15,7 @@ mod db;
 mod guacd;
 mod oidc;
 mod recording;
+mod secrets;
 mod sensitive;
 mod tunnel;
 
@@ -22,6 +23,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use axum::Router;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, RawQuery, Request, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -71,6 +73,11 @@ enum Command {
     /// Sets a user's password (read from stdin) and makes the account an
     /// enabled administrator, creating it if needed. For recovery.
     SetPassword { username: String },
+    /// Re-encrypts every stored connection credential with the current
+    /// secret key. Values under a retired key are read with the keys in
+    /// `[secrets] previous_key_files` / `previous_keys`, which can be
+    /// removed afterwards.
+    RotateKey,
 }
 
 pub struct AppState {
@@ -275,6 +282,13 @@ async fn open_database(config: &Config) -> anyhow::Result<Database> {
     Ok(db)
 }
 
+/// Loads the secret key for stored connection credentials (generating
+/// `<data_dir>/secret.key` on first start) and hands it to the database.
+async fn unlock_secrets(db: Database, config: &Config) -> anyhow::Result<Database> {
+    let keys = secrets::load(config, db.has_sealed_secrets().await?)?;
+    Ok(db.with_secrets(keys))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -304,6 +318,23 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Password updated; {username} is an enabled administrator.");
         return Ok(());
     }
+    if let Some(Command::RotateKey) = cli.command {
+        let db = unlock_secrets(open_database(&config).await?, &config).await?;
+        let rotated = db
+            .rotate_secrets()
+            .await
+            .context("re-encrypting the stored connection credentials")?;
+        let entry = audit::Entry::new(audit::action::SECRETS_ROTATE)
+            .source("command line")
+            .detail("count", rotated)
+            .detail("keyId", db.secret_key_id().unwrap_or_default());
+        audit::record(&db, entry).await;
+        eprintln!(
+            "Re-encrypted {rotated} stored credential(s). Every stored credential is now under \
+             the current key; previous keys can be removed from the configuration."
+        );
+        return Ok(());
+    }
 
     molcajete_telemetry::start(&cli.telemetry, "gateway").await?;
     let listen = config.server.listen;
@@ -319,7 +350,21 @@ async fn main() -> anyhow::Result<()> {
             "single sign-on through OpenID Connect"
         );
     }
-    let db = open_database(&config).await?;
+    let db = unlock_secrets(open_database(&config).await?, &config).await?;
+    let sealed = db
+        .seal_plaintext_secrets()
+        .await
+        .context("checking the stored connection credentials against the configured secret key")?;
+    if sealed > 0 {
+        info!(
+            count = sealed,
+            "encrypted stored connection credentials that were in plain text"
+        );
+        let entry = audit::Entry::new(audit::action::SECRETS_ENCRYPT)
+            .source("gateway start")
+            .detail("count", sealed);
+        audit::record(&db, entry).await;
+    }
     bootstrap::seed(&db, &config).await?;
     if config.recordings.enabled {
         let directory = config.recordings.directory(&config.server);
@@ -1276,17 +1321,18 @@ mod tests {
         args: &'static str,
         payload: Vec<u8>,
     ) -> TunnelRun {
-        run_tunnel_with(server, offered, args, payload, &[], "3.nop;").await
+        run_tunnel_with(server, offered, args, payload, &[], &[], "3.nop;").await
     }
 
-    /// Like [`run_tunnel`], with these flag `attributes` set on the
-    /// connection, and `input` sent by the browser.
+    /// Like [`run_tunnel`], with these flag `attributes` and `parameters`
+    /// set on the connection, and `input` sent by the browser.
     async fn run_tunnel_with(
         server: &str,
         offered: &str,
         args: &'static str,
         payload: Vec<u8>,
         attributes: &[&str],
+        parameters: &[(&str, &str)],
         input: &str,
     ) -> TunnelRun {
         use futures_util::SinkExt as _;
@@ -1299,8 +1345,13 @@ mod tests {
             guacd_addr.port()
         ))
         .await;
-        if !attributes.is_empty() {
+        if !attributes.is_empty() || !parameters.is_empty() {
             let mut granted = app.state.db.connection("granted").await.unwrap();
+            for (name, value) in parameters {
+                granted
+                    .parameters
+                    .insert((*name).to_owned(), (*value).to_owned());
+            }
             for name in attributes {
                 granted
                     .attributes
@@ -1461,6 +1512,125 @@ mod tests {
         assert_eq!(run.guacd.0.args, ["VERSION_1_5_0", "", "", ""]);
     }
 
+    #[tokio::test]
+    async fn stored_credentials_reach_guacd_decrypted() {
+        const ARGS: &str = "4.args,13.VERSION_1_5_0,8.hostname,8.password,11.private-key;";
+        let key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Blbg==\n-----END OPENSSH PRIVATE KEY-----";
+        let run = run_tunnel_with(
+            "",
+            "guacamole",
+            ARGS,
+            text_payload().into_bytes(),
+            &[],
+            &[
+                ("hostname", "10.0.0.5"),
+                ("password", "hunter2"),
+                ("private-key", key),
+            ],
+            "3.nop;",
+        )
+        .await;
+        assert_eq!(
+            run.guacd.0.args,
+            ["VERSION_1_5_0", "10.0.0.5", "hunter2", key]
+        );
+        for name in ["password", "private-key"] {
+            let stored = run.app.state.db.stored_parameter("granted", name).await;
+            let stored = stored.unwrap();
+            assert!(secrets::is_sealed(&stored), "{stored}");
+            assert!(!stored.contains("hunter2") && !stored.contains("OPENSSH"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_credentials_are_write_only() {
+        let app = app().await;
+        let admin = app.login("admin", "admin-password").await;
+        let (post, put) = (Method::POST, Method::PUT);
+        app.call(
+            &admin,
+            post.clone(),
+            "/api/users",
+            serde_json::json!({
+                "username": "manny", "password": "manny-password", "role": "connection_manager"
+            }),
+            StatusCode::CREATED,
+        )
+        .await;
+        let manny = app.login("manny", "manny-password").await;
+
+        let created = app
+            .call(
+                &admin,
+                post,
+                "/api/connections",
+                serde_json::json!({
+                    "id": "box", "name": "Box", "protocol": "ssh",
+                    "parameters": {
+                        "hostname": "10.0.0.7", "password": "hunter2", "passphrase": "key pass"
+                    }
+                }),
+                StatusCode::CREATED,
+            )
+            .await;
+        assert_eq!(
+            created["parameters"],
+            serde_json::json!({ "hostname": "10.0.0.7" })
+        );
+        assert_eq!(
+            created["storedSecrets"],
+            serde_json::json!(["passphrase", "password"])
+        );
+        assert!(created.get("clearSecrets").is_none());
+
+        // Nobody reads them back, administrators included.
+        let mut form = serde_json::Value::Null;
+        for cookie in [&admin, &manny] {
+            let response = app.get("/api/connections/box", Some(cookie)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            form = body_json(response).await;
+            let text = form.to_string();
+            assert!(
+                !text.contains("hunter2") && !text.contains("key pass"),
+                "{text}"
+            );
+            assert_eq!(form["storedSecrets"], created["storedSecrets"]);
+        }
+
+        // Saving the form as it came back keeps them ...
+        form["name"] = "Box 2".into();
+        app.call(
+            &manny,
+            put.clone(),
+            "/api/connections/box",
+            form.clone(),
+            StatusCode::OK,
+        )
+        .await;
+        let secrets = app.state.db.connection_secrets("box").await.unwrap();
+        assert_eq!(
+            (secrets["password"].as_str(), secrets["passphrase"].as_str()),
+            ("hunter2", "key pass")
+        );
+
+        // ... a new value replaces one, and an explicit clear removes one.
+        form["parameters"]["password"] = "new password".into();
+        form["clearSecrets"] = serde_json::json!(["passphrase"]);
+        let saved = app
+            .call(&manny, put, "/api/connections/box", form, StatusCode::OK)
+            .await;
+        assert_eq!(saved["storedSecrets"], serde_json::json!(["password"]));
+        assert!(!saved.to_string().contains("new password"));
+        let secrets = app.state.db.connection_secrets("box").await.unwrap();
+        assert_eq!(
+            secrets,
+            [("password".to_owned(), "new password".to_owned())].into()
+        );
+        let stored = app.state.db.stored_parameter("box", "password").await;
+        assert!(!stored.unwrap().contains("new password"));
+    }
+
     /// The recording of the session that ended last, once it is complete,
     /// and the text of its file.
     async fn finished_recording(app: &TestApp) -> (db::Recording, String) {
@@ -1500,8 +1670,16 @@ mod tests {
             ("guacamole", STOCK_ARGS, text_payload().into_bytes()),
         ] {
             let started = db::now_millis();
-            let run =
-                run_tunnel_with("", offered, args, payload, &[attributes::RECORD], INPUT).await;
+            let run = run_tunnel_with(
+                "",
+                offered,
+                args,
+                payload,
+                &[attributes::RECORD],
+                &[],
+                INPUT,
+            )
+            .await;
             let (recording, text) = finished_recording(&run.app).await;
             assert_eq!(recording.connection_id, "granted");
             assert_eq!(recording.username, "bob");
@@ -1555,6 +1733,7 @@ mod tests {
                 attributes::RECORD_EXCLUDE_MOUSE,
                 attributes::RECORD_MOLCAJETE_FORMATS,
             ],
+            &[],
             INPUT,
         )
         .await;
@@ -1581,6 +1760,7 @@ mod tests {
             STOCK_ARGS,
             text_payload().into_bytes(),
             &[attributes::RECORD],
+            &[],
             INPUT,
         )
         .await;
@@ -1880,13 +2060,60 @@ mod tests {
             )
             .await;
         assert_eq!(updated.status(), StatusCode::OK);
+        // Stored credentials are not decrypted to compare them: each one
+        // sent again counts as changed.
         let updated = only_entry(&app, &admin, "connection.update").await;
+        let replaced = serde_json::json!({ "from": "[redacted]", "to": "[redacted]" });
         assert_eq!(
             updated["changes"],
             serde_json::json!({
                 "parameters.hostname": { "from": "10.0.0.9", "to": "10.0.0.10" },
-                "parameters.password": { "from": "[redacted]", "to": "[redacted]" },
+                "parameters.password": replaced,
+                "parameters.private-key": replaced,
+                "parameters.passphrase": replaced,
             })
+        );
+        let text = updated.to_string();
+        assert!(
+            !text.contains("rdp-secret") && !text.contains("enc:v1:"),
+            "{text}"
+        );
+
+        // Saved without credentials: they are kept, and no change shows.
+        let renamed = app
+            .json(
+                Method::PUT,
+                "/api/connections/jump",
+                Some(&admin),
+                serde_json::json!({
+                    "id": "jump", "name": "Jump host 2", "protocol": "ssh",
+                    "parameters": { "hostname": "10.0.0.10" }
+                }),
+            )
+            .await;
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let entries = audit(&app, &admin, "action=connection.update").await;
+        assert_eq!(
+            entries[0]["changes"],
+            serde_json::json!({ "name": { "from": "Jump host", "to": "Jump host 2" } })
+        );
+        // A cleared credential shows as removed.
+        let cleared = app
+            .json(
+                Method::PUT,
+                "/api/connections/jump",
+                Some(&admin),
+                serde_json::json!({
+                    "id": "jump", "name": "Jump host 2", "protocol": "ssh",
+                    "parameters": { "hostname": "10.0.0.10" }, "clearSecrets": ["passphrase"]
+                }),
+            )
+            .await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let entries = audit(&app, &admin, "action=connection.update").await;
+        assert_eq!(
+            entries[0]["changes"],
+            serde_json::json!({ "parameters.passphrase": { "from": "[redacted]", "to": null } })
         );
 
         // Grants.
@@ -1936,13 +2163,13 @@ mod tests {
             audit(&app, &admin, "action=connection&actor=admin")
                 .await
                 .len(),
-            5
+            7
         );
         assert_eq!(
             audit(&app, &admin, "target=jump&targetType=connection")
                 .await
                 .len(),
-            5
+            7
         );
         assert_eq!(audit(&app, &admin, "actor=bob").await.len(), 0);
         assert_eq!(audit(&app, &admin, "limit=2").await.len(), 2);

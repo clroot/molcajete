@@ -353,7 +353,7 @@ The tunnel follows the stock contract of section 1.2, so guacamole-common-js wor
 
 1. The upgrade request must come from the gateway's own origin and carry a valid session; the query string (`TunnelRequest::from_query`) accepts the short names of the molcajete client (`connection`, `width`, `image`, ...) and the stock `GUAC_*` names.
 2. The connection is looked up for the user (section 5.3). An unknown or forbidden connection closes the socket with `RESOURCE_NOT_FOUND`.
-3. The gateway performs the handshake with the connection's guacd (its own host and port, or the default) (`guacd::connect`), answering the highest common protocol version. A failed handshake closes the WebSocket with the mapped status code in the close reason, like the Java web app.
+3. The connection's stored credentials are decrypted (section 5.5), and the gateway performs the handshake with the connection's guacd (its own host and port, or the default) (`guacd::connect`), answering the highest common protocol version. A failed handshake closes the WebSocket with the mapped status code in the close reason, like the Java web app.
 4. `relay` pumps both directions until either side ends:
    - daemon → browser: whole instructions (or records) are batched into one message of up to 64 KiB, sent as soon as the next read would block. Three framings exist (`Framing`), see section 5.2.
    - browser → daemon: text only, parsed with `Limits::STRICT` and forwarded verbatim. Internal pings are answered by the gateway and never reach the daemon.
@@ -442,6 +442,14 @@ One code path serves SQLite, PostgreSQL and MySQL/MariaDB through sqlx's `Any` d
 
 Connection attributes (`molcajete_connection_attribute`) hold molcajete's own per-connection switches (`record-sessions`, `record-keys`, `record-exclude-mouse`, `record-molcajete-formats`); unlike parameters they never reach the daemon. Upgrading is described in [deployment.md](deployment.md#upgrading).
 
+**Connection credentials** (`secrets.rs`). The parameters that `sensitive::is_secret` calls secrets (section 5.7: `password`, `passphrase`, `private-key`, their `sftp-`, `gateway-` and `jump-host-` variants, `client-key`; `web/src/connections/secrets.ts` mirrors it and a test keeps the two lists equal) are stored encrypted, so a copy of the database, or a backup, does not give away the credentials of every remote machine.
+
+- *Format.* `enc:v1:<key id>:<base64 of nonce, ciphertext and tag>`. `v1` is AES-256-GCM with a random 96-bit nonce, and the connection id and parameter name as associated data, so a value moved to another row does not decrypt. The key id is the start of a SHA-256 of the key: with several keys configured during a rotation it picks the right one, and with a wrong key the gateway says which key it needs instead of sending garbage to the remote server.
+- *Why AES-256-GCM.* It is what reviewers expect, CPUs accelerate it, and RustCrypto's `aes-gcm` is pure Rust (no OpenSSL). Random 96-bit nonces stay safe up to about 2³² values per key, which a gateway does not come near; XChaCha20-Poly1305's longer nonce buys nothing here.
+- *Key.* From `MOLCAJETE_SECRET_KEY`, `[secrets] key_file` or `key`, otherwise `<data_dir>/secret.key`, generated on the first start unless the database already holds encrypted values. Retired keys (`previous_key_files`) only decrypt.
+- *Where values are encrypted and decrypted.* `Database` holds the keys: inserting a sensitive parameter encrypts it, and reading a connection (`Database::connection`) leaves credentials out and names them in `stored_secrets`, which is what the API returns, to administrators too. Only the tunnel calls `Database::connection_secrets`, right before the guacd handshake. Updating a connection keeps stored credentials it does not mention unless `clear_secrets` names them, so the write-only form and scripts that read and write back a connection do not lose them.
+- *Data migration.* At every start `seal_plaintext_secrets` encrypts plain values under a sensitive name in one transaction (left by an older gateway, or under a name added to the list later) and fails if a value is under a key that is not configured. It is Rust rather than SQL because SQL has neither the key nor the cipher. `rotate-key` (`rotate_secrets`) re-encrypts every value not under the current key, also in one transaction.
+
 ### 5.6 Recording
 
 **Why in the gateway.** guacd records in the daemon (`recording-path`), teeing its socket into a file. molcajete records in the gateway (`recording.rs`): the gateway sees the stream of stock guacd and molcajeted alike, so one implementation covers both; it owns the database the recordings are indexed in; and molcajeted may run on another host whose disks the gateway and its API cannot reach (for example natively on a Mac for VideoToolbox while the gateway runs in Kubernetes). Stock `recording-*` parameters still go to stock guacd, which records as before.
@@ -475,7 +483,7 @@ audit::record(
 ```
 
 - **Diffs.** `audit::diff` compares two JSON snapshots: nested objects flatten to dotted keys (`parameters.hostname`), lists of strings become `added`/`removed`, and a missing field equals `null`. Handlers snapshot what an administrator thinks of as the record (for a user: username, role, disabled, groups by name, grants), so one request that touches several tables gives one entry.
-- **Redaction.** `record` passes every entry through `sensitive::redact`, which replaces the value under any secret key at any depth with `[redacted]`. `sensitive::is_secret` is the gateway's one list of secret names (the parameters the web UI edits as passwords or keys, Guacamole's `sftp-`/`gateway-` variants, and the user's password), for anything else that must keep secrets out of logs or responses.
+- **Redaction.** `record` passes every entry through `sensitive::redact`, which replaces the value under any secret key at any depth with `[redacted]`. `sensitive::is_secret` is the gateway's one list of secret names (the parameters the web UI edits as passwords or keys, Guacamole's `sftp-`/`gateway-` variants, and the user's password), for anything else that must keep secrets out of logs or responses; connection parameters it names are also encrypted at rest (section 5.5). Connection entries never see a credential's value to begin with: `api::audit_view` puts `stored` or `replaced` in its place.
 - **Not in the change's transaction.** One request is several repository calls with their own transactions (a user, then its groups, then its grants), so the entry is written right after them. `record` never fails the request: it writes the log line (target `audit`) first, then the row; a failed insert is logged and counted (`molcajete_gateway_audit_write_failures_total`).
 - **Order and paging.** Entry ids are UUIDv7, increasing within the process, so entries of the same millisecond keep their order under `ORDER BY occurred_at DESC, entry_id DESC`. `GET /api/audit` pages with `LIMIT`/`OFFSET` and fetches one row more to answer `hasMore`; the action filter matches an action or everything below a prefix (`action = ? OR action LIKE 'prefix.%'`), and only names of lowercase letters, digits, `_` and `.` are accepted. CSV export streams the same query in pages of 1000.
 - **Retention.** A task deletes entries older than `[audit] retention_days` at start and every hour.
@@ -798,7 +806,6 @@ Tracked as issues:
 
 - Sharing a running session through links, and administrators shadowing sessions (#48); joining with `select,$id` is refused by molcajeted today
 - Active sessions and connection history for administrators, ending sessions (#49)
-- Encrypting stored connection credentials and never returning them from the API (#52)
 - File transfer: SFTP in SSH sessions and drive redirection in RDP (#53); the protocol's `file`/`pipe`/`filesystem` objects are not handled yet
 - Read-only and clipboard restrictions in the connection form (#54)
 - Throttling repeated failed logins (#55)
@@ -811,7 +818,7 @@ Not yet tracked:
 
 1. **molcajeted protocols.** Telnet and Kubernetes (the web UI already treats them as terminals for stock guacd). SSH: agent forwarding, italics and colour emoji. RDP: RemoteApp, receiving EGFX/H.264 and relaying the server's stream as is, AAC/Opus audio, Kerberos, bulk compression once IronRDP can reactivate with it.
 2. **Input.** Audio input (microphone), touch and multi-touch, an on-screen keyboard.
-3. **Gateway.** LDAP, TLS to the daemon, an HTTP tunnel for networks without WebSocket.
+3. **Gateway.** LDAP, TLS to the daemon, an HTTP tunnel for networks without WebSocket. Connection credentials kept in HashiCorp Vault or OpenBao (KV) and referenced from a parameter, instead of encrypted in the database.
 4. **Recordings.** Checkpoints (copies of the layers every so often) so that seeking backward does not replay from the start, at the price of GPU memory and of video streams whose decoder state cannot be copied; playing audio; showing the key log of a recording with keys; recording in molcajeted for deployments without the gateway.
 5. **Renderer.** Batching solid fills, a WebGPU backend (`copyExternalImageToTexture`/`importExternalTexture` to cut upload costs; only `Renderer` needs replacing), recovering from a lost WebGL context.
 6. **molcajeted encoding.** Pacing from a measured link rate and per-connection limits (the byte budget is a fixed 8 MiB/s); building a frame off the connection's task (images are encoded in parallel, but the session loop still waits for the frame); running the video encode alongside the image phase; backing off scroll and move detection where it keeps finding nothing; lossy WebP as in guacd 1.6. zstd images: the cost of one more image was estimated for PNG and not revisited; indexed images could be uploaded as indices and expanded by a shader; a faster Zstandard decoder for wasm than `ruzstd`.

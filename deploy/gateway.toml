@@ -16,6 +16,13 @@ port = 4822
 # [database]
 # url = "postgres://molcajete:change-me@postgres/molcajete"
 
+# Connection passwords and keys are encrypted in the database with this key
+# (`openssl rand -base64 32`); keep a copy with the database backups. Without
+# one, the gateway generates MOLCAJETE_DATA_DIR/secret.key, which needs a
+# volume there to survive. MOLCAJETE_SECRET_KEY wins over the file.
+# [secrets]
+# key = "..."
+
 # Created as an administrator on first start; afterwards manage users and
 # connections in the web UI. The entries below are only imported once.
 [[users]]

@@ -1,7 +1,7 @@
 //! JSON API: login sessions, connections, folders, users, groups,
 //! recordings and the audit log.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::Json;
@@ -67,6 +67,13 @@ impl From<DbError> for ApiError {
                 Self::bad_request("At least one enabled administrator must remain.")
             }
             DbError::Invalid(message) => Self::bad_request(message),
+            DbError::Secret(err) => {
+                error!(error = %err, "stored connection credentials");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Stored connection credentials could not be read.",
+                )
+            }
             DbError::Other(err) => {
                 error!(error = %err, "database error");
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Database error.")
@@ -283,6 +290,8 @@ pub async fn list_connections(
     Ok(Json(state.db.connection_summaries(&user).await?))
 }
 
+/// Stored credentials are never returned, to anyone: the connection names
+/// them in `storedSecrets` instead.
 pub async fn get_connection(
     State(state): State<Arc<AppState>>,
     ConnectionManager(_): ConnectionManager,
@@ -338,6 +347,12 @@ fn validate_connection(mut c: ConnectionRecord) -> ApiResult<ConnectionRecord> {
         parameters.insert(name, value);
     }
     c.parameters = parameters;
+    c.clear_secrets = c
+        .clear_secrets
+        .into_iter()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect();
     c.parent_id = c.parent_id.filter(|p| !p.is_empty());
     // Attributes are flags the gateway acts on; unset ones are left out.
     for name in c.attributes.keys() {
@@ -373,9 +388,34 @@ pub async fn create_connection(
         .by(&admin)
         .from(&address)
         .target(target::CONNECTION, &created.id, &created.name)
-        .changes(audit::diff(&Value::Null, &json!(created)));
+        .changes(audit::diff(
+            &Value::Null,
+            &audit_view(&created, &BTreeSet::new()),
+        ));
     audit::record(&state.db, entry).await;
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// A connection as the audit log sees it: each stored credential as
+/// `"stored"`, or `"replaced"` when `replaced` names it, so the log shows
+/// that a credential was set, changed or removed but never its value
+/// (encrypted or not). `storedSecrets` is left out, being the same news.
+fn audit_view(c: &ConnectionRecord, replaced: &BTreeSet<String>) -> Value {
+    let mut value = json!(c);
+    if let Some(map) = value.as_object_mut() {
+        map.remove("storedSecrets");
+        if let Some(Value::Object(parameters)) = map.get_mut("parameters") {
+            for name in &c.stored_secrets {
+                let mark = if replaced.contains(name) {
+                    "replaced"
+                } else {
+                    "stored"
+                };
+                parameters.insert(name.clone(), mark.into());
+            }
+        }
+    }
+    value
 }
 
 pub async fn update_connection(
@@ -389,11 +429,21 @@ pub async fn update_connection(
     let c = validate_connection(body)?;
     let before = state.db.connection(&c.id).await?;
     let updated = state.db.update_connection(&c).await?;
+    // Credentials given a value: the audit log shows they changed.
+    let replaced = c
+        .parameters
+        .keys()
+        .filter(|name| updated.stored_secrets.contains(*name))
+        .cloned()
+        .collect();
     let entry = Entry::new(action::CONNECTION_UPDATE)
         .by(&admin)
         .from(&address)
         .target(target::CONNECTION, &updated.id, &updated.name)
-        .changes(audit::diff(&json!(before), &json!(updated)));
+        .changes(audit::diff(
+            &audit_view(&before, &BTreeSet::new()),
+            &audit_view(&updated, &replaced),
+        ));
     audit::record(&state.db, entry).await;
     Ok(Json(updated))
 }
@@ -410,7 +460,10 @@ pub async fn delete_connection(
         .by(&admin)
         .from(&address)
         .target(target::CONNECTION, &id, &before.name)
-        .changes(audit::diff(&json!(before), &Value::Null));
+        .changes(audit::diff(
+            &audit_view(&before, &BTreeSet::new()),
+            &Value::Null,
+        ));
     audit::record(&state.db, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1442,6 +1495,8 @@ mod tests {
                 (" hostname ".into(), "10.0.0.5".into()),
                 ("empty".into(), String::new()),
             ]),
+            stored_secrets: Default::default(),
+            clear_secrets: [" password ".into(), " ".into()].into(),
             parent_id: Some(String::new()),
             attributes: BTreeMap::from([
                 (attributes::RECORD.into(), "true".into()),
@@ -1464,6 +1519,7 @@ mod tests {
             c.attributes,
             BTreeMap::from([(attributes::RECORD.into(), "true".into())])
         );
+        assert_eq!(c.clear_secrets, ["password".to_owned()].into());
         let mut unknown = record("x");
         unknown.attributes.insert("hostname".into(), "true".into());
         assert!(validate_connection(unknown).is_err());

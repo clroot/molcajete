@@ -18,6 +18,8 @@ impl ConnectionConfig {
             guacd_host: self.guacd.as_ref().map(|g| g.host.clone()),
             guacd_port: self.guacd.as_ref().map(|g| g.port),
             parameters: self.parameters.clone(),
+            stored_secrets: Default::default(),
+            clear_secrets: Default::default(),
             parent_id: None,
             attributes: self.attributes.clone(),
         }
@@ -164,6 +166,7 @@ mod tests {
             guacd = { host = "127.0.0.1", port = 4823 }
             [connections.parameters]
             hostname = "10.0.0.5"
+            password = "vnc-pass"
             "#,
         )
         .unwrap();
@@ -174,6 +177,14 @@ mod tests {
         let desk = db.connection("desk").await.unwrap();
         assert_eq!(desk.name, "desk");
         assert_eq!(desk.guacd_port, Some(4823));
+        // Imported credentials are encrypted like any other.
+        assert!(!desk.parameters.contains_key("password"));
+        let stored = db.stored_parameter("desk", "password").await.unwrap();
+        assert!(crate::secrets::is_sealed(&stored));
+        assert_eq!(
+            db.connection_secrets("desk").await.unwrap()["password"],
+            "vnc-pass"
+        );
 
         // Changes made in the database survive a restart with the same file.
         set_password(&db, "boss", "changed-password").await.unwrap();

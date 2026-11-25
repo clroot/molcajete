@@ -25,6 +25,9 @@ pub struct Config {
     pub recordings: RecordingsConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    /// The key stored connection credentials are encrypted with.
+    #[serde(default)]
+    pub secrets: SecretsConfig,
     /// Administrators created in the database on startup when no user with
     /// that name exists yet. Existing users and passwords are left alone.
     #[serde(default)]
@@ -204,6 +207,29 @@ impl Default for AuditConfig {
 
 fn default_audit_retention_days() -> u64 {
     365
+}
+
+/// `[secrets]`: the key stored connection credentials (passwords, private
+/// keys, …) are encrypted with; see [`crate::secrets`]. The
+/// `MOLCAJETE_SECRET_KEY` environment variable wins over `key_file`, which
+/// wins over `key`; without any, `<server.data_dir>/secret.key` is used and
+/// generated on first start. Keys are base64 of 32 random bytes
+/// (`openssl rand -base64 32`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// File holding the key.
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+    /// The key itself.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Retired keys that still decrypt values `rotate-key` has not
+    /// re-encrypted yet.
+    #[serde(default)]
+    pub previous_key_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
 }
 
 /// Session recording (connections with *Record sessions* on).
@@ -411,6 +437,9 @@ impl Config {
             if !seen.insert(c.id.as_str()) {
                 bail!("duplicate connection id {:?}", c.id);
             }
+        }
+        if self.secrets.key.is_some() && self.secrets.key_file.is_some() {
+            bail!("secrets: set key or key_file, not both");
         }
         if let Some(oidc) = &self.oidc {
             if oidc.client_secret.is_some() && oidc.client_secret_file.is_some() {

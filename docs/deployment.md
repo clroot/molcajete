@@ -75,7 +75,8 @@ All ports are published on 127.0.0.1 only. Put a reverse proxy with TLS in front
 
 3. Uncomment `sealed-secret.yaml` in `kustomization.yaml` and set the image names and tags in `deployment.yaml`.
 4. Choose where state lives. Either set `MOLCAJETE_DATABASE_URL` to PostgreSQL or MySQL (keep the URL in a Secret), or mount a PersistentVolume at `/var/lib/molcajete` for the SQLite file. Session recordings also need a PersistentVolume (`[recordings] directory`, by default `/var/lib/molcajete/recordings`). The template mounts neither, so without one everything created in the web UI, and every recording, is lost when the pod restarts.
-5. Pick an Ingress. `ingress.yaml` is a Tailscale ingress (`ingressClassName: tailscale`) that the reverse proxy example connects to; replace it with your own if needed. With Argo CD, add an Application and allow the `molcajete` namespace in its AppProject.
+5. Give the gateway its [secret key](#secrets) for stored connection credentials: `[secrets] key = "…"` (from `openssl rand -base64 32`) in the same Secret as the configuration, or `MOLCAJETE_SECRET_KEY` from a Secret of its own. Keep a copy outside the cluster with the database backups. Without a key the gateway generates `/var/lib/molcajete/secret.key`, which only survives with a PersistentVolume there.
+6. Pick an Ingress. `ingress.yaml` is a Tailscale ingress (`ingressClassName: tailscale`) that the reverse proxy example connects to; replace it with your own if needed. With Argo CD, add an Application and allow the `molcajete` namespace in its AppProject.
 
 Notes on the template:
 
@@ -188,17 +189,20 @@ password = "change-me"
 | `--telemetry-listen ADDR` | `MOLCAJETE_TELEMETRY_LISTEN` | off | `/metrics`, `/healthz` and profiles on a separate port. |
 | `--profiling` | `MOLCAJETE_PROFILING` | off | CPU profiles on the telemetry listener. |
 | | `MOLCAJETE_OIDC_CLIENT_SECRET` | | The `[oidc]` client secret; wins over the file. |
+| | `MOLCAJETE_SECRET_KEY` | | The [secret key](#secrets) for stored connection credentials; wins over `[secrets]`. |
 | | `RUST_LOG` | `info,tower_http=warn,pprof=warn` | Log filter. |
 
 The gateway image sets `MOLCAJETE_CONFIG=/etc/molcajete/gateway.toml`, `MOLCAJETE_LISTEN=0.0.0.0:8080`, `MOLCAJETE_STATIC_DIR=/usr/share/molcajete/web` and `MOLCAJETE_DATA_DIR=/var/lib/molcajete`, so the file need not repeat them.
 
-One subcommand recovers access. It reads the password (at least 8 characters) from stdin, and makes the account an enabled administrator, creating it if needed:
+Two subcommands work on the database directly, without a running gateway. They open it from the same configuration (and apply pending migrations), so run them with the same `--database-url` or `--data-dir` as the server, for example with `kubectl exec` in the gateway container.
 
-```bash
-echo 'new-password' | molcajete-gateway --config gateway.toml set-password admin
-```
+- `set-password <username>` recovers access. It reads the password (at least 8 characters) from stdin, and makes the account an enabled administrator, creating it if needed:
 
-It opens the database from the same configuration (and applies pending migrations), so run it with the same `--database-url` or `--data-dir` as the server, for example with `kubectl exec` in the gateway container.
+  ```bash
+  echo 'new-password' | molcajete-gateway --config gateway.toml set-password admin
+  ```
+
+- `rotate-key` re-encrypts every stored connection credential with the current secret key ([Rotating the key](#rotating-the-key)).
 
 ### `[server]`
 
@@ -233,6 +237,46 @@ The schema is created and migrated when the gateway starts ([Upgrading](#upgradi
 | Key | Default | |
 | --- | --- | --- |
 | `session_ttl_hours` | `12` | Lifetime of a sign-in session (the `molcajete_session` cookie), at least 1. |
+
+### `[secrets]`
+
+The key that [stored connection credentials](administration.md#stored-credentials) (passwords, private keys, passphrases) are encrypted with in the database. A key is 32 random bytes written as base64; make one with `openssl rand -base64 32`.
+
+| Key | Default | |
+| --- | --- | --- |
+| `key_file` | none | File holding the key. A warning is logged when other users can read it. |
+| `key` | none | The key itself; set `key` or `key_file`, not both. |
+| `previous_key_files`, `previous_keys` | `[]` | Retired keys that still decrypt values encrypted before a [rotation](#rotating-the-key). |
+
+```toml
+[secrets]
+key_file = "/run/secrets/molcajete-secret-key"
+```
+
+The gateway takes the key from `MOLCAJETE_SECRET_KEY` first, then `key_file`, then `key`. **Without any, it uses `<data_dir>/secret.key`**, and on the first start generates that file (mode 0600) and logs `generated a new secret key …; back it up together with the database`. That suits the single-host setup, where the key sits next to the SQLite file; with PostgreSQL or MySQL, or in Kubernetes, configure the key explicitly.
+
+**Back the key up along with the database, but store it separately** (a password manager or secrets store): a database restored without its key has lost its stored credentials, and a key kept in the same backup as the database protects nothing. Losing the key loses the stored credentials, not the connections: they have to be typed again.
+
+Starting without the right key fails with a message that names the key the stored values need, rather than sending wrong credentials to remote servers:
+
+- `the database holds encrypted connection credentials but no secret key is configured and <data_dir>/secret.key does not exist`: the database was restored or moved without its key. Restore the key file, or configure the key.
+- `a stored credential is encrypted with key <id>, which is not configured`: a different key is configured. The id is derived from the key and shown at every start (`secret key for stored credentials loaded key=<id>`).
+
+#### Rotating the key
+
+1. Make a new key and configure it as the key, and the old one as a previous key:
+
+   ```toml
+   [secrets]
+   key_file = "/run/secrets/molcajete-secret-key-2"
+   previous_key_files = ["/run/secrets/molcajete-secret-key"]
+   ```
+
+2. Restart the gateway (every replica). It now encrypts new values with the new key and still reads old ones.
+3. Run `molcajete-gateway rotate-key` with that configuration. It re-encrypts every stored credential with the new key, in one transaction, and prints how many it changed.
+4. Remove the previous key from the configuration and restart. Back up the new key with the database.
+
+With the generated `<data_dir>/secret.key`, rename it (to `secret.key.old`, say), write the new key to `secret.key` and list the old file in `previous_key_files`.
 
 ### `[oidc]`
 
@@ -327,7 +371,7 @@ Connections imported at startup when no connection with that id exists yet; afte
 | `name` | Shown in the connection list; defaults to `id`. |
 | `protocol` | required. The daemon's protocol: `vnc`, `rdp`, `ssh` (molcajeted and guacd), `telnet`, `kubernetes` (guacd). |
 | `guacd` | This connection's daemon, `{ host = "…", port = … }`; otherwise `[guacd]`. The handshake timeout is always `[guacd] handshake_timeout`. |
-| `parameters` | Protocol parameters sent to the daemon in `connect`, as strings (Guacamole's parameter names: `hostname`, `port`, `password`, `security`, `resize-method`, …). |
+| `parameters` | Protocol parameters sent to the daemon in `connect`, as strings (Guacamole's parameter names: `hostname`, `port`, `password`, `security`, `resize-method`, …). Credentials are encrypted when imported, but stay readable in this file: remove them once imported, or leave them out. |
 | `attributes` | molcajete's own settings, never sent to the daemon. Flags are on when the value is `"true"`: `record-sessions`, `record-keys`, `record-exclude-mouse`, `record-molcajete-formats`. |
 
 ```toml
@@ -392,9 +436,18 @@ The gateway applies pending migrations when it starts (and when `set-password` r
 - The JSON API keeps `isAdmin` on users, derived from the role, and accepts it in user requests, so scripts that used it keep working.
 - `[[users]]` from the configuration file and `set-password` still create administrators.
 
+### Encrypted credentials
+
+Gateways from this change on keep [connection credentials](administration.md#stored-credentials) encrypted. The schema does not change; the data does:
+
+- **Before upgrading, configure the [secret key](#secrets)** wherever `<data_dir>` is not on persistent storage (PostgreSQL or MySQL without a data volume, Kubernetes): otherwise the gateway generates a key that is lost with the pod, or fails to start when `<data_dir>` is read-only. Back the key up.
+- **On every start the gateway encrypts credentials still stored in plain text**, in one transaction, and logs `encrypted stored connection credentials that were in plain text count=<n>`. The first start after the upgrade encrypts all existing ones; later starts find none, unless a newer gateway adds a parameter name to the list of credentials.
+- **Rolling back needs the database backup taken before the upgrade.** An older gateway would send the encrypted values to remote servers as passwords. Restoring the backup also undoes connection changes made since.
+- The connection API no longer returns credentials ([JSON API](administration.md#json-api)). Scripts that read a connection and write it back keep its credentials, since a credential left out of a `PUT` is kept.
+
 ### Configuration files
 
-The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour.
+The configuration is strict in both directions: a newer gateway rejects keys it does not know, and an older one rejects sections it does not know (`[oidc]`, `[recordings]`, `[audit]`, `[secrets]`). When rolling back, roll back the configuration file too. No released key has been renamed or removed so far, and new sections and keys are optional with defaults that keep the previous behaviour.
 
 ## Mixed versions
 
