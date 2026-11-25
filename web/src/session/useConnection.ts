@@ -1,21 +1,32 @@
 import {useEffect, useState} from 'react';
 import {api} from '../api';
+import type {ConnectionDisplay} from './displaySettings';
+
+type ConnectionInfo = {name: string; protocol: string | null; display: ConnectionDisplay};
 
 /**
- * The connection's configured name (the id until it loads) and protocol
- * (`null` until it loads); also sets the tab title.
+ * The connection's configured name (the id until it loads), protocol
+ * (`null` until it loads) and display parameters; also sets the tab title.
  */
 export function useConnection(connectionId: string) {
-  const [connection, setConnection] = useState<{name: string; protocol: string | null}>({
+  const [connection, setConnection] = useState<ConnectionInfo>({
     name: connectionId,
     protocol: null,
+    display: {dpi: null, resizeMethod: null},
   });
   useEffect(() => {
     let isCurrent = true;
     api.connections().then(
       list => {
         const found = list.find(c => c.id === connectionId);
-        if (isCurrent && found) setConnection({name: found.name, protocol: found.protocol});
+        if (isCurrent && found) {
+          setConnection({
+            name: found.name,
+            protocol: found.protocol,
+            // Older gateways do not send them.
+            display: {dpi: found.dpi ?? null, resizeMethod: found.resizeMethod ?? null},
+          });
+        }
       },
       () => {}, // Keep showing the id.
     );

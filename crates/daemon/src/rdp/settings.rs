@@ -101,6 +101,37 @@ pub enum ResizeMethod {
     DisplayUpdate,
 }
 
+impl ResizeMethod {
+    /// Reads a `resize-method` value. guacd's "reconnect" is not
+    /// supported and, like anything else, leaves the size alone.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("display-update") => Self::DisplayUpdate,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Reads a `dpi` value: a positive number, or `None` for "follow the client".
+pub fn parse_dpi(value: Option<&str>) -> Option<u32> {
+    value?.trim().parse::<u32>().ok().filter(|&d| d > 0)
+}
+
+/// Desktop scale factor in percent ([MS-RDPBCGR] 2.2.1.3.2) for a DPI.
+pub fn desktop_scale_factor(dpi: u32) -> u32 {
+    (dpi.saturating_mul(100) / 96).clamp(100, 500)
+}
+
+/// Device scale factor in percent for a desktop scale factor: one of 100,
+/// 140 or 180, the plateaus Windows uses (125 % gives 100, 175 % gives 140).
+pub fn device_scale_factor(desktop_scale_factor: u32) -> u32 {
+    match desktop_scale_factor {
+        0..140 => 100,
+        140..180 => 140,
+        _ => 180,
+    }
+}
+
 /// Keyboard layout of the remote session, which decides how keysyms are
 /// turned into keyboard events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,16 +241,8 @@ impl Settings {
         let width = params.number::<u32>("width").unwrap_or(info.width);
         let height = params.number::<u32>("height").unwrap_or(info.height);
         let (width, height) = desktop_size(width, height);
-        let dpi = params
-            .number::<u32>("dpi")
-            .filter(|&d| d > 0)
-            .unwrap_or(info.dpi)
-            .max(1);
-
-        let resize_method = match params.value("resize-method") {
-            Some("display-update") => ResizeMethod::DisplayUpdate,
-            _ => ResizeMethod::None,
-        };
+        let dpi = parse_dpi(params.value("dpi")).unwrap_or(info.dpi).max(1);
+        let resize_method = ResizeMethod::parse(params.value("resize-method"));
         let layout = match params.value("server-layout") {
             Some("failsafe") => KeyboardLayout::Failsafe,
             Some("ko-kr-qwerty") => KeyboardLayout::KoKrQwerty,
@@ -266,16 +289,12 @@ impl Settings {
 
     /// Desktop scale factor in percent ([MS-RDPBCGR] 2.2.1.3.2), from the DPI.
     pub fn desktop_scale_factor(&self) -> u32 {
-        (self.dpi * 100 / 96).clamp(100, 500)
+        desktop_scale_factor(self.dpi)
     }
 
     /// Device scale factor in percent: one of 100, 140 or 180.
     pub fn device_scale_factor(&self) -> u32 {
-        match self.desktop_scale_factor() {
-            0..140 => 100,
-            140..180 => 140,
-            _ => 180,
-        }
+        device_scale_factor(self.desktop_scale_factor())
     }
 }
 
@@ -475,6 +494,52 @@ mod tests {
         assert_eq!(enabled.audio, Some(AudioEncoding::L16));
         let disabled = Settings::parse(&params(&[("disable-audio", "true")]), &info).unwrap();
         assert_eq!(disabled.audio, None);
+    }
+
+    #[test]
+    fn dpi_follows_the_client_unless_set() {
+        let client = ClientInfo { dpi: 192, ..info() };
+        let auto = Settings::parse(&params(&[]), &client).unwrap();
+        assert_eq!((auto.dpi, auto.desktop_scale_factor()), (192, 200));
+        let fixed = Settings::parse(&params(&[("dpi", "144")]), &client).unwrap();
+        assert_eq!((fixed.dpi, fixed.desktop_scale_factor()), (144, 150));
+        for junk in ["0", "-96", "auto"] {
+            let s = Settings::parse(&params(&[("dpi", junk)]), &client).unwrap();
+            assert_eq!(s.dpi, 192, "dpi={junk}");
+        }
+    }
+
+    #[test]
+    fn resize_method_is_off_unless_display_update() {
+        assert_eq!(ResizeMethod::parse(None), ResizeMethod::None);
+        assert_eq!(ResizeMethod::parse(Some("")), ResizeMethod::None);
+        assert_eq!(ResizeMethod::parse(Some("reconnect")), ResizeMethod::None);
+        assert_eq!(
+            ResizeMethod::parse(Some("display-update")),
+            ResizeMethod::DisplayUpdate
+        );
+    }
+
+    #[test]
+    fn scale_factors_of_the_offered_scales() {
+        // (percent, DPI as the web client stores it, device scale factor)
+        let cases = [
+            (100, 96, 100),
+            (125, 120, 100),
+            (150, 144, 140),
+            (175, 168, 140),
+            (200, 192, 180),
+            (250, 240, 180),
+            (300, 288, 180),
+        ];
+        for (percent, dpi, device) in cases {
+            assert_eq!(desktop_scale_factor(dpi), percent, "dpi {dpi}");
+            assert_eq!(device_scale_factor(percent), device, "{percent} %");
+        }
+        // Out of range values are clamped to what the protocol allows.
+        assert_eq!(desktop_scale_factor(48), 100);
+        assert_eq!(desktop_scale_factor(1200), 500);
+        assert_eq!(desktop_scale_factor(u32::MAX), 500);
     }
 
     #[test]

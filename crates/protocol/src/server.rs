@@ -293,6 +293,11 @@ pub enum ServerInstruction<'a> {
 
     // ---- Session control -----------------------------------------------
     Disconnect,
+    /// Whether the server can change the remote display's size and scale
+    /// during the session (molcajeted, RDP). Stock guacd never sends it.
+    DisplayControl {
+        available: bool,
+    },
     Error {
         message: &'a str,
         status: Status,
@@ -618,6 +623,9 @@ impl<'a> ServerInstruction<'a> {
                 mimetype: d.s(2),
             },
             "disconnect" => S::Disconnect,
+            "display-control" => S::DisplayControl {
+                available: d.s(0) == "1",
+            },
             "error" => S::Error {
                 message: d.s(0),
                 // A missing/invalid status is reported as a generic server error.
@@ -704,6 +712,17 @@ mod tests {
         assert_eq!(parse_int("-3"), Some(-3));
         assert_eq!(parse_int(""), None);
         assert_eq!(parse_int("abc"), None);
+    }
+
+    #[test]
+    fn display_control() {
+        for (arg, available) in [("1", true), ("0", false), ("", false)] {
+            let ins = Instruction::new("display-control", [arg]);
+            assert_eq!(
+                ServerInstruction::decode(&&ins).unwrap(),
+                ServerInstruction::DisplayControl { available }
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 // Connection form fields per guacd protocol. Parameters not listed here
 // are edited as free key/value pairs.
+import {AUTOMATIC_SCALE_LABEL, SCALE_OPTIONS} from '../session/displayScale';
 
 export type FieldKind = 'text' | 'password' | 'number' | 'multiline' | 'switch' | 'select';
 
@@ -11,6 +12,10 @@ export type ParameterField = {
   placeholder?: string;
   isRequired?: boolean;
   options?: {value: string; label: string}[];
+  /** The value of a switch that is on; guacd's `true` by default. */
+  onValue?: string;
+  /** Set when a new connection takes this protocol. */
+  defaultValue?: string;
 };
 
 export type Protocol = {
@@ -86,6 +91,22 @@ export const PROTOCOLS: Protocol[] = [
           {value: 'ko-kr-qwerty', label: 'Korean'},
           {value: 'failsafe', label: 'Any (send text as Unicode)'},
         ],
+      },
+      {
+        name: 'resize-method',
+        label: 'Resize the remote desktop to the window',
+        kind: 'switch',
+        description: 'The remote desktop takes the size of the browser window and follows it.',
+        onValue: 'display-update',
+        defaultValue: 'display-update',
+      },
+      {
+        name: 'dpi',
+        label: 'Display scale',
+        kind: 'select',
+        description: 'Size of text and apps on the remote desktop.',
+        placeholder: AUTOMATIC_SCALE_LABEL,
+        options: SCALE_OPTIONS,
       },
     ],
   },

@@ -37,6 +37,9 @@ pub struct ConnectionSummary {
     pub port: Option<String>,
     pub guacd_host: Option<String>,
     pub guacd_port: Option<u16>,
+    /// Display parameters the session page starts from (RDP).
+    pub dpi: Option<String>,
+    pub resize_method: Option<String>,
 }
 
 fn guacd_port(row: &AnyRow) -> Result<Option<u16>, sqlx::Error> {
@@ -54,12 +57,18 @@ impl Database {
         is_admin: bool,
     ) -> DbResult<Vec<ConnectionSummary>> {
         let select = "SELECT c.connection_id, c.name, c.protocol, c.guacd_host, c.guacd_port, \
-                      h.parameter_value AS hostname, p.parameter_value AS port \
+                      h.parameter_value AS hostname, p.parameter_value AS port, \
+                      d.parameter_value AS dpi, r.parameter_value AS resize_method \
                       FROM molcajete_connection c \
                       LEFT JOIN molcajete_connection_parameter h \
                         ON h.connection_id = c.connection_id AND h.parameter_name = 'hostname' \
                       LEFT JOIN molcajete_connection_parameter p \
-                        ON p.connection_id = c.connection_id AND p.parameter_name = 'port'";
+                        ON p.connection_id = c.connection_id AND p.parameter_name = 'port' \
+                      LEFT JOIN molcajete_connection_parameter d \
+                        ON d.connection_id = c.connection_id AND d.parameter_name = 'dpi' \
+                      LEFT JOIN molcajete_connection_parameter r \
+                        ON r.connection_id = c.connection_id \
+                        AND r.parameter_name = 'resize-method'";
         let rows = if is_admin {
             let sql = format!("{select} ORDER BY c.name, c.connection_id");
             query!(self, &sql).fetch_all(&self.pool).await?
@@ -84,6 +93,8 @@ impl Database {
                     port: row.try_get("port")?,
                     guacd_host: row.try_get("guacd_host")?,
                     guacd_port: guacd_port(row)?,
+                    dpi: row.try_get("dpi")?,
+                    resize_method: row.try_get("resize_method")?,
                 })
             })
             .collect::<Result<_, sqlx::Error>>()
@@ -295,6 +306,10 @@ mod tests {
             changed.guacd_host = Some("127.0.0.1".into());
             changed.guacd_port = Some(4823);
             changed.parameters.remove("password");
+            changed.parameters.insert("dpi".into(), "144".into());
+            changed
+                .parameters
+                .insert("resize-method".into(), "display-update".into());
             assert_eq!(
                 db.update_connection(&changed).await.unwrap(),
                 changed,
@@ -324,9 +339,22 @@ mod tests {
                     .is_empty(),
                 "{name}"
             );
+            let summaries = db.connection_summaries(&user.id, true).await.unwrap();
+            assert_eq!(summaries.len(), 2, "{name}");
             assert_eq!(
-                db.connection_summaries(&user.id, true).await.unwrap().len(),
-                2,
+                (
+                    summaries[1].dpi.as_deref(),
+                    summaries[1].resize_method.as_deref()
+                ),
+                (Some("144"), Some("display-update")),
+                "{name}"
+            );
+            assert_eq!(
+                (
+                    summaries[0].dpi.as_deref(),
+                    summaries[0].resize_method.as_deref()
+                ),
+                (None, None),
                 "{name}"
             );
 

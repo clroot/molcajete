@@ -215,6 +215,7 @@ mod wasm_api {
         }
 
         /// Whether container size changes are sent to the server as `size`.
+        /// Turning it on also sends the current size.
         pub fn set_auto_resize(&self, enabled: bool) {
             self.run(|inner| inner.set_auto_resize(enabled));
         }

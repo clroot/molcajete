@@ -12,6 +12,7 @@ mod active;
 mod audio;
 mod clipboard;
 mod connect;
+mod display_control;
 mod graphics;
 mod keyboard;
 mod mouse;

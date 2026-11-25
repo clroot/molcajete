@@ -8,6 +8,7 @@ const connected: SessionState = {
   clipboard: '',
   isUnstable: false,
   stats: null,
+  canChangeDisplay: true,
 };
 
 describe('session events', () => {
@@ -18,6 +19,13 @@ describe('session events', () => {
       const action = {type, detail: {stream: 128}} as unknown as Parameters<typeof reduce>[1];
       expect(reduce(connected, action)).toBe(connected);
     }
+  });
+
+  test('the server can say it cannot change the display, until the next connection', () => {
+    const fixed = reduce(connected, {type: 'display-control', detail: false});
+    expect(fixed.canChangeDisplay).toBe(false);
+    expect(reduce(fixed, {type: 'display-control', detail: true}).canChangeDisplay).toBe(true);
+    expect(reduce(fixed, {type: 'state', detail: 'connecting'}).canChangeDisplay).toBe(true);
   });
 
   test('a disconnect keeps the error that caused it', () => {

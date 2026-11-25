@@ -1079,6 +1079,9 @@ impl Inner {
             }
             S::Mouse { x, y } => self.display.show_software_cursor(x, y),
             S::Name { name } => self.emit("name", JsValue::from_str(name)),
+            S::DisplayControl { available } => {
+                self.emit("display-control", JsValue::from_bool(available))
+            }
             S::Msg { id } => self.emit("msg", JsValue::from(id)),
             S::Error { message, status } => {
                 let message = message.to_owned();
@@ -1593,8 +1596,16 @@ impl Inner {
         self.update_scale();
     }
 
+    /// Whether container size changes are sent to the server. Turning it
+    /// on also sends the current size, so that the remote display catches up
+    /// with the window.
     pub fn set_auto_resize(&mut self, enabled: bool) {
-        self.auto_resize = enabled;
+        let was_enabled = std::mem::replace(&mut self.auto_resize, enabled);
+        if !enabled {
+            self.pending_resize = None;
+        } else if !was_enabled && self.is_connected() {
+            self.queue_resize();
+        }
     }
 
     /// Container size (CSS pixels) and device pixel ratio, for clients
@@ -1618,12 +1629,17 @@ impl Inner {
         self.viewport = size;
         self.update_scale();
         if self.auto_resize && self.is_connected() {
-            let w = (size.0 * self.dpr).round() as u32;
-            let h = (size.1 * self.dpr).round() as u32;
-            if w >= 64 && h >= 64 {
-                // Sent from the timer so a window drag produces one request.
-                self.pending_resize = Some((w, h));
-            }
+            self.queue_resize();
+        }
+    }
+
+    /// Queues a `size` for the container in device pixels. It is sent from
+    /// the timer, so a window drag produces one request.
+    fn queue_resize(&mut self) {
+        let w = (self.viewport.0 * self.dpr).round() as u32;
+        let h = (self.viewport.1 * self.dpr).round() as u32;
+        if w >= 64 && h >= 64 {
+            self.pending_resize = Some((w, h));
         }
     }
 

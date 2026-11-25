@@ -13,6 +13,8 @@ const forcePngImages = new URLSearchParams(location.search).has('png');
 type Options = {
   displayRef: RefObject<HTMLDivElement | null>;
   connectionId: string;
+  /** Extra tunnel URL parameters, read at every connect. */
+  tunnelParameters?: () => Record<string, string>;
   onEvent: (event: SessionEvent) => void;
   /** The client could not be created (no WebGL2, wasm failed to load…). */
   onStartFailed: (message: string) => void;
@@ -22,7 +24,13 @@ type Options = {
  * Creates the wasm client in `displayRef`, connects it to `connectionId`
  * and frees it on unmount. `connect()` reconnects the same client.
  */
-export function useMolcajeteClient({displayRef, connectionId, onEvent, onStartFailed}: Options) {
+export function useMolcajeteClient({
+  displayRef,
+  connectionId,
+  tunnelParameters,
+  onEvent,
+  onStartFailed,
+}: Options) {
   const clientRef = useRef<MolcajeteSession | null>(null);
   const reporterRef = useRef<Reporter | null>(null);
   const [mode, setMode] = useState<MolcajeteSession['mode'] | null>(null);
@@ -38,9 +46,12 @@ export function useMolcajeteClient({displayRef, connectionId, onEvent, onStartFa
       reporterRef.current = new reporting.SessionReporter(connectionId, client.mode);
     }
     let url = client.tunnel_url(tunnelBase(), connectionId);
+    for (const [name, value] of Object.entries(tunnelParameters?.() ?? {})) {
+      url += `&${encodeURIComponent(name)}=${encodeURIComponent(value)}`;
+    }
     if (reporterRef.current) url += `&session=${encodeURIComponent(reporterRef.current.session)}`;
     client.connect(url);
-  }, [connectionId]);
+  }, [connectionId, tunnelParameters]);
 
   useEffect(() => {
     let isCurrent = true;

@@ -66,6 +66,21 @@ pub struct TunnelRequest {
     /// The browser selected the binary subprotocol.
     pub binary: bool,
     pub info: ClientInfo,
+    /// Connection parameters this browser sets for itself
+    /// (`param.<name>=<value>`, see [`valid_override`]). An empty value
+    /// removes the connection's own.
+    pub overrides: BTreeMap<String, String>,
+}
+
+/// Whether a browser may set parameter `name` to `value` for its own
+/// session. Only how the remote desktop follows the window can be set,
+/// which the session menu changes during a session anyway.
+fn valid_override(name: &str, value: &str) -> bool {
+    match name {
+        "dpi" => value.is_empty() || value.parse::<u32>().is_ok_and(|d| (24..=1200).contains(&d)),
+        "resize-method" => matches!(value, "" | "display-update"),
+        _ => false,
+    }
 }
 
 impl TunnelRequest {
@@ -98,7 +113,13 @@ impl TunnelRequest {
                 "video" | "GUAC_VIDEO" => video.push(value),
                 "image" | "GUAC_IMAGE" => image.push(value),
                 "timezone" | "GUAC_TIMEZONE" => req.info.timezone = Some(value),
-                _ => {}
+                key => {
+                    if let Some(name) = key.strip_prefix("param.")
+                        && valid_override(name, &value)
+                    {
+                        req.overrides.insert(name.to_owned(), value);
+                    }
+                }
             }
         }
         req.info.audio = audio;
@@ -107,6 +128,21 @@ impl TunnelRequest {
             req.info.image = image;
         }
         req
+    }
+}
+
+impl TunnelRequest {
+    /// The connection's parameters with this browser's overrides applied.
+    pub fn parameters(&self, connection: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut parameters = connection.clone();
+        for (name, value) in &self.overrides {
+            if value.is_empty() {
+                parameters.remove(name);
+            } else {
+                parameters.insert(name.clone(), value.clone());
+            }
+        }
+        parameters
     }
 }
 
@@ -164,12 +200,13 @@ async fn serve_tunnel(
     let defaults = &state.config.guacd;
     let guacd_host = connection.guacd_host.as_deref().unwrap_or(&defaults.host);
     let guacd_port = connection.guacd_port.unwrap_or(defaults.port);
-    let parameters: &BTreeMap<String, String> = &connection.parameters;
+    let parameters = request.parameters(&connection.parameters);
     info!(
         connection = %connection.id,
         protocol = %connection.protocol,
         width = request.info.width,
         height = request.info.height,
+        overrides = ?request.overrides,
         "opening tunnel"
     );
 
@@ -177,7 +214,7 @@ async fn serve_tunnel(
     let session = match guacd::connect(
         (guacd_host, guacd_port),
         &connection.protocol,
-        parameters,
+        &parameters,
         &request.info,
         request.binary,
         Duration::from_secs(defaults.handshake_timeout),
@@ -602,5 +639,42 @@ mod tests {
         assert_eq!(req.connection.as_deref(), Some("x"));
         assert_eq!(req.info.width, 800);
         assert_eq!(req.info.image, ["image/png", "image/jpeg"]);
+    }
+
+    #[test]
+    fn browser_overrides_only_display_parameters() {
+        let req = TunnelRequest::from_query(
+            "connection=win&param.dpi=144&param.resize-method=&param.hostname=evil\
+             &param.security=tls&param.password=x",
+        );
+        assert_eq!(
+            req.overrides,
+            BTreeMap::from([
+                ("dpi".to_owned(), "144".to_owned()),
+                ("resize-method".to_owned(), String::new()),
+            ])
+        );
+        let connection = BTreeMap::from([
+            ("hostname".to_owned(), "win".to_owned()),
+            ("dpi".to_owned(), "96".to_owned()),
+            ("resize-method".to_owned(), "display-update".to_owned()),
+        ]);
+        assert_eq!(
+            req.parameters(&connection),
+            BTreeMap::from([
+                ("hostname".to_owned(), "win".to_owned()),
+                ("dpi".to_owned(), "144".to_owned()),
+            ])
+        );
+
+        // Values the daemons would not understand are ignored.
+        let req = TunnelRequest::from_query(
+            "param.dpi=auto&param.dpi=9999&param.resize-method=reconnect",
+        );
+        assert!(req.overrides.is_empty());
+        assert_eq!(req.parameters(&connection), connection);
+        // Empty: follow the client.
+        let req = TunnelRequest::from_query("param.dpi=");
+        assert!(!req.parameters(&connection).contains_key("dpi"));
     }
 }
