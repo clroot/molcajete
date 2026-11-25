@@ -3,6 +3,7 @@ import {TextArea} from '@astryxdesign/core/TextArea';
 import {Selector} from '@astryxdesign/core/Selector';
 import {Switch} from '@astryxdesign/core/Switch';
 import type {ParameterField} from './protocols';
+import {scaleOptionsWith} from '../session/displayScale';
 
 // guacd reads boolean parameters as "true"; anything else is false.
 const GUACD_TRUE = 'true';
@@ -19,7 +20,11 @@ export default function ParameterInput({field, value, onChange}: Props) {
   switch (field.kind) {
     case 'switch':
       return (
-        <Switch {...common} value={value === GUACD_TRUE} onChange={on => onChange(on ? GUACD_TRUE : '')} />
+        <Switch
+          {...common}
+          value={value === (field.onValue ?? GUACD_TRUE)}
+          onChange={on => onChange(on ? (field.onValue ?? GUACD_TRUE) : '')}
+        />
       );
     case 'select':
       return (
@@ -27,9 +32,9 @@ export default function ParameterInput({field, value, onChange}: Props) {
           {...common}
           value={value || null}
           hasClear
-          placeholder="Default"
+          placeholder={field.placeholder ?? 'Default'}
           onChange={v => onChange(v ?? '')}
-          options={field.options ?? []}
+          options={field.name === 'dpi' ? scaleOptionsWith(value) : (field.options ?? [])}
         />
       );
     case 'multiline':

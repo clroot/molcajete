@@ -1,5 +1,12 @@
 import {describe, expect, test} from 'bun:test';
-import {changeProtocol, extraParameter, slugify, toConnection, toConnectionForm} from './connectionForm';
+import {
+  changeProtocol,
+  emptyConnectionForm,
+  extraParameter,
+  slugify,
+  toConnection,
+  toConnectionForm,
+} from './connectionForm';
 
 const rdp = {
   id: 'office',
@@ -31,6 +38,32 @@ describe('connection form', () => {
     form.fields.username = '';
     const result = toConnection(form);
     expect(result).toEqual({ok: true, connection: rdp});
+  });
+
+  test('new RDP connections resize the desktop to the window', () => {
+    const form = changeProtocol({...emptyConnectionForm(), name: 'New'}, 'rdp', true);
+    expect(form.fields).toEqual({'resize-method': 'display-update'});
+    // Existing connections keep what they have.
+    expect(changeProtocol(toConnectionForm({...rdp, protocol: 'vnc'}), 'rdp').fields).toEqual({
+      hostname: '10.0.0.20',
+      security: 'nla',
+    });
+    // A switch turned off is not stored, so guacd's default (none) applies.
+    form.fields['resize-method'] = '';
+    expect(toConnection(form)).toMatchObject({ok: true, connection: {parameters: {}}});
+  });
+
+  test('round-trips the display fields', () => {
+    const display = {...rdp, parameters: {...rdp.parameters, 'resize-method': 'display-update', dpi: '144'}};
+    const form = toConnectionForm(display);
+    expect(form.fields).toMatchObject({'resize-method': 'display-update', dpi: '144'});
+    expect(form.extras.map(e => e.name)).toEqual(['color-depth']);
+    expect(toConnection(form)).toEqual({ok: true, connection: display});
+    // Automatic is no `dpi` at all.
+    form.fields.dpi = '';
+    expect(toConnection(form)).toMatchObject({ok: true, connection: {parameters: {hostname: '10.0.0.20'}}});
+    const result = toConnection(form);
+    expect(result.ok && 'dpi' in result.connection.parameters).toBe(false);
   });
 
   test('uses the guacd port only with a host', () => {

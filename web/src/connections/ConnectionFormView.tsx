@@ -86,7 +86,7 @@ export default function ConnectionFormView({isNew, initial, onClose, onSaved}: P
             <Selector
               label="Protocol"
               value={form.protocol}
-              onChange={value => value && setForm(f => changeProtocol(f, value))}
+              onChange={value => value && setForm(f => changeProtocol(f, value, isNew))}
               options={PROTOCOLS.map(p => ({value: p.value, label: p.label}))}
             />
           </VStack>

@@ -62,10 +62,19 @@ export function toConnectionForm(c: Connection): ConnectionForm {
 /**
  * Switches protocol without losing anything: values the new protocol has
  * no field for move to the extras, and extras it does have a field for
- * move into that field.
+ * move into that field. A new connection also gets the protocol's
+ * defaults for fields that have no value.
  */
-export function changeProtocol(form: ConnectionForm, protocol: string): ConnectionForm {
-  return {...form, protocol, ...splitParameters(protocol, joinParameters(form))};
+export function changeProtocol(form: ConnectionForm, protocol: string, isNew = false): ConnectionForm {
+  const changed = {...form, protocol, ...splitParameters(protocol, joinParameters(form))};
+  if (isNew) {
+    for (const field of protocolInfo(protocol).fields) {
+      if (field.defaultValue !== undefined && !changed.fields[field.name]) {
+        changed.fields[field.name] = field.defaultValue;
+      }
+    }
+  }
+  return changed;
 }
 
 /** A URL-safe id derived from the name, suggested for new connections. */
