@@ -19,6 +19,8 @@ export type SessionState = {
   canChangeDisplay: boolean;
   /** Target of the link under the pointer in a terminal. */
   link: string | null;
+  /** An audio stream is open, but the browser plays nothing until a click or key press. */
+  isAudioBlocked: boolean;
 };
 
 type Action =
@@ -35,6 +37,7 @@ const initialState: SessionState = {
   stats: null,
   canChangeDisplay: true,
   link: null,
+  isAudioBlocked: false,
 };
 
 export function reduce(state: SessionState, action: Action): SessionState {
@@ -75,6 +78,8 @@ export function reduce(state: SessionState, action: Action): SessionState {
       return {...state, canChangeDisplay: action.detail};
     case 'link':
       return {...state, link: action.detail};
+    case 'audio':
+      return {...state, isAudioBlocked: action.detail.blocked};
     case 'reconnecting':
       return {...state, status: {kind: 'connecting'}, required: null};
     case 'name':

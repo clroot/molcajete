@@ -10,6 +10,7 @@ const connected: SessionState = {
   stats: null,
   canChangeDisplay: true,
   link: null,
+  isAudioBlocked: false,
 };
 
 describe('session events', () => {
@@ -20,6 +21,12 @@ describe('session events', () => {
       const action = {type, detail: {stream: 128}} as unknown as Parameters<typeof reduce>[1];
       expect(reduce(connected, action)).toBe(connected);
     }
+  });
+
+  test('says when sound waits for a click', () => {
+    const blocked = reduce(connected, {type: 'audio', detail: {blocked: true}});
+    expect(blocked.isAudioBlocked).toBe(true);
+    expect(reduce(blocked, {type: 'audio', detail: {blocked: false}}).isAudioBlocked).toBe(false);
   });
 
   test('the server can say it cannot change the display, until the next connection', () => {

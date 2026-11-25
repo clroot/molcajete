@@ -8,6 +8,7 @@ import {useToast} from '@astryxdesign/core/Toast';
 import {ComputerDesktopIcon, FolderPlusIcon, PlusIcon} from '@heroicons/react/24/outline';
 import {api, canManageConnections, type ConnectionSummary, type Folder, type User} from '../api';
 import {href} from '../route';
+import {unlockAudio} from '../session/audio';
 import {useApiData} from '../useApiData';
 import PageFrame from '../shell/PageFrame';
 import AsyncContent from '../shell/AsyncContent';
@@ -35,7 +36,7 @@ export default function ConnectionsPage({user}: {user: User}) {
 }
 
 const connectButton = (c: ConnectionSummary) => (
-  <Button label="Connect" size="sm" href={href.session(c.id)} />
+  <Button label="Connect" size="sm" href={href.session(c.id)} onClick={unlockAudio} />
 );
 
 /** A user's view: the connections granted to them, in their folders. */

@@ -297,7 +297,7 @@ The decoder is configured with a fixed, generous codec string per codec (`codec_
 
 The client offers the subprotocols `molcajete-binary-v1, guacamole` (`set_binary_tunnel(false)` or `?text` offers only `guacamole`). Which one the gateway chose only shows in the messages that arrive, so both kinds are accepted at any time; the tunnel's own messages (UUID, ping replies) are always text.
 
-A binary message is an `ArrayBuffer`. The client reads each record header through a typed-array view, copies instruction text straight into the parser buffer (`Parser::feed_with`), and keeps stream data as views of the message: images as in section 4.4, video as in section 4.5, and PCM copied once, into wasm for Web Audio or, in worker mode, into its own buffer transferred to the page (transferring the message would detach the image views). The text path (string → parser → base64 decoder) stays for stock gateways and for recordings.
+A binary message is an `ArrayBuffer`. The client reads each record header through a typed-array view, copies instruction text straight into the parser buffer (`Parser::feed_with`), and keeps stream data as views of the message: images as in section 4.4, video as in section 4.5, and PCM copied once, into a buffer of its own for the page (transferred from the worker in worker mode) (transferring the message would detach the image views). The text path (string → parser → base64 decoder) stays for stock gateways and for recordings.
 
 Keep-alive: `nop` every 5 s, a tunnel ping every second (its round trip is reported in `stats`), and the tunnel counts as dead after 15 s without a message.
 
@@ -331,7 +331,9 @@ For RDP the browser also decides whether the desktop takes the window's size (`r
 
 ### 4.9 Audio
 
-Raw PCM (`audio/L8`, `audio/L16`) is played with Web Audio, scheduled 50–300 ms ahead (`audio.rs`). In worker mode the worker hands PCM to the page (`audio-start`/`audio-data`/`audio-end` events, buffers transferred without copying) and the page's `PcmPlayer` schedules it. The audio context resumes on the first pointer or key input (autoplay policy).
+Raw PCM (`audio/L8`, `audio/L16`) is played with Web Audio, scheduled 50–300 ms ahead. In both modes the client hands PCM to the page (`set_audio_forwarding`; `audio-start`/`audio-data`/`audio-end` events, buffers transferred without copying from the worker), and the page's `PcmPlayer` plays every stream in one `AudioContext`. The wasm client's own player (`audio.rs`) is only used when forwarding is off.
+
+Browsers create an `AudioContext` suspended unless the page is handling a user gesture, and a stream's first sound arrives long after the click that opened the session. The web UI therefore makes the page's context in that click (a connection's link or *Connect*, and *Reconnect*; `session/audio.ts`) and hands it to `MolcajeteSession.create` (`audioContext`). Any press, click, touch or key on the page resumes it. When a stream is open while the context is still suspended, as in a session opened from a bookmark or a new tab, the client reports `audio` events (`{blocked}`) and the session shows *Click or press a key to turn on sound* until a gesture lets the sound through.
 
 ### 4.10 Playback of recordings
 
@@ -640,6 +642,7 @@ Any of the three protocols can reach its server through one to four SSH jump hos
   - `renderer.test.mjs`: pixels of the WebGL2 renderer against what the HTML-canvas reference client produces, including zstd images at every index depth, through clips, transforms and composite modes, damaged images, and frames where zstd, PNG and JPEG images overlap.
   - `input.test.mjs`: keyboard and IME handling of the page-side client (Korean composition driven over CDP), in worker and main-thread mode.
   - `binary.test.mjs`: a stand-in gateway sends one frame (a PNG larger than a record, a PNG with transparency, a JPEG, zstd images, PCM audio and an H.264 stream cut at arbitrary points) as records to a client offering the binary subprotocol and as base64 to one that does not, in worker and main-thread mode; all four must show the same pixels, and `sync` replies must carry the apply time only when asked.
+  - `audio.test.mjs`: PCM streams under a browser's autoplay policy, in worker and main-thread mode: without a gesture the page is told that sound waits and a click lets it play; a context made in the click that opened the session plays the stream at once.
   - `playback.test.mjs`: seeking and playing recordings; a frame decoded by the browser and in wasm must give the same pixels.
   - `video.test.mjs`: real H.264 and AV1 bitstreams made with ffmpeg, framed as molcajeted frames them, checked on the composited canvas, including the return to the default layer after `dispose`. Linux Chromium has no H.265 decoder; Windows Chrome 158 (headless, hardware decoding) decoded all three codecs.
 - **End to end.** VNC (x11vnc), SSH (OpenSSH) and RDP (xrdp and Windows 11) through the gateway, with stock guacd 1.6 and molcajeted, in worker and main-thread mode: display, key input with Shift combinations, Hangul, mouse, scrolling, selection and clipboard in both directions, resizing, error mapping (wrong password, closed port, host-key mismatch). On the stock guacd path Hangul on the SSH command line was garbled; molcajeted shows it correctly because of its `xterm-256color` default.
@@ -815,7 +818,6 @@ Tracked as issues:
 - Fuzzing the parsers that read untrusted input (#56)
 - API tokens for automation and one-time links for embedded sessions (#57)
 - Edge cases older remote-desktop projects have fixed: keyboard layouts, AltGr, dead keys, stuck keys, clipboard fallbacks and more (#63)
-- Audio staying silent until the next click after a stream starts (#10)
 
 Not yet tracked:
 

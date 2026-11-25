@@ -17,7 +17,8 @@ import SessionMenu, {type ScaleMode} from './SessionMenu';
 import SessionMenuButton from './SessionMenuButton';
 import SessionGuide from './SessionGuide';
 import {readPreference, writePreference} from './storage';
-import {LinkStatus, StatsPanel, UnstableNotice} from './SessionBadges';
+import {AudioHint, LinkStatus, StatsPanel, UnstableNotice} from './SessionBadges';
+import {unlockAudio} from './audio';
 import {hasLinks, isTerminal} from './terminal';
 import {useCopyFeedback} from './useCopyFeedback';
 
@@ -91,6 +92,7 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
   }, [mode, client, terminal]);
 
   const reconnect = () => {
+    unlockAudio();
     dispatch({type: 'reconnecting'});
     connect();
   };
@@ -136,6 +138,7 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
       {status.kind === 'connected' && session.isUnstable && <UnstableNotice />}
       {showStats && session.stats && <StatsPanel stats={session.stats} mode={mode ?? '?'} />}
       {isConnected && terminal && session.link && <LinkStatus url={session.link} />}
+      {isConnected && session.isAudioBlocked && <AudioHint />}
 
       {isConnected && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
       {isConnected && isGuideDue && !session.required && !isMenuOpen && (

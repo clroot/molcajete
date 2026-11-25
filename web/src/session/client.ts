@@ -43,7 +43,9 @@ export type SessionEvent =
   /** The terminal has no selection any more (molcajeted SSH only); a selection arrives as `clipboard`. */
   | {type: 'selection'; detail: boolean}
   /** The copy shortcut wrote the selection to the local clipboard, or could not. */
-  | {type: 'copy'; detail: {ok: boolean}};
+  | {type: 'copy'; detail: {ok: boolean}}
+  /** Whether an audio stream is open while the browser holds its sound back until a click or key press. */
+  | {type: 'audio'; detail: {blocked: boolean}};
 
 export interface MolcajeteSession {
   readonly mode: 'worker' | 'main';
@@ -89,7 +91,14 @@ type ClientModule = {
   MolcajeteSession: {
     create(
       container: HTMLElement,
-      options?: {worker?: boolean; binary?: boolean; zstd?: boolean; playback?: boolean},
+      options?: {
+        worker?: boolean;
+        binary?: boolean;
+        zstd?: boolean;
+        playback?: boolean;
+        /** Where audio plays; made during a user gesture so that the browser lets it run. */
+        audioContext?: AudioContext;
+      },
     ): Promise<MolcajeteSession>;
   };
 };
