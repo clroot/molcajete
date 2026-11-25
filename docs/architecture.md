@@ -508,7 +508,7 @@ molcajeted listens on port 4822 like guacd and runs one tokio task per connectio
 
 - **Handshake** (`handshake.rs`). Compatible with guacd: `args` advertises `VERSION_1_5_0` and the argument names of guacd's plugins for `vnc`, `ssh` and `rdp`, so a connection configured for guacd works unchanged, followed by the jump host parameters (section 6.9); `molcajete-binary` is appended last (section 5.2). Joining a running connection (`select,$id`) is refused, and other protocols get `UNSUPPORTED`. Client input is parsed with `Limits::STRICT`.
 - **Output** (`io.rs`). Everything sent to the client goes through one `Output`: instructions are appended as text, stream data with `Output::blob`, which writes base64 `blob` instructions of at most 6048 bytes for a stock client and blob records for a molcajete gateway. Display, video, audio and clipboard code is the same for both.
-- **Input** (`session.rs`). A reader task decodes client instructions into `ClientEvent`s (mouse, key, size, clipboard, `argv`, sync replies with their arrival time and apply time, stream acks), reassembling inbound `clipboard` and `argv` streams.
+- **Input** (`session.rs`). A reader task decodes client instructions into `ClientEvent`s (mouse, key, size, clipboard, `argv`, sync replies with their arrival time and apply time, stream acks), reassembling inbound `clipboard` and `argv` streams. A client may have 64 such streams open at once (libguac's limit) with at most 16 MiB of data buffered across them; a blob beyond that closes its stream with `CLIENT_OVERRUN`.
 - **Loop.** Each protocol runs one `select!` loop over remote updates, client input, the frame timer, the idle timer (`Display::idle_deadline`, for ending an idle video and refining lossy areas without new changes) and a 5 s keep-alive. The frame is built inside `block_in_place` on the connection's task.
 
 ### 6.2 Display: diffing and encoding
@@ -602,7 +602,7 @@ Each candidate must pass a trial encode at start. All backends emit one access u
 
 ### 6.6 VNC (`vnc/`)
 
-An RFB client of its own (`vnc/rfb`): RFB 3.3/3.7/3.8, None and VNC authentication, Raw/CopyRect/Hextile/ZRLE, the Cursor/DesktopSize/ExtendedDesktopSize/LastRect pseudo-encodings, clipboard in both directions and remote resize. It always asks for 32 bpp little-endian true colour, so every decoder handles one pixel layout. CopyRect becomes a `copy` on both the display and its client copy. Parameters (`hostname`, `encodings`, `read-only`, `disable-copy`, `force-lossless`, ...) follow guacd's VNC plugin.
+An RFB client of its own (`vnc/rfb`): RFB 3.3/3.7/3.8, None and VNC authentication, Raw/CopyRect/Hextile/ZRLE, the Cursor/DesktopSize/ExtendedDesktopSize/LastRect pseudo-encodings, clipboard in both directions and remote resize. It always asks for 32 bpp little-endian true colour, so every decoder handles one pixel layout. CopyRect becomes a `copy` on both the display and its client copy. A server is not trusted with memory: its framebuffer may have at most 8192 × 8192 pixels (the largest display a client may ask for, in any shape), which bounds every rectangle, and pixel data, ZRLE payloads and clipboard text are read into buffers that grow as the data arrives rather than to the length the server announces. Parameters (`hostname`, `encodings`, `read-only`, `disable-copy`, `force-lossless`, ...) follow guacd's VNC plugin.
 
 ### 6.7 SSH (`ssh/`)
 
@@ -638,6 +638,19 @@ Any of the three protocols can reach its server through one to four SSH jump hos
 ### 7.1 Tests
 
 - **Unit tests.** Protocol: every split point, code point lengths, limits, invalid UTF-8, binary records at every split point, the zstd image decoder on damaged input. Gateway: the guacd handshake against a fake guacd, error mapping, query parsing, tunnels of all four client/daemon combinations through a real WebSocket, migrations and queries on every database backend, the OIDC flow against a fake provider, recording encoding, retention and permissions. Daemon: the handshake with and without the binary parameter, display merging, copy ordering and blob splitting, the same frame as text and as records, PNG and zstd round trips through the client's decoder, the choice between zstd and PNG, the client simulator and randomized display test, pacing, YUV conversion, the RFB client, RDP settings and keyboard mapping, jump host chains against in-process russh bastions (one and two hops, host key mismatch, failed login, unreachable hops and targets). Client logic: path tessellation, keysyms, key release pairing, wheel, PCM.
+- **Fuzzing** (`fuzz/`, `cargo fuzz` on nightly; `scripts/fuzz.sh [seconds] [target ...]`). Every parser that reads bytes from a party that should not be trusted has a libFuzzer target:
+
+  | Target | Code | Reads | Checks besides not panicking |
+  |---|---|---|---|
+  | `parser` | `Parser`, `ServerInstruction::decode` | browser → gateway and molcajeted (strict limits), server → client (lenient) | the same bytes whole and cut into pieces give the same instructions and the same end; each instruction survives encoding and parsing again |
+  | `records` | `RecordReader`, `records` | molcajeted → gateway, gateway → client | a stream cut into pieces gives the records of the whole message |
+  | `zimage` | `zimage::Decoder` | server → client | a decoded image has the announced size, at most `MAX_PIXELS`, is opaque, and decodes the same again with the same decoder |
+  | `video_frames` | `video::FrameReader` | server → client | whole and in pieces give the same frames |
+  | `handshake` | `handshake::negotiate`, `session::InputDecoder` | client → molcajeted | |
+  | `rfb` | `vnc/rfb`: handshake, server messages in every encoding, ZRLE tiles | VNC server → molcajeted | decoded pixels fill their rectangle |
+  | `terminal` | `ssh/terminal.rs` (alacritty_terminal), `ssh/render.rs`, links and selection | SSH server → molcajeted | |
+
+  The targets in molcajeted call `molcajete_daemon::fuzzing`, a hidden module of the daemon's library; to read from memory, `GuacReader`, `GuacWriter` and `RfbReader` are generic over their stream. An allocation above 512 MiB counts as a crash, so a length field that allocates before its data arrives is found too. `fuzz/examples/seeds.rs` writes the committed seeds (`fuzz/seeds`, about 100 KB) with the protocol's own encoders; what a run finds goes to `fuzz/corpus`, which is not committed. A crash leaves its input in `fuzz/artifacts/<target>/`; its fix gets a unit test in the crate that owns the code. `.github/workflows/fuzz.yml` runs each target for five minutes every week, keeping the corpus in the Actions cache and uploading crashing inputs. IronRDP's decoders are left to IronRDP's own fuzzing. `.github/workflows/ci.yml` runs formatting, clippy and the unit tests on every pull request.
 - **Browser tests** (`tests/browser`, headless Chromium, `npm test`):
   - `renderer.test.mjs`: pixels of the WebGL2 renderer against what the HTML-canvas reference client produces, including zstd images at every index depth, through clips, transforms and composite modes, damaged images, and frames where zstd, PNG and JPEG images overlap.
   - `input.test.mjs`: keyboard and IME handling of the page-side client (Korean composition driven over CDP), in worker and main-thread mode.
@@ -815,7 +828,6 @@ Tracked as issues:
 - Active sessions and connection history for administrators, ending sessions (#49)
 - File transfer: SFTP in SSH sessions and drive redirection in RDP (#53); the protocol's `file`/`pipe`/`filesystem` objects are not handled yet
 - Read-only and clipboard restrictions in the connection form (#54)
-- Fuzzing the parsers that read untrusted input (#56)
 - API tokens for automation and one-time links for embedded sessions (#57)
 - Edge cases older remote-desktop projects have fixed: keyboard layouts, AltGr, dead keys, stuck keys, clipboard fallbacks and more (#63)
 

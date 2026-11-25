@@ -1,0 +1,2 @@
+# Seed inputs of the fuzz targets are bytes, not text.
+fuzz/seeds/** binary

@@ -1,0 +1,52 @@
+# Runs every fuzz target in fuzz/ for a few minutes each week. A crash fails
+# the job and uploads its input; reproduce it with
+# `cargo +nightly fuzz run --fuzz-dir fuzz <target> <crash file>`.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parser, records, zimage, video_frames, handshake, rfb, terminal]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      # What earlier runs found, so that each run starts where the last one
+      # stopped. A new key per run; the newest earlier one is restored.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '300' }}
+          TARGET: ${{ matrix.target }}
+        run: scripts/fuzz.sh "$SECONDS_PER_TARGET" "$TARGET"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

@@ -36,6 +36,21 @@ pub use writer::RfbWriter;
 /// Size of the buffer wrapped around the socket's read half.
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Largest framebuffer accepted from a server, in pixels: as many as 8192 x 8192, the largest
+/// display a client may ask for. Every rectangle lies within the framebuffer, so this also
+/// bounds what decoding one may allocate, whatever sizes a server announces.
+const MAX_FRAMEBUFFER_PIXELS: u32 = 8192 * 8192;
+
+/// Refuses framebuffers larger than [`MAX_FRAMEBUFFER_PIXELS`].
+fn check_framebuffer_size(width: u16, height: u16) -> Result<(), RfbError> {
+    if u32::from(width) * u32::from(height) > MAX_FRAMEBUFFER_PIXELS {
+        return Err(RfbError::Protocol(format!(
+            "framebuffer of {width}x{height} pixels is too large"
+        )));
+    }
+    Ok(())
+}
+
 /// Encoding and pseudo-encoding numbers understood by this client.
 pub mod encoding {
     pub const RAW: i32 = 0;
@@ -299,4 +314,68 @@ struct Screen {
 /// panicked because every update is a plain field assignment.
 fn lock_shared(shared: &Mutex<SharedState>) -> MutexGuard<'_, SharedState> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Entry point of the `rfb` fuzz target: treats `data` as what a VNC server sends.
+///
+/// The first byte picks what is exercised: the handshake followed by server messages, server
+/// messages on a framebuffer whose size the next four bytes give, or the ZRLE tile decoder on
+/// inflated data (the zlib layer is hard to get through with arbitrary bytes).
+pub(crate) async fn fuzz(data: &[u8]) {
+    let Some((&mode, mut rest)) = data.split_first() else {
+        return;
+    };
+    let u16_at = |data: &[u8], at: usize| u16::from_be_bytes([data[at], data[at + 1]]);
+    let (width, height) = match mode % 3 {
+        0 => {
+            let options = ConnectOptions {
+                host: String::new(),
+                port: 0,
+                password: Some("password".into()),
+                shared: true,
+                encodings: None,
+            };
+            match handshake::run(&mut rest, &mut tokio::io::sink(), &options).await {
+                Ok(info) => (info.width, info.height),
+                Err(_) => return,
+            }
+        }
+        1 if rest.len() >= 4 => {
+            let size = (u16_at(rest, 0), u16_at(rest, 2));
+            // What the handshake accepts.
+            if check_framebuffer_size(size.0, size.1).is_err() {
+                return;
+            }
+            rest = &rest[4..];
+            size
+        }
+        2 if rest.len() >= 4 => {
+            // Large rectangles only repeat what small ones do, more slowly.
+            let (width, height) = (u16_at(rest, 0) % 512, u16_at(rest, 2) % 512);
+            if let Ok(rgba) = zrle::decode_tiles(&rest[4..], width, height) {
+                assert_eq!(rgba.len(), usize::from(width) * usize::from(height) * 4);
+            }
+            return;
+        }
+        _ => return,
+    };
+    let shared = Arc::new(Mutex::new(SharedState::default()));
+    let mut reader = RfbReader::new(rest, width, height, shared);
+    while let Ok(event) = reader.next_event().await {
+        if let RfbEvent::Rect {
+            width,
+            height,
+            rgba,
+            ..
+        }
+        | RfbEvent::Cursor {
+            width,
+            height,
+            rgba,
+            ..
+        } = &event
+        {
+            assert_eq!(rgba.len(), usize::from(*width) * usize::from(*height) * 4);
+        }
+    }
 }

@@ -20,6 +20,7 @@ mod bridge;
 pub(crate) mod client;
 mod color;
 mod font;
+pub(crate) mod fuzz;
 mod keys;
 mod link;
 mod mouse;

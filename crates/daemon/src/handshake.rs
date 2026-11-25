@@ -19,6 +19,8 @@ use std::collections::HashMap;
 
 use molcajete_protocol::{Instruction, InstructionBuilder, ProtocolVersion, binary};
 
+use tokio::io::{AsyncRead, AsyncWrite};
+
 use crate::io::{GuacReader, GuacWriter};
 
 /// What the client told us about itself during the handshake.
@@ -87,7 +89,9 @@ pub enum HandshakeError {
 }
 
 /// Reads the `select` instruction.
-pub async fn read_select(reader: &mut GuacReader) -> Result<String, HandshakeError> {
+pub async fn read_select<R: AsyncRead + Unpin>(
+    reader: &mut GuacReader<R>,
+) -> Result<String, HandshakeError> {
     let ins = reader.next().await?.ok_or(HandshakeError::Closed)?;
     if ins.opcode != "select" {
         return Err(HandshakeError::Protocol(format!(
@@ -101,9 +105,9 @@ pub async fn read_select(reader: &mut GuacReader) -> Result<String, HandshakeErr
 /// Sends `args`, collects client information until `connect`, then answers
 /// `ready`. When the client asked for it, the writer is switched to binary
 /// records for everything that follows.
-pub async fn negotiate(
-    reader: &mut GuacReader,
-    writer: &mut GuacWriter,
+pub async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut GuacReader<R>,
+    writer: &mut GuacWriter<W>,
     arg_names: &[&str],
     connection_id: &str,
 ) -> Result<(ClientInfo, Params), HandshakeError> {

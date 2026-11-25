@@ -37,10 +37,8 @@ impl ZrleDecoder {
         max_inflated_len(width, height) * 2 + INFLATE_CHUNK
     }
 
-    /// Returns a buffer of `len` bytes to read the rectangle's zlib payload into.
-    pub(super) fn compressed_buffer(&mut self, len: usize) -> &mut [u8] {
-        self.compressed.clear();
-        self.compressed.resize(len, 0);
+    /// The buffer to read the rectangle's zlib payload into.
+    pub(super) fn compressed_buffer(&mut self) -> &mut Vec<u8> {
         &mut self.compressed
     }
 
