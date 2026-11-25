@@ -19,6 +19,13 @@ port = 4822
 # url = "postgres://molcajete:secret@127.0.0.1/molcajete"
 # url = "mysql://molcajete:secret@127.0.0.1/molcajete"
 
+# Sessions of connections with "Record sessions" on (in the web UI, or
+# `attributes = { record-sessions = "true" }` below) are written here.
+# [recordings]
+# directory = "/var/lib/molcajete/recordings"   # default: <server.data_dir>/recordings
+# max_age_days = 90                             # 0 keeps recordings forever
+# max_total_size = "200 GiB"                    # the oldest go first; 0 = no limit
+
 # Created as an administrator on startup if the username does not exist
 # yet; afterwards, manage users (and passwords) in the web UI. Without any
 # user, an "admin" account with a random password is created and logged.
