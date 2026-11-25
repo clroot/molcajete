@@ -10,6 +10,7 @@ use ironrdp_connector::connection_activation::{
 };
 use ironrdp_core::WriteBuf;
 use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
+use ironrdp_dvc::DrdynvcClient;
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_pdu::Action;
 use ironrdp_pdu::input::InputEventPdu;
@@ -28,11 +29,12 @@ use tracing::{debug, info, warn};
 use super::audio::AudioOutput;
 use super::clipboard::{self, GuacClipboard};
 use super::connect::{RdpFramed, RdpStream};
+use super::display_control::{self, DisplayControlStatus};
 use super::graphics::{Area, Cursor, extract_rgba};
 use super::keyboard::Keyboard;
 use super::mouse::Mouse;
 use super::pacing::FramePacer;
-use super::settings::{ResizeMethod, Settings};
+use super::settings::{self, ResizeMethod, Settings};
 use super::slow_path;
 use crate::display::{Display, ImageFormats, Pacing};
 use crate::handshake::ClientInfo;
@@ -82,6 +84,16 @@ pub struct Session<'a> {
     refresh_rect_support: bool,
     suppress_output_support: bool,
     resize: Option<PendingResize>,
+    /// Starts as the connection's `resize-method`; the client can change it
+    /// (`argv`).
+    resize_method: ResizeMethod,
+    /// Requested DPI, from the connection or the client (`argv`).
+    dpi: u32,
+    /// DPI the client announced in the handshake, for "follow the client".
+    client_dpi: u32,
+    /// Desktop scale factor the server was last given.
+    scale: u32,
+    display_control: DisplayControlStatus,
     audio: Option<AudioOutput>,
 }
 
@@ -97,6 +109,10 @@ impl<'a> Session<'a> {
         let (rdp_reader, rdp_writer) = split_tokio_framed(framed);
         let size = result.desktop_size;
         debug!(input_flags = ?result.input_flags, "server input capabilities");
+        let dynamic_channels = result
+            .static_channels
+            .get_channel_id_by_type::<DrdynvcClient>()
+            .is_some();
         let stage = ActiveStageBuilder {
             static_channels: result.static_channels,
             user_channel_id: result.user_channel_id,
@@ -136,6 +152,11 @@ impl<'a> Session<'a> {
             refresh_rect_support: result.refresh_rect_support,
             suppress_output_support: result.suppress_output_support,
             resize: None,
+            resize_method: settings.resize_method,
+            dpi: settings.dpi,
+            client_dpi: info.dpi,
+            scale: settings.desktop_scale_factor(),
+            display_control: DisplayControlStatus::new(dynamic_channels, Instant::now()),
             audio,
         }
     }
@@ -173,6 +194,7 @@ impl<'a> Session<'a> {
             self.writer.buffer(),
         );
         self.set_cursor(&Cursor::arrow());
+        self.update_display_control();
         self.writer.flush().await?;
         if let Some(text) = early.clipboard {
             self.client_clipboard(text).await?;
@@ -232,6 +254,7 @@ impl<'a> Session<'a> {
                     Flow::Continue
                 }
                 _ = keepalive.tick() => {
+                    self.update_display_control();
                     // A stalled client must not hold back changes forever.
                     if self.pacer.is_dirty() {
                         self.send_frame().await?;
@@ -490,6 +513,7 @@ impl<'a> Session<'a> {
                 self.send_input(events).await?;
             }
             ClientEvent::Size { width, height } => self.request_resize(width, height),
+            ClientEvent::Argv { name, value } => self.client_parameter(&name, &value),
             ClientEvent::Clipboard(text) if !self.settings.disable_paste => {
                 self.client_clipboard(text).await?;
             }
@@ -575,16 +599,62 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// A connection parameter changed by the client during the session.
+    fn client_parameter(&mut self, name: &str, value: &str) {
+        match name {
+            "resize-method" => {
+                self.resize_method = ResizeMethod::parse(Some(value));
+                info!(resize_method = ?self.resize_method, "client changed the resize method");
+            }
+            "dpi" => {
+                let dpi = settings::parse_dpi(Some(value)).unwrap_or(self.client_dpi);
+                info!(dpi, "client changed the DPI");
+                self.request_scale(dpi);
+            }
+            _ => debug!(name, "parameter cannot be changed during the session"),
+        }
+    }
+
+    /// Tells the client whether the display can change during the session,
+    /// once that is known or when it changed.
+    fn update_display_control(&mut self) {
+        let ready = self.stage.display_control_ready();
+        if let Some(available) = self.display_control.update(ready, Instant::now()) {
+            info!(available, "Display Control availability");
+            self.writer.push(&display_control::instruction(available));
+        }
+    }
+
+    fn current_size(&self) -> (u32, u32) {
+        (
+            u32::from(self.image.width()),
+            u32::from(self.image.height()),
+        )
+    }
+
+    /// Asks for a new scale at the size the desktop has or is about to get.
+    fn request_scale(&mut self, dpi: u32) {
+        self.dpi = dpi;
+        if self.resize.is_none() && settings::desktop_scale_factor(dpi) == self.scale {
+            return;
+        }
+        let (width, height) = self
+            .resize
+            .as_ref()
+            .map_or_else(|| self.current_size(), |r| (r.width, r.height));
+        self.resize = Some(PendingResize {
+            width,
+            height,
+            due: tokio::time::Instant::now() + RESIZE_DELAY,
+        });
+    }
+
     fn request_resize(&mut self, width: u32, height: u32) {
-        if self.settings.resize_method != ResizeMethod::DisplayUpdate {
+        if self.resize_method != ResizeMethod::DisplayUpdate {
             return;
         }
         let (width, height) = MonitorLayoutEntry::adjust_display_size(width, height);
-        let current = (
-            u32::from(self.image.width()),
-            u32::from(self.image.height()),
-        );
-        if self.resize.is_none() && (width, height) == current {
+        if self.resize.is_none() && (width, height) == self.current_size() {
             return;
         }
         self.resize = Some(PendingResize {
@@ -594,38 +664,39 @@ impl<'a> Session<'a> {
         });
     }
 
-    /// Sends a pending size change over the Display Control channel.
+    /// Sends a pending size or scale change over the Display Control channel.
     async fn apply_resize(&mut self) -> anyhow::Result<()> {
         let Some(pending) = self.resize.take() else {
             return Ok(());
         };
+        self.update_display_control();
         match self.stage.display_control_ready() {
-            None => debug!("Display Control channel unavailable; size change ignored"),
-            Some(false) => {
+            Some(false) if !self.display_control.is_unavailable() => {
                 self.resize = Some(PendingResize {
                     due: tokio::time::Instant::now() + RESIZE_RETRY,
                     ..pending
                 });
             }
+            None | Some(false) => {
+                debug!("Display Control channel unavailable; display change ignored");
+            }
             Some(true) => {
-                let current = (
-                    u32::from(self.image.width()),
-                    u32::from(self.image.height()),
-                );
-                if (pending.width, pending.height) == current {
+                let scale = settings::desktop_scale_factor(self.dpi);
+                if (pending.width, pending.height) == self.current_size() && scale == self.scale {
                     return Ok(());
                 }
-                let scale = Some(self.settings.desktop_scale_factor());
                 if let Some(frame) =
                     self.stage
-                        .encode_resize(pending.width, pending.height, scale, None)
+                        .encode_resize(pending.width, pending.height, Some(scale), None)
                 {
                     debug!(
                         width = pending.width,
                         height = pending.height,
-                        "requesting desktop resize"
+                        scale,
+                        "requesting desktop layout"
                     );
                     self.write_rdp(&frame?).await?;
+                    self.scale = scale;
                 }
             }
         }

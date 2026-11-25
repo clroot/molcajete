@@ -27,7 +27,7 @@ use tokio_rustls::client::TlsStream;
 
 use super::audio::SoundSink;
 use super::clipboard::GuacClipboard;
-use super::settings::{ResizeMethod, Settings};
+use super::settings::Settings;
 use super::tls;
 
 /// The upgraded (TLS) transport of an RDP connection.
@@ -185,10 +185,10 @@ fn build_connector(
     client_addr: std::net::SocketAddr,
     sound: Option<&SoundSink>,
 ) -> ClientConnector {
-    let mut drdynvc = DrdynvcClient::new();
-    if settings.resize_method == ResizeMethod::DisplayUpdate {
-        drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
-    }
+    // Display Control is offered even with resize-method=none: the client can
+    // turn resizing on during the session and change the scale with it.
+    let mut drdynvc =
+        DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     if let Some(sound) = sound {
         drdynvc = drdynvc.with_dynamic_channel(sound.dynamic_channel());
     }
