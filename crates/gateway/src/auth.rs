@@ -6,12 +6,14 @@
 //! preflight) and, like the WebSocket tunnel, come from the gateway's own
 //! origin when the browser says where they come from.
 
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher as _, PasswordVerifier as _};
-use axum::extract::FromRequestParts;
+use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, header};
 use rand::RngCore as _;
@@ -107,6 +109,49 @@ pub fn is_https(headers: &HeaderMap) -> bool {
     let value = |name| headers.get(name).and_then(|v| v.to_str().ok());
     value("x-forwarded-proto").is_some_and(|v| v.trim().eq_ignore_ascii_case("https"))
         || value(header::ORIGIN.as_str()).is_some_and(|v| v.starts_with("https://"))
+}
+
+/// The browser's address as reported by a reverse proxy, otherwise the TCP
+/// peer (`unknown` when there is none, as in tests). For logs and the
+/// audit log.
+///
+/// `X-Real-IP` (set by the edge proxy) wins over `X-Forwarded-For`: proxies
+/// in between, such as the Tailscale ingress, replace `X-Forwarded-For` with
+/// their own peer address but pass `X-Real-IP` through.
+pub fn client_address(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let peer = peer.map(|p| p.ip().to_string());
+    match (
+        header("x-real-ip").or_else(|| header("x-forwarded-for")),
+        peer,
+    ) {
+        (Some(forwarded), Some(peer)) => format!("{forwarded} (via {peer})"),
+        (Some(forwarded), None) => forwarded.to_owned(),
+        (None, Some(peer)) => peer,
+        (None, None) => "unknown".to_owned(),
+    }
+}
+
+/// The request's [`client_address`].
+pub struct ClientAddress(pub String);
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientAddress {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0);
+        Ok(Self(client_address(&parts.headers, peer)))
+    }
 }
 
 pub fn session_cookie(token: &str, max_age_secs: u64, secure: bool) -> HeaderValue {

@@ -1,4 +1,5 @@
-//! JSON API: login sessions, connections, folders, users, groups and recordings.
+//! JSON API: login sessions, connections, folders, users, groups,
+//! recordings and the audit log.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -8,10 +9,12 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use serde_json::{Value, json};
+use tracing::error;
 
 use crate::AppState;
-use crate::auth::{self, AdminUser, ConnectionManager, CurrentUser};
+use crate::audit::{self, Entry, action, target};
+use crate::auth::{self, AdminUser, ClientAddress, ConnectionManager, CurrentUser};
 use crate::db::{
     Access, ConnectionRecord, DbError, Folder, Group, GroupUpdate, NewUser, Principal, Recording,
     Role, Target, User, UserUpdate, attributes,
@@ -102,6 +105,7 @@ pub struct LoginRequest {
 
 pub async fn login(
     State(state): State<Arc<AppState>>,
+    address: ClientAddress,
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> ApiResult<Response> {
@@ -124,10 +128,31 @@ pub async fn login(
         .unwrap_or_else(|| auth::dummy_hash())
         .to_owned();
     let valid = auth::verify_password_blocking(body.password, hash).await;
-    let user = match found {
-        Some((user, hash)) if valid && hash != auth::NO_PASSWORD && !user.disabled => user,
-        _ => {
-            warn!(username = %body.username, "login failed");
+    let refused = match &found {
+        None => Some((
+            "unknown_user",
+            Entry::new(action::LOGIN_FAILURE).by_name(&body.username),
+        )),
+        Some((user, hash)) => {
+            let reason = if hash == auth::NO_PASSWORD {
+                Some("no_password")
+            } else if !valid {
+                Some("wrong_password")
+            } else if user.disabled {
+                Some("disabled")
+            } else {
+                None
+            };
+            reason.map(|reason| (reason, Entry::new(action::LOGIN_FAILURE).by(user)))
+        }
+    };
+    let user = match (found, refused) {
+        (Some((user, _)), None) => user,
+        (_, refused) => {
+            if let Some((reason, entry)) = refused {
+                let entry = entry.from(&address).detail("reason", reason);
+                audit::record(&state.db, entry).await;
+            }
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "Incorrect username or password.",
@@ -136,7 +161,8 @@ pub async fn login(
     };
 
     let cookie = start_session(&state, &user, auth::is_https(&headers), None).await?;
-    info!(username = %user.username, "login");
+    let entry = Entry::new(action::LOGIN_SUCCESS).by(&user).from(&address);
+    audit::record(&state.db, entry).await;
     Ok(([(header::SET_COOKIE, cookie)], Json(user)).into_response())
 }
 
@@ -166,16 +192,29 @@ pub async fn start_session(
 /// Ends the session. For a session opened through single sign-on at a
 /// provider that supports RP-initiated logout, the response is
 /// `{"logoutUrl": …}`: where to send the browser to sign out there too.
-pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    address: ClientAddress,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     let mut logout_url = None;
     if let Some(token) = auth::session_token(&headers) {
         let token_hash = auth::token_hash(token);
+        let user = match state.db.session_user(&token_hash).await {
+            Ok(user) => Some(user),
+            Err(DbError::NotFound) => None,
+            Err(err) => return Err(err.into()),
+        };
         let id_token = match state.db.session_id_token(&token_hash).await {
             Ok(id_token) => id_token,
             Err(DbError::NotFound) => None,
             Err(err) => return Err(err.into()),
         };
         state.db.delete_session(&token_hash).await?;
+        if let Some(user) = &user {
+            let entry = Entry::new(action::LOGOUT).by(user).from(&address);
+            audit::record(&state.db, entry).await;
+        }
         if let (Some(oidc), Some(id_token)) = (&state.oidc, id_token) {
             logout_url = oidc.logout_url(&id_token).await;
         }
@@ -205,6 +244,7 @@ pub struct ChangePasswordRequest {
 pub async fn change_password(
     State(state): State<Arc<AppState>>,
     CurrentUser(user): CurrentUser,
+    address: ClientAddress,
     Json(body): Json<ChangePasswordRequest>,
 ) -> ApiResult<StatusCode> {
     let hash = state.db.password_hash(&user.id).await?;
@@ -225,7 +265,11 @@ pub async fn change_password(
             },
         )
         .await?;
-    info!(username = %user.username, "password changed");
+    let entry = Entry::new(action::USER_PASSWORD)
+        .by(&user)
+        .from(&address)
+        .target(target::USER, &user.id, &user.username);
+    audit::record(&state.db, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -310,6 +354,7 @@ fn validate_connection(mut c: ConnectionRecord) -> ApiResult<ConnectionRecord> {
 pub async fn create_connection(
     State(state): State<Arc<AppState>>,
     ConnectionManager(admin): ConnectionManager,
+    address: ClientAddress,
     Json(body): Json<ConnectionRecord>,
 ) -> ApiResult<(StatusCode, Json<ConnectionRecord>)> {
     let c = validate_connection(body)?;
@@ -324,30 +369,49 @@ pub async fn create_connection(
             ),
             err => err.into(),
         })?;
-    info!(by = %admin.username, connection = %created.id, "connection created");
+    let entry = Entry::new(action::CONNECTION_CREATE)
+        .by(&admin)
+        .from(&address)
+        .target(target::CONNECTION, &created.id, &created.name)
+        .changes(audit::diff(&Value::Null, &json!(created)));
+    audit::record(&state.db, entry).await;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
 pub async fn update_connection(
     State(state): State<Arc<AppState>>,
     ConnectionManager(admin): ConnectionManager,
+    address: ClientAddress,
     Path(id): Path<String>,
     Json(mut body): Json<ConnectionRecord>,
 ) -> ApiResult<Json<ConnectionRecord>> {
     body.id = id;
     let c = validate_connection(body)?;
+    let before = state.db.connection(&c.id).await?;
     let updated = state.db.update_connection(&c).await?;
-    info!(by = %admin.username, connection = %updated.id, "connection updated");
+    let entry = Entry::new(action::CONNECTION_UPDATE)
+        .by(&admin)
+        .from(&address)
+        .target(target::CONNECTION, &updated.id, &updated.name)
+        .changes(audit::diff(&json!(before), &json!(updated)));
+    audit::record(&state.db, entry).await;
     Ok(Json(updated))
 }
 
 pub async fn delete_connection(
     State(state): State<Arc<AppState>>,
     ConnectionManager(admin): ConnectionManager,
+    address: ClientAddress,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    let before = state.db.connection(&id).await?;
     state.db.delete_connection(&id).await?;
-    info!(by = %admin.username, connection = %id, "connection deleted");
+    let entry = Entry::new(action::CONNECTION_DELETE)
+        .by(&admin)
+        .from(&address)
+        .target(target::CONNECTION, &id, &before.name)
+        .changes(audit::diff(&json!(before), &Value::Null));
+    audit::record(&state.db, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -365,11 +429,22 @@ fn parent(body: &ParentRequest) -> Option<&str> {
 pub async fn move_connection(
     State(state): State<Arc<AppState>>,
     ConnectionManager(by): ConnectionManager,
+    address: ClientAddress,
     Path(id): Path<String>,
     Json(body): Json<ParentRequest>,
 ) -> ApiResult<StatusCode> {
+    let before = state.db.connection(&id).await?;
     state.db.move_connection(&id, parent(&body)).await?;
-    info!(by = %by.username, connection = %id, folder = ?parent(&body), "connection moved");
+    let names = Names::load(&state).await?;
+    let entry = Entry::new(action::CONNECTION_MOVE)
+        .by(&by)
+        .from(&address)
+        .target(target::CONNECTION, &id, &before.name)
+        .changes(audit::diff(
+            &json!({ "folder": names.folder(before.parent_id.as_deref()) }),
+            &json!({ "folder": names.folder(parent(&body)) }),
+        ));
+    audit::record(&state.db, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -388,13 +463,20 @@ pub async fn get_connection_access(
 pub async fn set_connection_access(
     State(state): State<Arc<AppState>>,
     ConnectionManager(by): ConnectionManager,
+    address: ClientAddress,
     Path(id): Path<String>,
     Json(body): Json<Access>,
 ) -> ApiResult<Json<Access>> {
-    state.db.connection(&id).await?;
+    let connection = state.db.connection(&id).await?;
+    let before = state.db.access(Target::Connection, &id).await?;
     state.db.set_access(Target::Connection, &id, &body).await?;
-    info!(by = %by.username, connection = %id, "connection access changed");
-    Ok(Json(state.db.access(Target::Connection, &id).await?))
+    let after = state.db.access(Target::Connection, &id).await?;
+    let entry = Entry::new(action::CONNECTION_ACCESS)
+        .by(&by)
+        .from(&address)
+        .target(target::CONNECTION, &id, &connection.name);
+    record_access(&state, entry, &before, &after).await?;
+    Ok(Json(after))
 }
 
 pub async fn get_folder_access(
@@ -409,13 +491,42 @@ pub async fn get_folder_access(
 pub async fn set_folder_access(
     State(state): State<Arc<AppState>>,
     ConnectionManager(by): ConnectionManager,
+    address: ClientAddress,
     Path(id): Path<String>,
     Json(body): Json<Access>,
 ) -> ApiResult<Json<Access>> {
-    state.db.folder(&id).await?;
+    let folder = state.db.folder(&id).await?;
+    let before = state.db.access(Target::Folder, &id).await?;
     state.db.set_access(Target::Folder, &id, &body).await?;
-    info!(by = %by.username, folder = %id, "folder access changed");
-    Ok(Json(state.db.access(Target::Folder, &id).await?))
+    let after = state.db.access(Target::Folder, &id).await?;
+    let entry = Entry::new(action::FOLDER_ACCESS)
+        .by(&by)
+        .from(&address)
+        .target(target::FOLDER, &id, &folder.name);
+    record_access(&state, entry, &before, &after).await?;
+    Ok(Json(after))
+}
+
+/// Records who was granted or lost a connection or folder, by name.
+async fn record_access(
+    state: &AppState,
+    entry: Entry,
+    before: &Access,
+    after: &Access,
+) -> ApiResult<()> {
+    if before == after {
+        return Ok(());
+    }
+    let names = Names::load(state).await?;
+    let named = |access: &Access| {
+        json!({
+            "users": names.users(&access.users),
+            "groups": names.groups(&access.groups),
+        })
+    };
+    let entry = entry.changes(audit::diff(&named(before), &named(after)));
+    audit::record(&state.db, entry).await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -477,12 +588,22 @@ fn validate_folder_name(name: &str) -> ApiResult<String> {
 pub async fn create_folder(
     State(state): State<Arc<AppState>>,
     ConnectionManager(by): ConnectionManager,
+    address: ClientAddress,
     Json(body): Json<FolderRequest>,
 ) -> ApiResult<(StatusCode, Json<Folder>)> {
     let name = validate_folder_name(&body.name)?;
     let parent_id = body.parent_id.as_deref().filter(|p| !p.is_empty());
     let folder = state.db.create_folder(&name, parent_id).await?;
-    info!(by = %by.username, folder = %folder.id, name = %folder.name, "folder created");
+    let names = Names::load(&state).await?;
+    let entry = Entry::new(action::FOLDER_CREATE)
+        .by(&by)
+        .from(&address)
+        .target(target::FOLDER, &folder.id, &folder.name)
+        .changes(audit::diff(
+            &Value::Null,
+            &json!({ "name": folder.name, "folder": names.folder(parent_id) }),
+        ));
+    audit::record(&state.db, entry).await;
     Ok((StatusCode::CREATED, Json(folder)))
 }
 
@@ -490,23 +611,44 @@ pub async fn create_folder(
 pub async fn rename_folder(
     State(state): State<Arc<AppState>>,
     ConnectionManager(by): ConnectionManager,
+    address: ClientAddress,
     Path(id): Path<String>,
     Json(body): Json<FolderRequest>,
 ) -> ApiResult<Json<Folder>> {
     let name = validate_folder_name(&body.name)?;
+    let before = state.db.folder(&id).await?;
     let folder = state.db.rename_folder(&id, &name).await?;
-    info!(by = %by.username, folder = %id, name = %folder.name, "folder renamed");
+    let entry = Entry::new(action::FOLDER_RENAME)
+        .by(&by)
+        .from(&address)
+        .target(target::FOLDER, &id, &folder.name)
+        .changes(audit::diff(
+            &json!({ "name": before.name }),
+            &json!({ "name": folder.name }),
+        ));
+    audit::record(&state.db, entry).await;
     Ok(Json(folder))
 }
 
 pub async fn move_folder(
     State(state): State<Arc<AppState>>,
     ConnectionManager(by): ConnectionManager,
+    address: ClientAddress,
     Path(id): Path<String>,
     Json(body): Json<ParentRequest>,
 ) -> ApiResult<Json<Folder>> {
+    let before = state.db.folder(&id).await?;
     let folder = state.db.move_folder(&id, parent(&body)).await?;
-    info!(by = %by.username, folder = %id, into = ?parent(&body), "folder moved");
+    let names = Names::load(&state).await?;
+    let entry = Entry::new(action::FOLDER_MOVE)
+        .by(&by)
+        .from(&address)
+        .target(target::FOLDER, &id, &folder.name)
+        .changes(audit::diff(
+            &json!({ "folder": names.folder(before.parent_id.as_deref()) }),
+            &json!({ "folder": names.folder(folder.parent_id.as_deref()) }),
+        ));
+    audit::record(&state.db, entry).await;
     Ok(Json(folder))
 }
 
@@ -514,10 +656,21 @@ pub async fn move_folder(
 pub async fn delete_folder(
     State(state): State<Arc<AppState>>,
     ConnectionManager(by): ConnectionManager,
+    address: ClientAddress,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    let before = state.db.folder(&id).await?;
+    let names = Names::load(&state).await?;
     state.db.delete_folder(&id).await?;
-    info!(by = %by.username, folder = %id, "folder deleted");
+    let entry = Entry::new(action::FOLDER_DELETE)
+        .by(&by)
+        .from(&address)
+        .target(target::FOLDER, &id, &before.name)
+        .changes(audit::diff(
+            &json!({ "name": before.name, "folder": names.folder(before.parent_id.as_deref()) }),
+            &Value::Null,
+        ));
+    audit::record(&state.db, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -535,6 +688,76 @@ pub struct UserDetail {
     folders: Vec<String>,
     /// Ids of the user's groups.
     groups: Vec<String>,
+}
+
+/// Names of users, groups and folders, which audit entries show instead of
+/// ids.
+struct Names {
+    users: HashMap<String, String>,
+    groups: HashMap<String, String>,
+    folders: HashMap<String, String>,
+}
+
+impl Names {
+    async fn load(state: &AppState) -> ApiResult<Self> {
+        Ok(Self {
+            users: (state.db.list_users().await?)
+                .into_iter()
+                .map(|u| (u.id, u.username))
+                .collect(),
+            groups: (state.db.list_groups().await?)
+                .into_iter()
+                .map(|g| (g.id, g.name))
+                .collect(),
+            folders: (state.db.list_folders().await?)
+                .into_iter()
+                .map(|f| (f.id, f.name))
+                .collect(),
+        })
+    }
+
+    fn lookup(map: &HashMap<String, String>, ids: &[String]) -> Vec<String> {
+        ids.iter()
+            .map(|id| map.get(id).unwrap_or(id).clone())
+            .collect()
+    }
+
+    fn users(&self, ids: &[String]) -> Vec<String> {
+        Self::lookup(&self.users, ids)
+    }
+
+    fn groups(&self, ids: &[String]) -> Vec<String> {
+        Self::lookup(&self.groups, ids)
+    }
+
+    fn folders(&self, ids: &[String]) -> Vec<String> {
+        Self::lookup(&self.folders, ids)
+    }
+
+    /// The folder's name; `null` for the top level.
+    fn folder(&self, id: Option<&str>) -> Value {
+        id.map_or(Value::Null, |id| {
+            json!(self.folders.get(id).map_or(id, String::as_str))
+        })
+    }
+}
+
+/// What a user's audit entries compare.
+fn user_snapshot(detail: &UserDetail, names: &Names) -> Value {
+    json!({
+        "username": detail.user.username,
+        "role": detail.user.role,
+        "disabled": detail.user.disabled,
+        "groups": names.groups(&detail.groups),
+        "connections": detail.connections,
+        "folders": names.folders(&detail.folders),
+    })
+}
+
+/// The `password` change of an audit entry: never the password itself.
+fn password_change(had_one: bool) -> Value {
+    use crate::sensitive::REDACTED;
+    json!({ "password": { "from": had_one.then_some(REDACTED), "to": REDACTED } })
 }
 
 async fn user_detail(state: &AppState, user: User) -> ApiResult<UserDetail> {
@@ -631,6 +854,7 @@ async fn apply_grants(
 pub async fn create_user(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
+    address: ClientAddress,
     Json(body): Json<UserRequest>,
 ) -> ApiResult<(StatusCode, Json<UserDetail>)> {
     let username = validate_username(body.username.as_deref().unwrap_or(""))?;
@@ -662,18 +886,31 @@ pub async fn create_user(
         body.folders.as_deref(),
     )
     .await?;
-    info!(by = %admin.username, username = %user.username, "user created");
     let user = state.db.user(&user.id).await?;
-    Ok((StatusCode::CREATED, Json(user_detail(&state, user).await?)))
+    let detail = user_detail(&state, user).await?;
+    let names = Names::load(&state).await?;
+    let mut entry = Entry::new(action::USER_CREATE)
+        .by(&admin)
+        .from(&address)
+        .target(target::USER, &detail.user.id, &detail.user.username)
+        .changes(audit::diff(&Value::Null, &user_snapshot(&detail, &names)));
+    if hash != auth::NO_PASSWORD {
+        entry = entry.changes(password_change(false));
+    }
+    audit::record(&state.db, entry).await;
+    Ok((StatusCode::CREATED, Json(detail)))
 }
 
 pub async fn update_user(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
+    address: ClientAddress,
     Path(id): Path<String>,
     Json(body): Json<UserRequest>,
 ) -> ApiResult<Json<UserDetail>> {
     let current = state.db.user(&id).await?;
+    let names = Names::load(&state).await?;
+    let before = user_snapshot(&user_detail(&state, current.clone()).await?, &names);
     let role = body.role();
     let demotes_self =
         role.is_some_and(|r| r != current.role && r != Role::Admin) || body.disabled == Some(true);
@@ -694,7 +931,11 @@ pub async fn update_user(
         }
         None => None,
     };
-    let user = state
+    let had_password = match hash {
+        Some(_) => Some(state.db.password_hash(&id).await? != auth::NO_PASSWORD),
+        None => None,
+    };
+    state
         .db
         .update_user(
             &id,
@@ -718,22 +959,39 @@ pub async fn update_user(
         body.folders.as_deref(),
     )
     .await?;
-    info!(by = %admin.username, username = %user.username, "user updated");
     let user = state.db.user(&id).await?;
-    Ok(Json(user_detail(&state, user).await?))
+    let detail = user_detail(&state, user).await?;
+    let mut entry = Entry::new(action::USER_UPDATE)
+        .by(&admin)
+        .from(&address)
+        .target(target::USER, &id, &detail.user.username)
+        .changes(audit::diff(&before, &user_snapshot(&detail, &names)));
+    if let Some(had_one) = had_password {
+        entry = entry.changes(password_change(had_one));
+    }
+    audit::record(&state.db, entry).await;
+    Ok(Json(detail))
 }
 
 pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
+    address: ClientAddress,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     if id == admin.id {
         return Err(ApiError::bad_request("You cannot delete your own account."));
     }
     let user = state.db.user(&id).await?;
+    let names = Names::load(&state).await?;
+    let before = user_snapshot(&user_detail(&state, user.clone()).await?, &names);
     state.db.delete_user(&id).await?;
-    info!(by = %admin.username, username = %user.username, "user deleted");
+    let entry = Entry::new(action::USER_DELETE)
+        .by(&admin)
+        .from(&address)
+        .target(target::USER, &id, &user.username)
+        .changes(audit::diff(&before, &Value::Null));
+    audit::record(&state.db, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -761,6 +1019,17 @@ async fn group_detail(state: &AppState, id: &str) -> ApiResult<GroupDetail> {
         members: state.db.group_member_ids(id).await?,
         connections: grants.connections,
         folders: grants.folders,
+    })
+}
+
+/// What a group's audit entries compare.
+fn group_snapshot(detail: &GroupDetail, names: &Names) -> Value {
+    json!({
+        "name": detail.group.name,
+        "role": detail.group.role,
+        "members": names.users(&detail.members),
+        "connections": detail.connections,
+        "folders": names.folders(&detail.folders),
     })
 }
 
@@ -815,6 +1084,7 @@ fn group_name_taken(err: DbError) -> ApiError {
 pub async fn create_group(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
+    address: ClientAddress,
     Json(body): Json<GroupRequest>,
 ) -> ApiResult<(StatusCode, Json<GroupDetail>)> {
     let name = validate_group_name(body.name.as_deref().unwrap_or(""))?;
@@ -834,20 +1104,27 @@ pub async fn create_group(
         body.folders.as_deref(),
     )
     .await?;
-    info!(by = %admin.username, group = %group.name, "group created");
-    Ok((
-        StatusCode::CREATED,
-        Json(group_detail(&state, &group.id).await?),
-    ))
+    let detail = group_detail(&state, &group.id).await?;
+    let names = Names::load(&state).await?;
+    let entry = Entry::new(action::GROUP_CREATE)
+        .by(&admin)
+        .from(&address)
+        .target(target::GROUP, &group.id, &group.name)
+        .changes(audit::diff(&Value::Null, &group_snapshot(&detail, &names)));
+    audit::record(&state.db, entry).await;
+    Ok((StatusCode::CREATED, Json(detail)))
 }
 
 pub async fn update_group(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
+    address: ClientAddress,
     Path(id): Path<String>,
     Json(body): Json<GroupRequest>,
 ) -> ApiResult<Json<GroupDetail>> {
     let name = body.name.as_deref().map(validate_group_name).transpose()?;
+    let names = Names::load(&state).await?;
+    let before = group_snapshot(&group_detail(&state, &id).await?, &names);
     let group = state
         .db
         .update_group(
@@ -870,18 +1147,31 @@ pub async fn update_group(
         body.folders.as_deref(),
     )
     .await?;
-    info!(by = %admin.username, group = %group.name, "group updated");
-    Ok(Json(group_detail(&state, &id).await?))
+    let detail = group_detail(&state, &id).await?;
+    let entry = Entry::new(action::GROUP_UPDATE)
+        .by(&admin)
+        .from(&address)
+        .target(target::GROUP, &id, &group.name)
+        .changes(audit::diff(&before, &group_snapshot(&detail, &names)));
+    audit::record(&state.db, entry).await;
+    Ok(Json(detail))
 }
 
 pub async fn delete_group(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
+    address: ClientAddress,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let group = state.db.group(&id).await?;
+    let detail = group_detail(&state, &id).await?;
+    let names = Names::load(&state).await?;
     state.db.delete_group(&id).await?;
-    info!(by = %admin.username, group = %group.name, "group deleted");
+    let entry = Entry::new(action::GROUP_DELETE)
+        .by(&admin)
+        .from(&address)
+        .target(target::GROUP, &id, &detail.group.name)
+        .changes(audit::diff(&group_snapshot(&detail, &names), &Value::Null));
+    audit::record(&state.db, entry).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -931,9 +1221,20 @@ pub struct FileQuery {
 }
 
 /// The recording file, with range requests (`ServeFile`).
+/// The audit entry about a recording.
+fn recording_entry(action: &'static str, by: &User, recording: &Recording) -> Entry {
+    Entry::new(action)
+        .by(by)
+        .target(target::RECORDING, &recording.id, &recording.file_name)
+        .detail("connection", recording.connection_id.as_str())
+        .detail("user", recording.username.as_str())
+        .detail("startedAt", recording.started_at)
+}
+
 pub async fn recording_file(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
+    address: ClientAddress,
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
     request: Request,
@@ -961,7 +1262,8 @@ pub async fn recording_file(
                 .headers_mut()
                 .insert(header::CONTENT_DISPOSITION, value);
         }
-        info!(by = %admin.username, recording = %id, "recording downloaded");
+        let entry = recording_entry(action::RECORDING_DOWNLOAD, &admin, &recording);
+        audit::record(&state.db, entry.from(&address)).await;
     }
     Ok(response)
 }
@@ -969,6 +1271,7 @@ pub async fn recording_file(
 pub async fn delete_recording(
     State(state): State<Arc<AppState>>,
     AdminUser(admin): AdminUser,
+    address: ClientAddress,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let recording = state.db.recording(&id).await?;
@@ -979,8 +1282,149 @@ pub async fn delete_recording(
         ));
     }
     recording::delete(&state.db, &recordings_dir(&state), &recording).await?;
-    info!(by = %admin.username, recording = %id, file = %recording.file_name, "recording deleted");
+    let entry = recording_entry(action::RECORDING_DELETE, &admin, &recording);
+    audit::record(&state.db, entry.from(&address)).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Audit log (administrators only)
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditQuery {
+    /// The actor's username or id.
+    actor: Option<String>,
+    /// An action or a prefix of whole parts: `user`, `oidc.user`, `login.failure`.
+    action: Option<String>,
+    /// `user`, `group`, `connection`, `folder` or `recording`.
+    target_type: Option<String>,
+    /// The target's id or name.
+    target: Option<String>,
+    /// From this time on, Unix milliseconds.
+    from: Option<i64>,
+    /// Before this time, Unix milliseconds.
+    to: Option<i64>,
+    /// Entries per page (default 100, at most 1000).
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// `csv` for a CSV file of every matching entry (up to 100 000).
+    format: Option<String>,
+}
+
+const AUDIT_PAGE: i64 = 100;
+const AUDIT_MAX_PAGE: i64 = 1000;
+const AUDIT_MAX_CSV: usize = 100_000;
+
+impl AuditQuery {
+    fn filter(&self) -> ApiResult<crate::db::AuditFilter> {
+        let text = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let action = text(&self.action);
+        if let Some(action) = &action
+            && !action.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '*')
+            })
+        {
+            return Err(ApiError::bad_request(
+                "Filter actions by a name such as user.update or a prefix such as user.",
+            ));
+        }
+        Ok(crate::db::AuditFilter {
+            actor: text(&self.actor),
+            action,
+            target_type: text(&self.target_type),
+            target: text(&self.target),
+            since: self.from,
+            until: self.to,
+        })
+    }
+}
+
+/// `GET /api/audit`: `{"entries": […], "hasMore": bool}`, newest first, or
+/// with `format=csv` every matching entry as a CSV download.
+pub async fn list_audit(
+    State(state): State<Arc<AppState>>,
+    AdminUser(_): AdminUser,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Response> {
+    let filter = query.filter()?;
+    if query.format.as_deref() == Some("csv") {
+        return audit_csv(&state, &filter).await;
+    }
+    if query.format.as_deref().is_some_and(|f| f != "json") {
+        return Err(ApiError::bad_request("The format is json or csv."));
+    }
+    let limit = query.limit.unwrap_or(AUDIT_PAGE).clamp(1, AUDIT_MAX_PAGE);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let mut entries = state
+        .db
+        .list_audit_entries(&filter, limit + 1, offset)
+        .await?;
+    let has_more = entries.len() as i64 > limit;
+    entries.truncate(limit as usize);
+    Ok(Json(json!({ "entries": entries, "hasMore": has_more })).into_response())
+}
+
+/// `GET /api/audit/actions`: every action the gateway records.
+pub async fn audit_actions(AdminUser(_): AdminUser) -> Json<&'static [&'static str]> {
+    Json(audit::action::ALL)
+}
+
+async fn audit_csv(state: &AppState, filter: &crate::db::AuditFilter) -> ApiResult<Response> {
+    let mut csv = String::from(
+        "time,action,actor,actor_id,source_address,target_type,target_id,target_name,changes\r\n",
+    );
+    let mut written = 0;
+    while written < AUDIT_MAX_CSV {
+        let page = state
+            .db
+            .list_audit_entries(filter, AUDIT_MAX_PAGE, written as i64)
+            .await?;
+        for entry in &page {
+            let changes = entry.changes.as_ref().map(Value::to_string);
+            let fields = [
+                Some(audit::rfc3339(entry.occurred_at)),
+                Some(entry.action.clone()),
+                entry.actor_name.clone(),
+                entry.actor_id.clone(),
+                entry.source_address.clone(),
+                entry.target_type.clone(),
+                entry.target_id.clone(),
+                entry.target_name.clone(),
+                changes,
+            ];
+            let row: Vec<String> = fields
+                .iter()
+                .map(|f| audit::csv_field(f.as_deref().unwrap_or("")))
+                .collect();
+            csv.push_str(&row.join(","));
+            csv.push_str("\r\n");
+        }
+        written += page.len();
+        if (page.len() as i64) < AUDIT_MAX_PAGE {
+            break;
+        }
+    }
+    let name = format!(
+        "attachment; filename=\"molcajete-audit-{}.csv\"",
+        audit::rfc3339(crate::db::now_millis()).replace([':', '.'], "-")
+    );
+    let mut response = csv.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&name) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

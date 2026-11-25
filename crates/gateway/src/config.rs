@@ -23,6 +23,8 @@ pub struct Config {
     pub oidc: Option<OidcConfig>,
     #[serde(default)]
     pub recordings: RecordingsConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
     /// Administrators created in the database on startup when no user with
     /// that name exists yet. Existing users and passwords are left alone.
     #[serde(default)]
@@ -181,6 +183,27 @@ impl OidcConfig {
         }
         Ok(self.client_secret.clone().filter(|s| !s.is_empty()))
     }
+}
+
+/// `[audit]`: the audit log of administrative changes and sign-ins.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Entries older than this many days are deleted; 0 keeps them.
+    #[serde(default = "default_audit_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_audit_retention_days(),
+        }
+    }
+}
+
+fn default_audit_retention_days() -> u64 {
+    365
 }
 
 /// Session recording (connections with *Record sessions* on).
@@ -440,6 +463,9 @@ mod tests {
             PathBuf::from("./recordings")
         );
         assert_eq!(config.recordings.max_total_size, 0);
+        assert_eq!(config.audit.retention_days, 365);
+        let config: Config = toml::from_str("[audit]\nretention_days = 0\n").unwrap();
+        assert_eq!(config.audit.retention_days, 0);
     }
 
     #[test]

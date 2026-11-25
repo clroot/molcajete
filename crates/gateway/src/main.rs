@@ -6,6 +6,7 @@
 //! (WebSocket) and guacd (TCP).
 
 mod api;
+mod audit;
 mod auth;
 mod bootstrap;
 mod client_report;
@@ -14,6 +15,7 @@ mod db;
 mod guacd;
 mod oidc;
 mod recording;
+mod sensitive;
 mod tunnel;
 
 use std::net::SocketAddr;
@@ -112,7 +114,7 @@ async fn websocket_tunnel(
         Err(err) => return err.into_response(),
     };
     let mut request = tunnel::TunnelRequest::from_query(query.as_deref().unwrap_or(""));
-    request.peer = Some(client_address(&headers, peer));
+    request.peer = Some(auth::client_address(&headers, Some(peer)));
     request.user = Some(recording::RecordedUser {
         id: user.id.clone(),
         username: user.username.clone(),
@@ -162,29 +164,6 @@ async fn require_session(
         Ok(_) => next.run(request).await,
         Err(err) => err.into_response(),
     }
-}
-
-/// The browser's address as reported by a reverse proxy, otherwise the TCP
-/// peer. Only used for logs.
-///
-/// `X-Real-IP` (set by the edge proxy) wins over `X-Forwarded-For`: proxies
-/// in between, such as the Tailscale ingress, replace `X-Forwarded-For` with
-/// their own peer address but pass `X-Real-IP` through.
-fn client_address(headers: &HeaderMap, peer: SocketAddr) -> String {
-    let header = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-    };
-    header("x-real-ip")
-        .or_else(|| header("x-forwarded-for"))
-        .map_or_else(
-            || peer.ip().to_string(),
-            |v| format!("{v} (via {})", peer.ip()),
-        )
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -244,6 +223,8 @@ fn router(state: Arc<AppState>) -> Router {
             get(api::get_recording).delete(api::delete_recording),
         )
         .route("/recordings/{id}/file", get(api::recording_file))
+        .route("/audit", get(api::list_audit))
+        .route("/audit/actions", get(api::audit_actions))
         .route("/settings", get(client_settings))
         .route(
             "/telemetry/client",
@@ -345,6 +326,8 @@ async fn main() -> anyhow::Result<()> {
         info!(dir = %directory.display(), "session recordings enabled");
         recording::start_maintenance(db.clone(), config.recordings.clone(), directory).await;
     }
+
+    audit::start_maintenance(db.clone(), config.audit.clone());
 
     let state = Arc::new(AppState {
         config,
@@ -1753,14 +1736,362 @@ mod tests {
         assert!(directory.join("live.guac").exists());
     }
 
+    /// The audit entries `query` (`action=…&…`) finds, newest first.
+    async fn audit(app: &TestApp, cookie: &str, query: &str) -> Vec<serde_json::Value> {
+        let response = app.get(&format!("/api/audit?{query}"), Some(cookie)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        body["entries"].as_array().unwrap().clone()
+    }
+
+    /// The one entry with `action` done by `admin`.
+    async fn only_entry(app: &TestApp, cookie: &str, action: &str) -> serde_json::Value {
+        let entries = audit(app, cookie, &format!("action={action}&actor=admin")).await;
+        assert_eq!(entries.len(), 1, "{action}: {entries:#?}");
+        entries[0].clone()
+    }
+
+    async fn delete(app: &TestApp, path: &str, cookie: &str) -> StatusCode {
+        let request = Request::delete(path)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap();
+        app.send(request).await.status()
+    }
+
+    const SECRETS: &[&str] = &[
+        "carol-password",
+        "carol-new-password",
+        "rdp-secret-1",
+        "rdp-secret-2",
+        "ssh-key-material",
+        "key-passphrase",
+    ];
+
+    #[tokio::test]
+    async fn audit_log_records_changes_with_actor_and_diff() {
+        let app = app().await;
+        let admin = app.login("admin", "admin-password").await;
+        let admin_id = only_entry(&app, &admin, "login.success").await["actorId"].clone();
+
+        // Users.
+        let carol = app
+            .json(
+                Method::POST,
+                "/api/users",
+                Some(&admin),
+                serde_json::json!({
+                    "username": "carol", "password": "carol-password", "connections": ["granted"]
+                }),
+            )
+            .await;
+        assert_eq!(carol.status(), StatusCode::CREATED);
+        let carol_id = body_json(carol).await["id"].as_str().unwrap().to_owned();
+        let created = only_entry(&app, &admin, "user.create").await;
+        assert_eq!(created["actorName"], "admin");
+        assert_eq!(created["actorId"], admin_id);
+        assert_eq!(
+            (
+                &created["targetType"],
+                &created["targetId"],
+                &created["targetName"]
+            ),
+            (&"user".into(), &carol_id.clone().into(), &"carol".into())
+        );
+        assert_eq!(created["changes"]["username"]["to"], "carol");
+        assert_eq!(
+            created["changes"]["connections"],
+            serde_json::json!({ "added": ["granted"] })
+        );
+        assert_eq!(created["changes"]["password"]["to"], "[redacted]");
+
+        let carol_path = format!("/api/users/{carol_id}");
+        let update = app
+            .json(
+                Method::PUT,
+                &carol_path,
+                Some(&admin),
+                serde_json::json!({
+                    "role": "connection_manager",
+                    "password": "carol-new-password",
+                    "connections": ["secret"],
+                }),
+            )
+            .await;
+        assert_eq!(update.status(), StatusCode::OK);
+        let updated = only_entry(&app, &admin, "user.update").await;
+        assert_eq!(updated["actorName"], "admin");
+        assert_eq!(
+            updated["changes"],
+            serde_json::json!({
+                "role": { "from": "user", "to": "connection_manager" },
+                "connections": { "added": ["secret"], "removed": ["granted"] },
+                "password": { "from": "[redacted]", "to": "[redacted]" },
+            })
+        );
+        assert_eq!(
+            delete(&app, &carol_path, &admin).await,
+            StatusCode::NO_CONTENT
+        );
+        let deleted = only_entry(&app, &admin, "user.delete").await;
+        assert_eq!(deleted["targetName"], "carol");
+        assert_eq!(deleted["changes"]["role"]["from"], "connection_manager");
+
+        // Connections, with secrets among the parameters.
+        let created = app
+            .json(
+                Method::POST,
+                "/api/connections",
+                Some(&admin),
+                serde_json::json!({
+                    "id": "jump", "name": "Jump host", "protocol": "ssh",
+                    "parameters": {
+                        "hostname": "10.0.0.9", "password": "rdp-secret-1",
+                        "private-key": "ssh-key-material", "passphrase": "key-passphrase"
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = only_entry(&app, &admin, "connection.create").await;
+        assert_eq!(created["targetId"], "jump");
+        assert_eq!(created["changes"]["parameters.hostname"]["to"], "10.0.0.9");
+        assert_eq!(
+            created["changes"]["parameters.password"]["to"],
+            "[redacted]"
+        );
+        assert_eq!(
+            created["changes"]["parameters.private-key"]["to"],
+            "[redacted]"
+        );
+
+        let updated = app
+            .json(
+                Method::PUT,
+                "/api/connections/jump",
+                Some(&admin),
+                serde_json::json!({
+                    "id": "jump", "name": "Jump host", "protocol": "ssh",
+                    "parameters": {
+                        "hostname": "10.0.0.10", "password": "rdp-secret-2",
+                        "private-key": "ssh-key-material", "passphrase": "key-passphrase"
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated = only_entry(&app, &admin, "connection.update").await;
+        assert_eq!(
+            updated["changes"],
+            serde_json::json!({
+                "parameters.hostname": { "from": "10.0.0.9", "to": "10.0.0.10" },
+                "parameters.password": { "from": "[redacted]", "to": "[redacted]" },
+            })
+        );
+
+        // Grants.
+        let bob_id = app.state.db.user_credentials("bob").await.unwrap().0.id;
+        let access = app
+            .json(
+                Method::PUT,
+                "/api/connections/jump/access",
+                Some(&admin),
+                serde_json::json!({ "users": [bob_id], "groups": [] }),
+            )
+            .await;
+        assert_eq!(access.status(), StatusCode::OK);
+        let granted = only_entry(&app, &admin, "connection.access").await;
+        assert_eq!(
+            granted["changes"],
+            serde_json::json!({ "users": { "added": ["bob"] } })
+        );
+        let revoke = app
+            .json(
+                Method::PUT,
+                "/api/connections/jump/access",
+                Some(&admin),
+                serde_json::json!({ "users": [], "groups": [] }),
+            )
+            .await;
+        assert_eq!(revoke.status(), StatusCode::OK);
+        let entries = audit(&app, &admin, "action=connection.access").await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0]["changes"],
+            serde_json::json!({ "users": { "removed": ["bob"] } })
+        );
+
+        assert_eq!(
+            delete(&app, "/api/connections/jump", &admin).await,
+            StatusCode::NO_CONTENT
+        );
+        let deleted = only_entry(&app, &admin, "connection.delete").await;
+        assert_eq!(
+            deleted["changes"]["parameters.hostname"]["from"],
+            "10.0.0.10"
+        );
+
+        // Filters.
+        assert_eq!(
+            audit(&app, &admin, "action=connection&actor=admin")
+                .await
+                .len(),
+            5
+        );
+        assert_eq!(
+            audit(&app, &admin, "target=jump&targetType=connection")
+                .await
+                .len(),
+            5
+        );
+        assert_eq!(audit(&app, &admin, "actor=bob").await.len(), 0);
+        assert_eq!(audit(&app, &admin, "limit=2").await.len(), 2);
+        assert_eq!(
+            app.get("/api/audit?action=DROP%20TABLE", Some(&admin))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // No secret anywhere: not in the stored entries, not in the CSV.
+        let json = app.get("/api/audit?limit=1000", Some(&admin)).await;
+        let json = String::from_utf8(
+            axum::body::to_bytes(json.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let csv = app.get("/api/audit?format=csv", Some(&admin)).await;
+        assert_eq!(
+            csv.headers()[header::CONTENT_TYPE],
+            "text/csv; charset=utf-8"
+        );
+        assert!(
+            csv.headers()[header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment; filename=\"molcajete-audit-")
+        );
+        let csv = String::from_utf8(
+            axum::body::to_bytes(csv.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(csv.starts_with("time,action,actor,"));
+        assert!(csv.contains(",connection.update,admin,"), "{csv}");
+        for secret in SECRETS {
+            assert!(!json.contains(secret), "{secret} in {json}");
+            assert!(!csv.contains(secret), "{secret} in {csv}");
+        }
+        let rows = app
+            .state
+            .db
+            .list_audit_entries(&Default::default(), 1000, 0)
+            .await;
+        let rows = format!("{:?}", rows.unwrap());
+        for secret in SECRETS {
+            assert!(!rows.contains(secret), "{secret} stored");
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_log_records_sign_ins_with_the_source_address() {
+        let app = app().await;
+        let peer: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+        let attempt = |username: &str, password: &str, real_ip: Option<&str>| {
+            let mut request =
+                Request::post("/api/auth/login").header(header::CONTENT_TYPE, "application/json");
+            if let Some(ip) = real_ip {
+                request = request.header("x-real-ip", ip);
+            }
+            let mut request = request
+                .body(Body::from(
+                    serde_json::json!({ "username": username, "password": password }).to_string(),
+                ))
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(peer));
+            request
+        };
+        let status = app
+            .send(attempt("ghost", "nope", Some("203.0.113.9")))
+            .await
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let status = app
+            .send(attempt("bob", "wrong-password", None))
+            .await
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let status = app
+            .send(attempt("bob", "bob-password", None))
+            .await
+            .status();
+        assert_eq!(status, StatusCode::OK);
+
+        let admin = app.login("admin", "admin-password").await;
+        let failures = audit(&app, &admin, "action=login.failure").await;
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[1]["actorName"], "ghost");
+        assert_eq!(failures[1]["actorId"], serde_json::Value::Null);
+        assert_eq!(failures[1]["sourceAddress"], "203.0.113.9 (via 10.0.0.2)");
+        assert_eq!(failures[1]["changes"]["reason"], "unknown_user");
+        assert_eq!(failures[0]["actorName"], "bob");
+        assert_eq!(failures[0]["sourceAddress"], "10.0.0.2");
+        assert_eq!(failures[0]["changes"]["reason"], "wrong_password");
+        let json = serde_json::to_string(&failures).unwrap();
+        assert!(!json.contains("wrong-password") && !json.contains("nope"));
+
+        let bob_logins = audit(&app, &admin, "action=login.success&actor=bob").await;
+        assert_eq!(bob_logins.len(), 1);
+        assert_eq!(bob_logins[0]["sourceAddress"], "10.0.0.2");
+
+        let logout = Request::post("/api/auth/logout")
+            .header(header::COOKIE, &admin)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.send(logout).await.status(), StatusCode::NO_CONTENT);
+        let admin = app.login("admin", "admin-password").await;
+        assert_eq!(
+            only_entry(&app, &admin, "logout").await["actorName"],
+            "admin"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_administrators_read_the_audit_log() {
+        let app = app().await;
+        let bob = app.login("bob", "bob-password").await;
+        assert_eq!(
+            app.get("/api/audit", None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.get("/api/audit", Some(&bob)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.get("/api/audit/actions", Some(&bob)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let admin = app.login("admin", "admin-password").await;
+        let actions = body_json(app.get("/api/audit/actions", Some(&admin)).await).await;
+        assert!(actions.as_array().unwrap().contains(&"user.update".into()));
+    }
+
     #[test]
     fn client_address_prefers_the_edge_proxy_header() {
-        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        use auth::client_address;
+        let peer = Some("10.0.0.2:5000".parse().unwrap());
         let mut headers = HeaderMap::new();
         assert_eq!(client_address(&headers, peer), "10.0.0.2");
+        assert_eq!(client_address(&headers, None), "unknown");
         headers.insert("x-forwarded-for", "100.96.0.1, 10.0.0.1".parse().unwrap());
         assert_eq!(client_address(&headers, peer), "100.96.0.1 (via 10.0.0.2)");
         headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
         assert_eq!(client_address(&headers, peer), "203.0.113.7 (via 10.0.0.2)");
+        assert_eq!(client_address(&headers, None), "203.0.113.7");
     }
 }
