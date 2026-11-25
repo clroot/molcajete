@@ -27,6 +27,8 @@ metrics = "0.24"
 png = "0.18"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
+# Encoder of the zstd image type (libzstd, compiled from source by zstd-sys).
+zstd = "0.13"
 
 # SSH
 ab_glyph = "0.2"

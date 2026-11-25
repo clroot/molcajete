@@ -69,7 +69,7 @@ Going through the whole guacd source, screen updates consist almost entirely of 
 
 ```
 crates/
-  molcajete-protocol   shared protocol (platform independent): streaming parser, encoder, status codes, typed instructions, video framing, binary tunnel framing
+  molcajete-protocol   shared protocol (platform independent): streaming parser, encoder, status codes, typed instructions, video framing, binary tunnel framing, zstd image format
   molcajete-client     wasm client: WebGL2 renderer, WebCodecs video, input, audio, clipboard, WebSocket tunnel
   molcajete-gateway    Rust web gateway: static files, connection list API, WebSocket ↔ guacd relay
   molcajete-daemon     Rust guacd (molcajeted): handshake, server-side display/encoding, video mode, VNC·SSH·RDP (+audio)
@@ -89,7 +89,7 @@ Possible combinations:
 | stock guacamole-common-js | molcajete-gateway (accepts the `GUAC_*` parameters) | stock guacd or molcajeted |
 | stock web app | Java web app | molcajeted (compatible handshake) |
 
-Between molcajete components, stream data (images, video, audio) travels as raw bytes instead of base64 (section 2.6); every combination with a stock component uses the text protocol on that leg.
+Between molcajete components, stream data (images, video, audio) travels as raw bytes instead of base64 (section 2.6); every combination with a stock component uses the text protocol on that leg. When the browser runs molcajete-client and the daemon is molcajeted, lossless images are zstd images instead of PNG (section 2.7), whatever the gateway.
 
 ### 2.1 molcajete-protocol
 
@@ -99,6 +99,7 @@ Between molcajete components, stream data (images, video, audio) travels as raw 
 - Limits: `Limits::STRICT` (same as guacd, for untrusted input) and `Limits::LENIENT`.
 - `video`: framing of `video` streams (section 2.5). The server's `encode_frame` and the client's `FrameReader` (reassembles frames regardless of blob boundaries) share this code.
 - `binary`: the record framing of the binary tunnel (section 2.6): `RecordWriter` (molcajeted, and the gateway when it decodes for a stock guacd), `RecordReader` (the gateway's TCP side, any split of the byte stream) and the constants the client parses a message with.
+- `zimage`: the zstd image type (section 2.7): its mimetype, the header molcajeted writes, and the decoder, which the wasm client and the daemon's client simulator share. The decoder is pure Rust (`ruzstd`), so the crate still builds for `wasm32-unknown-unknown`; the encoder needs libzstd and lives in molcajeted.
 
 ### 2.2 molcajete-gateway
 
@@ -129,7 +130,8 @@ Between molcajete components, stream data (images, video, audio) travels as raw 
 | Unbounded modes (SRC/IN/OUT/RIN/RATOP) | For a single rectangle, the outside is cleared with at most 4 scissor+clear calls. Otherwise a coverage mask drives a "clear outside" pass followed by a "draw inside" pass. |
 | `copy` | Between layers the source texture is sampled directly. Within a layer (scrolling) the region is first copied into a scratch texture with `copyTexSubImage2D`. |
 | `transfer` | ROP shader: applies the 4-bit truth table with integer bit operations to un-premultiplied 8-bit values. SRC uses `blitFramebuffer` (ignores clip and composite mode, like putImageData). |
-| `img` | The encoded image goes to the decoder as a `Uint8Array`: on the binary tunnel a view of the received message when the image arrived in one blob (no copy, and no pass through wasm memory), otherwise one joined array. Decoded with WebCodecs `ImageDecoder` (no colour-space conversion) into a `VideoFrame`; without `ImageDecoder`, Blob + `createImageBitmap`. PNG (IHDR colour type, tRNS) and WebP (VP8/VP8L/VP8X) headers tell whether the image is opaque; opaque images without transform or clip are uploaded straight into the layer texture, the rest go through a reused upload texture and are blended. Uploads are first drawn into a 2D `OffscreenCanvas` (deferred to the GPU process) and that canvas is copied with `texSubImage2D`. |
+| `img` (zstd image) | Kept as received until its frame is drawn, then decoded in wasm into a pixel buffer that is reused from image to image, and uploaded with `texSubImage2D` from a view of the wasm memory: straight into the layer texture, or into the upload texture when a transform, a clip or a composite mode other than SRC and OVER applies. No decoder object, no promise, no staging canvas (section 2.7). |
+| `img` (PNG, JPEG, WebP) | The encoded image goes to the decoder as a `Uint8Array`: on the binary tunnel a view of the received message when the image arrived in one blob (no copy, and no pass through wasm memory), otherwise one joined array. Decoded with WebCodecs `ImageDecoder` (no colour-space conversion) into a `VideoFrame`; without `ImageDecoder`, Blob + `createImageBitmap`. PNG (IHDR colour type, tRNS) and WebP (VP8/VP8L/VP8X) headers tell whether the image is opaque; opaque images without transform or clip are uploaded straight into the layer texture, the rest go through a reused upload texture and are blended. Uploads are first drawn into a 2D `OffscreenCanvas` (deferred to the GPU process) and that canvas is copied with `texSubImage2D`. |
 | `video` | Unpacks molcajete framing (a 9-byte header per frame + H.264/H.265 Annex B or AV1 OBUs, `molcajete_protocol::video`) into a WebCodecs `VideoDecoder` (`optimizeForLatency`, hardware decoding where available). Each frame takes an image slot in the frame queue, like `img`, filled by the decoder output (`VideoFrame`), so video follows `sync` order and the other drawing instructions. Decoded frames are uploaded to the texture as they are, on the GPU. Decoder errors are reported to the server with an `ack` error and the server falls back to images. |
 | Paths (`arc`/`curve`/`line`/`clip`/`cstroke`/`lfill`) | Arcs and curves are flattened into polylines; fills (nonzero) and strokes are tessellated with lyon. Coverage is drawn into an R8 mask that a shader samples while compositing. |
 | `clip` | Scissor for axis-aligned rectangles, otherwise a per-layer R8 clip mask (intersections by multiplicative blending) |
@@ -138,7 +140,7 @@ Between molcajete components, stream data (images, video, audio) travels as raw 
 | `move`/`shade`/`distort`/`dispose` | Layer tree properties, applied when compositing |
 | `cursor` | Copied into a cursor texture and read back **asynchronously** with a PBO + fence, so the GPU pipeline never stalls. The CSS cursor (data URL) is updated only when the pixels actually changed, so the local pointer has no lag; when the source layer did not change, the readback is skipped entirely. The server's `mouse` position is drawn as a software cursor. |
 
-**Frames.** Instructions are queued as `Op`s, and once a whole frame up to `sync` is ready (images decoded) it runs at once. When the frame has run, `sync` is sent back and the next `requestAnimationFrame` composites once. Intermediate states never reach the screen.
+**Frames.** Instructions are queued as `Op`s, and once a whole frame up to `sync` is ready (images decoded) it runs at once. A zstd image is ready as soon as its `end` has arrived, so a frame made of them waits for nothing; it takes its place in the queue like any other image, which keeps the drawing order when PNG, JPEG or video frames are mixed in. When the frame has run, `sync` is sent back and the next `requestAnimationFrame` composites once. Intermediate states never reach the screen.
 
 **Compositing.** The layer tree is walked and each layer drawn with its transform (`translate`, then `distort` about its centre), opacity and the parent's clip (scissor). A translucent layer with children is first rendered as a subtree offscreen and blended with the group opacity, like CSS `opacity`. The canvas is created with `desynchronized: true` (low latency), and linear filtering is used only for non-integer scale factors.
 
@@ -161,7 +163,7 @@ Between molcajete components, stream data (images, video, audio) travels as raw 
   1. **Scroll detection**: row hashes find vertical moves, sent as `copy`.
   2. **Move detection in any direction** (dragged windows, ...): hashes of the changed 64×64 cells are looked up while a 64×64 window slides one pixel at a time over the client copy, using a 2D rolling hash (two odd multipliers, subtracting the rows and columns that leave the window). Cells that moved by the same offset are merged into large rectangles and sent as single `copy` instructions, front of the movement first. guacd 1.6 slides with multiplier 62 and no subtraction, which leaves the upper-left half of the block out of the hash and produces many false matches, so that approach was not used.
   3. **Remaining differences**: cut into changed row bands and changed column runs within them, then encoded. Unchanged pixels re-sent by the server cost nothing. A client is slowed by the number of images in a frame rather than by their size, so the resulting rectangles are joined into their bounding box wherever one image is estimated to be cheaper than two: an image is taken to cost 1 KB (PNG headers and palette, the `img`/`blob`/`end` instructions, and a decode on the client), the unchanged pixels a join adds 1 byte per 8 pixels, or per 128 pixels in rows that are one colour or repeat the row above. Lines of text that changed over the same columns therefore share an image, since the leading between them is flat, while changes side by side over unchanged text stay separate. Joined images stay below one megapixel so that a large update is still decoded as several images in parallel.
-  4. **Encoding**: solid colours as `rect`+`cfill`, up to 256 colours as palette PNG (1/2/4/8 bit), everything else as RGB PNG (Balanced compression + Adaptive filter). Large, colourful areas that change often are sent as JPEG when the client supports it, and those tiles are re-sent as PNG once they calm down (lossless refinement).
+  4. **Encoding**: solid colours as `rect`+`cfill`, up to 256 colours as palette PNG (1/2/4/8 bit), everything else as RGB PNG (DEFLATE level 4 + Adaptive filter). A client that announces the zstd image type gets it in place of PNG for every opaque region that is not a photograph (section 2.7). Large, colourful areas that change often are sent as JPEG when the client supports it, and those tiles are re-sent losslessly once they calm down (lossless refinement).
 - Because the instructions we send are replayed on the copy, wrong guesses correct themselves: a bad `copy` shows up as a difference in the next comparison and is re-sent as pixels. VNC CopyRect only needs the same `copy` applied to the copy, with no need to flush the source area first. This property is checked by a client simulator that replays the instructions and by randomized fuzz tests (1,000 seeds).
 - Frame pacing: the send time of every `sync` is recorded, and the exponentially smoothed time until its reply is used as the client's processing lag. The next frame goes out after `max(floor, lag)` (at most 500 ms, the same idea as guacd), where the floor is 16 ms for RDP and VNC and 33 ms for SSH. Remote updates keep arriving meanwhile and accumulate as differences from the copy, so short-lived intermediate states are never sent. The first change after a quiet period is sent immediately, so input stays responsive.
 - Large frames (more than 32 KiB encoded) are paced by one of two profiles (`display/pacing.rs`, chosen with `Display::with_pacing`; all three protocols ask `Display::next_frame_at`):
@@ -246,11 +248,120 @@ The worker and main-thread modes share all of this; the text path (`String` → 
 
 The binary stream is 0.2–3% larger than the encoded images themselves (record headers and the instructions around them).
 
+### 2.7 zstd images (a lossless image type the client decodes itself)
+
+Every lossless update used to be a PNG. molcajeted paid for DEFLATE on each one, and the client for an `ImageDecoder` per image: a decoder object, a promise, a `VideoFrame` and, for most images, a pass through the staging canvas before the texture upload; a frame could only be applied once all of its images had come back from their decoders. For a client that announces it, molcajeted now sends screen content as a format the client decodes itself, in wasm, while it draws the frame.
+
+**Format** (`molcajete_protocol::zimage`, mimetype `image/x-molcajete-zstd-v1`). An image is indexed or RGB pixels, as they are, in one Zstandard frame:
+
+```
+u8      kind: 0 = indexed, 1 = RGB
+u16 LE  width  (1 or more)
+u16 LE  height (1 or more)
+indexed only:
+  u8    number of colours - 1
+  [..]  palette: 3 bytes (R, G, B) per colour
+[..]    one Zstandard frame (RFC 8878) holding
+          indexed: the rows of palette indices, each index taking 1 bit for up to
+                   2 colours, 2 bits up to 4, 4 bits up to 16 and 8 bits otherwise,
+                   first pixel in the highest bits, every row padded to a whole
+                   byte (as in PNG)
+          RGB:     width * height * 3 bytes, rows top to bottom
+```
+
+- Every pixel is opaque; there is no alpha channel, no row filter and no interlacing. The `img` instruction says where the image goes and with which composite mode, as for any other type.
+- An image has at most 2^25 pixels (an 8K screen has 33.2 million).
+- The frame uses no dictionary and is the only one; nothing follows it. It decompresses to exactly the number of bytes the header implies. Its window is at most 8 MiB, unless it is a single-segment frame, whose window is its content. A decoder can therefore check, before it allocates anything, that it will need no more than the image itself and 8 MiB.
+- An index that has no palette entry is black.
+- A decoder refuses anything else, and an image it refuses is skipped like an image the browser cannot decode: its frame is still applied. The version is part of the mimetype; a change to the format is a new mimetype, announced next to this one.
+
+The decoder (`zimage::Decoder`) checks the header and the frame header itself and leaves the Zstandard frame to `ruzstd`, a pure Rust decoder, writing into a buffer of the size the header implies. It never panics on any input and never produces more or fewer pixels than announced; tests feed it images cut at every length, every byte replaced, bytes removed and inserted, and random data.
+
+**Negotiation.** The client lists the mimetype in the `image` instruction of the handshake, after the stock ones (the tunnel URL carries it as one more `image=` parameter, which every gateway passes on). molcajeted uses the type only for a client that listed it, so the stock clients and older molcajete clients get PNG as before, and a stock guacd ignores a mimetype it does not know. Nothing depends on the tunnel: the data is an `img` stream like any other, in blob records or in base64 `blob` instructions. `--image-zstd false` turns the type off in a daemon and `?png` in a session.
+
+**Which images.** molcajeted chooses per image (`display/encode.rs`):
+
+| Region | Sent as |
+|---|---|
+| one colour | `rect` + `cfill`, as before |
+| opaque, up to 256 colours | zstd image, indexed |
+| opaque, more colours, at least 3 of 4 pixels equal to their left neighbour (in every fourth row) | zstd image, RGB |
+| opaque, more colours, otherwise: a photograph, a gradient | PNG (RGB, adaptive filter) |
+| any transparent pixel; the cursor | PNG (the format has no alpha) |
+| wider or higher than 65535 pixels, or more than 2^25 pixels | PNG |
+| large, colourful and changing often | JPEG, as before; refined later by this table |
+
+The share of repeated pixels tells screen content from photographs well: it is 94 to 97% in the windows and pages with more than 256 colours of the recorded sessions, and 3 to 15% in photographs. Without a row filter Zstandard needs 22 to 74% more bytes than PNG for a photograph, and 37 to 45% fewer for those windows, so the rule keeps PNG exactly where its filters earn something. It costs one look at a quarter of the rows of an image that has already failed to fit a palette; `display::bench::zstd_images` measures it on a 5120x512 photograph (0.17 ms, against 83 ms to encode it as PNG).
+
+**In the client.** A zstd image is not decoded when it arrives. Its bytes are queued (`QueuedImage::Zstd`) in the place the `img` instruction takes in its frame, and the slot counts as ready from the moment `end` arrives, so the frame waits for nothing because of it. When the frame is drawn, the image is decoded into a pixel buffer that is reused from image to image and uploaded with `texSubImage2D` from a view of the wasm memory, into the layer texture when it is drawn with SRC or OVER and no transform or clip, and through the upload texture otherwise, exactly like a decoded PNG. The pixels are opaque, so straight and premultiplied alpha are the same and the upload asks the browser for no conversion. PNG, JPEG and video frames of the same frame still wait for their decoders, and the frame with them; the order of drawing is that of the instructions in every mix.
+
+**Why this encoding.** The candidates of GH-24 were compared on the images of two recorded RDP sessions (a list being scrolled: 1194 images, 72.6 megapixels, 95% of them with at most 256 colours; pages being opened: 49 images, 14.1 megapixels, 57% of the pixels in two windows with more colours) and on the images `display::bench` produces (text whose glyphs are noise, which is pessimistic). Bytes are relative to the PNG molcajeted sends; encoding was timed natively on an Apple M4, decoding in wasm without SIMD in headless Chromium 1228 on the same machine, warm, per megapixel.
+
+| Candidate | Bytes: list | Bytes: pages | Bytes: bench `page` | Bytes: bench `scatter` | Encode ms/MP (list / bench `page`) | Decode in wasm ms/MP (list / bench `page`) | Decoder in the wasm file |
+|---|---|---|---|---|---|---|---|
+| PNG, DEFLATE level 4 (the baseline) | 100% (8602 kB) | 100% (565 kB) | 100% (6134 kB) | 100% (2533 kB) | 4.96 / 6.82 | `ImageDecoder`: 1.38 / 0.88 one at a time, 0.67 / 0.27 eight at a time | none |
+| QOI | 240% | 1024% | 239% | 247% | 1.05 / 1.22 | 0.72 / 0.75 | 4 kB |
+| indexed or RGB + LZ4 | 128% | 122% | 165% | 180% | 1.46 / 2.15 | 0.74 / 0.84 | 9 kB |
+| indexed or RGB + zstd level 1 | 100% | 73% | 98% | 101% | 1.55 / 2.43 | 2.54 / 3.14 | 45 kB |
+| **indexed or RGB + zstd level 3** | **96%** | **65%** | **94%** | **101%** | **1.64 / 2.55** | **2.10 / 2.90** | **45 kB** |
+| indexed or RGB + zstd level 5 | 94% | 62% | 92% | 98% | 3.18 / 3.92 | not measured | 45 kB |
+| indexed or RGB + DEFLATE level 4 | 98% | 86% | 100% | 98% | 4.03 / 6.64 | 1.31 / 1.35 | 20 kB |
+| RGB rows with PNG's adaptive filter + zstd level 1 (no palette) | 225% | 150% | 164% | 163% | 8.83 / 8.11 | 6.46 / 6.05 | 45 kB |
+| PNG decoded in wasm (`png` crate) | 100% | 100% | 100% | 100% | as PNG | 1.30 / 0.98 | 110 kB |
+
+- **QOI and LZ4** have no entropy coder. They decode fastest, but LZ4 takes 22 to 80% more bytes than PNG and QOI two and a half to ten times as many, and the bytes of a large frame are what a session waits for longest (GH-22).
+- **Row filters** make screen content larger, not smaller, under an LZ coder: an exact repetition of a glyph is no longer one after filtering. They only pay for photographs, which stay PNG.
+- **The palette** is what makes the difference on text: the same pixels as RGB take half as many bytes again. Packing the indices like PNG instead of keeping them as bytes saves 3% at most.
+- **Zstandard against DEFLATE** over the same pixels: about the same bytes (3% more on bench `scatter`, a quarter fewer on the recorded pages) at 40% of the encoding time, against a decoder that is slower in wasm (`ruzstd` reaches 350 to 500 MB/s there, `miniz_oxide` about 750 MB/s) and 25 kB larger. Level 3 costs 5% more time than level 1 for 4% fewer bytes (11% fewer on the pages); level 5 one and a half to two times the time of level 3 for another 2 to 3%.
+- **Decoding PNG in wasm** would have served stock guacd too, with no new format, but saves molcajeted nothing and adds the most code.
+- **Alpha** was left out: molcajeted sends transparent pixels only in cursors and in regions a remote protocol reports as transparent, which are rare and stay PNG, and without alpha the question of premultiplying exactly like the browser's PNG decoder does not arise.
+
+The comparison tool depends on the recordings, which show a private desktop, and is not in the repository; `display::bench` and `display::bench::zstd_images` reproduce the synthetic part.
+
+**Effect in molcajeted** (`display::bench`, a 5K screen, per frame, PNG client → zstd client):
+
+| Scenario | Encoding | Whole flush | Image bytes | zstd images of all images |
+|---|---|---|---|---|
+| `page` (full page of new text) | 57.3 → 17.9 ms | 76.8 → 37.4 ms | 860.5 → 799.9 kB (−7.0%) | 7.5 of 7.5 |
+| `scatter` (40 small changes) | 7.2 → 2.6 ms | 12.5 → 7.9 ms | 128.1 → 127.8 kB | 33.3 of 33.3 |
+| `scroll` (document scrolls) | 2.2 → 0.7 ms | 14.3 → 13.5 ms | 33.0 → 32.1 kB (−2.7%) | 1.0 of 1.0 |
+| `corners` (two small changes) | 1.1 → 0.4 ms | 1.7 → 1.0 ms | 17.3 → 17.2 kB | 2.0 of 2.0 |
+| `drag` (window dragged over a wallpaper) | 1.0 → 0.7 ms | 7.7 → 7.4 ms | 49.0 → 48.4 kB (−1.2%) | 2.5 of 4.5 (the wallpaper stays PNG) |
+
+The wasm client grows by 50 kB (692,392 → 742,844 bytes as built by `scripts/build-web.sh` without `wasm-opt`; 214,863 → 231,640 bytes with `gzip -9`). molcajeted links libzstd (`zstd` crate), compiled from the source bundled with `zstd-sys`.
+
+**Effect in the client.** The two recordings were replayed into the client in headless Chromium 1228 on an Apple M4, once as recorded (PNG) and once with the same images converted by molcajeted's rule (1187 of 1217 and 49 of 68 images become zstd images; the rest are cursors and a few small photographs). The replay feeds text messages (base64), so it shows nothing of the binary tunnel.
+
+On the GPU (ANGLE on Metal), ranges of 3 or 4 runs:
+
+| Replay | Measure | PNG | zstd |
+|---|---|---|---|
+| list, `?main`, messages fed back to back | until every frame is applied | 0.35–0.40 s | 0.26–0.28 s |
+| | frame lag (from `sync` to applied), average | 3.9–5.7 ms | 0.48–0.50 ms |
+| | main thread: tasks, of which script | 355–405 ms, 299–353 ms | 268–280 ms, 50–58 ms |
+| pages, `?main`, messages fed back to back | frame lag, average | 13.4–17.0 ms | 0.72–0.86 ms |
+| | main thread: tasks, of which script | 71–96 ms, 55–74 ms | 92–102 ms, 38–56 ms |
+| list, worker, recorded timing (25 s) | frame lag, average | 1.05–1.56 ms | 1.35–1.48 ms |
+| | per image | 0.49–0.75 ms from handing it to the decoder to having it | 0.39–0.51 ms decoding |
+| list, `?main`, recorded timing | frame lag, average | 1.42–1.51 ms | 1.35–1.55 ms |
+| | main thread: tasks, of which script | 862–927 ms, 514–554 ms | 956–1071 ms, 102–113 ms |
+| pages, worker, recorded timing (20 s) | frame lag, average | 1.91–2.04 ms | 1.43–1.62 ms |
+| pages, `?main`, recorded timing | frame lag, average | 1.74–2.08 ms | 1.34–1.68 ms |
+| | main thread: tasks, of which script | 150–189 ms, 70–102 ms | 213–251 ms, 57–73 ms |
+
+- When frames queue up, a frame of zstd images is applied in a tenth of the time, because nothing in it is waited for, and the client gets through the backlog of the list about 40% sooner.
+- At the pace of a session with about three images per frame, on an otherwise idle machine, the time from `sync` to applied is the same within the spread of the runs: a PNG is back from its decoder after about as long as a zstd image takes to decode. Per megapixel these decodes were three to four times slower than in the warm measurement above, as everything is on a thread that sleeps between frames.
+- The script time of the client falls (to a fifth on the list), but the thread that draws now also carries the pixels to the GPU process: with `?main` the main thread's task time was 10 to 40% higher at recorded timing than with PNG, whose decoding and staging happen elsewhere. In the default worker mode that thread is the worker.
+- Without a GPU the upload dominates. On SwiftShader, which the tests use, `texSubImage2D` from memory took about 5.5 ms per megapixel on the calling thread, where the staging canvas costs it nearly nothing, and the backlog of the list took 0.75–0.85 s as zstd images against 0.28 s as PNG; at recorded timing the frame lag was 0.67–0.70 ms against 0.55–0.58 ms.
+
+Not measured: a deployed session (network, a 5K display, other GPUs and browsers), the worker's own CPU time, and the binary tunnel in the replay.
+
 ## 3. Verification
 
-- Unit tests: protocol (every split point, code point lengths, limits, invalid UTF-8, binary records at every split point), gateway (fake guacd handshake, error mapping, query parsing, tunnels of all four client/daemon combinations through a real WebSocket), daemon (handshake with and without the binary parameter, display merging/copy ordering/blob splitting, the same frame as text and as records, PNG round trips), client logic (path tessellation area, keysyms, key release pairing, wheel, PCM).
+- Unit tests: protocol (every split point, code point lengths, limits, invalid UTF-8, binary records at every split point), gateway (fake guacd handshake, error mapping, query parsing, tunnels of all four client/daemon combinations through a real WebSocket), daemon (handshake with and without the binary parameter, display merging/copy ordering/blob splitting, the same frame as text and as records, PNG round trips, zstd image round trips through the client's decoder and the choice between zstd and PNG), client logic (path tessellation area, keysyms, key release pairing, wheel, PCM).
 - Binary tunnel in the browser (`tests/browser/binary.test.mjs`): a stand-in gateway sends one frame over a real WebSocket (a PNG larger than a record, a PNG with transparency, a JPEG, PCM audio and an H.264 stream cut at arbitrary points) as records to a client offering the binary subprotocol and as base64 instructions to one that does not, in worker and main-thread mode; all four must show the same pixels.
-- Browser pixel tests (`tests/browser`): 22 scenarios checked against the canvas reference implementation.
+- zstd images: the decoder is tested on truncated images at every length, on every byte of an image replaced, on bytes removed and inserted and on random data (it must fail or produce exactly the announced number of opaque pixels, and never panic). In the browser, `renderer.test.mjs` checks the pixels of indexed images at every index depth and of RGB images, the paths through a clip, a transform and the composite modes SRC and ROVER, damaged images, and a frame in which zstd, PNG and JPEG images overlap; `binary.test.mjs` sends a frame with zstd images (one larger than a record, others overlapping a PNG and a JPEG) over both tunnels in both modes and checks that the mimetype is announced, or not when turned off.
+- Browser pixel tests (`tests/browser`): 27 scenarios checked against the canvas reference implementation.
 - End-to-end in real environments: with guacd 1.6 + x11vnc (xterm/xclock/xeyes), display, key input (Shift combinations) and mouse tracking; with guacd 1.6 + OpenSSH, colours, bold text, Hangul, scroll bars, drag selection and clipboard. The same items were checked on the all-Rust path (wasm client → molcajete-gateway → molcajeted → x11vnc), worker mode included.
 - molcajeted SSH: colours (16/256/true colour), bold, Hangul (in output and on the input command line), full-screen apps such as `top`/vi, fast scrolling, drag selection → clipboard, wheel scrollback, resizing, and error mapping (wrong password, closed port, host-key mismatch). On the stock guacd path Hangul on the input command line was garbled; molcajeted displays it correctly because its default terminal type is `xterm-256color`.
 - molcajeted RDP: on xrdp+XFCE, the same scenarios as with stock guacd produce the same screen: opening a terminal, Shift-combined special characters, Ctrl+C, wheel scrolling, clipboard in both directions (including Hangul), display-update resizing, and a clean exit on logout.
@@ -338,7 +449,7 @@ A 640×360 video (`mandelbrot`, a zooming fractal) was played on the desktop wit
 3. File transfer (`file`/`pipe`/`filesystem` objects), audio input (microphone), touch/multi-touch, on-screen keyboard
 4. Gateway: authentication providers (OIDC/LDAP/DB), connection permissions, TLS to guacd, HTTP tunnel (for environments without WebSocket)
 5. Renderer: batching solid fills, a WebGPU backend (`copyExternalImageToTexture`/`importExternalTexture` to cut upload costs; only `Renderer` needs replacing), context loss recovery
-6. molcajeted encoding: frame pacing from a measured link rate and per-connection limits (the byte budget is a fixed 8 MiB/s), parallel encoding, lossy WebP (as in guacd 1.6)
+6. molcajeted encoding: frame pacing from a measured link rate and per-connection limits (the byte budget is a fixed 8 MiB/s), parallel encoding, lossy WebP (as in guacd 1.6). zstd images: the cost of one more image (section 2.4) was estimated for PNG and not looked at again; indexed images could be uploaded as indices and expanded by a shader, a quarter of the bytes the drawing thread carries to the GPU now; a faster Zstandard decoder for wasm than `ruzstd`.
 7. Binary tunnel: client → server streams (clipboard, and file upload or audio input once they exist) are still base64 text; the gateway forwards records from molcajeted without checking the instructions inside.
 8. Video mode
    - Hardware encoders (NVENC/QSV/VA-API/AMF) are wired up but not verified on real hardware. VideoToolbox is verified on Apple M4.

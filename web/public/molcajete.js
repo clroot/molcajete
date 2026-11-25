@@ -97,9 +97,11 @@ function timezone() {
 export class MolcajeteSession {
   /**
    * @param {HTMLElement} container element the display is placed in
-   * @param {{worker?: boolean, binary?: boolean}} options `worker: false` forces
-   *   main-thread mode; `binary: false` keeps the tunnel on the Guacamole text
-   *   protocol instead of offering the gateway raw image, video and audio data
+   * @param {{worker?: boolean, binary?: boolean, zstd?: boolean}} options
+   *   `worker: false` forces main-thread mode; `binary: false` keeps the
+   *   tunnel on the Guacamole text protocol instead of offering the gateway
+   *   raw image, video and audio data; `zstd: false` does not announce the
+   *   zstd image type, so that lossless updates arrive as PNG
    */
   static async create(container, options = {}) {
     const useWorker = options.worker ?? supportsWorker();
@@ -108,6 +110,10 @@ export class MolcajeteSession {
     if (useWorker) await session.#startWorker();
     else await session.#startMain();
     if (options.binary === false) session.call("set_binary_tunnel", false);
+    if (options.zstd === false) {
+      session.#zstd = false;
+      session.call("set_zstd_images", false);
+    }
     return session;
   }
 
@@ -122,6 +128,8 @@ export class MolcajeteSession {
   #requests = new Map();
   #nextRequest = 1;
   #video = [];
+  /** Whether the zstd image type is announced (see `create`). */
+  #zstd = true;
   #audioContext = null;
   #players = new Map();
   #remoteComposition = false;
@@ -166,7 +174,13 @@ export class MolcajeteSession {
     this.#worker = worker;
     const ready = new Promise((resolve) => {
       worker.onmessage = ({ data }) => {
-        if (data.type === "ready") resolve();
+        if (data.type === "ready") {
+          // The worker says whether its client decodes zstd images. A
+          // worker of an earlier version does not say, and must not be
+          // sent a type it would drop.
+          if (data.zstd !== true) this.#zstd = false;
+          resolve();
+        }
         else if (data.type === "event") this.#onEvent(data.event, data.detail);
         else if (data.type === "result") {
           const request = this.#requests.get(data.id);
@@ -325,6 +339,8 @@ export class MolcajeteSession {
       dpi: String(Math.round(96 * dpr)),
     });
     for (const image of ["image/png", "image/jpeg", "image/webp"]) params.append("image", image);
+    // Decoded by the wasm client itself (molcajete_protocol::zimage).
+    if (this.#zstd) params.append("image", "image/x-molcajete-zstd-v1");
     // Audio is decoded in the worker and played on this page.
     if (typeof AudioContext !== "undefined") {
       for (const audio of ["audio/L8", "audio/L16"]) params.append("audio", audio);

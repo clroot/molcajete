@@ -133,6 +133,21 @@ Our client, the gateway and molcajeted carry image, video and audio data as raw 
 - A browser tab opened before the upgrade keeps running the old client (text) until it is reloaded.
 - `molcajete_gateway_relayed_bytes_total{direction="to_browser"}` counts what the gateway read from the daemon; with `framing="transcoded"` the browser receives about a quarter less than that.
 
+### zstd images and mixed versions
+
+Our web client decodes one more lossless image type itself, in WebAssembly, and molcajeted sends it instead of PNG to the clients that announce it ([architecture.md](architecture.md), section 2.7): `image/x-molcajete-zstd-v1` in the `image` instruction of the handshake, which the gateway passes on as it does every mimetype. Nothing else changes for anyone else:
+
+| Web client | molcajeted | Lossless images |
+| --- | --- | --- |
+| new | new | zstd images; PNG for photographs, images with transparency and the cursor |
+| new | older, or stock guacd | PNG (the daemon does not know the mimetype and ignores it) |
+| older, or stock guacamole-common-js, or the stock web application | new | PNG (the client does not announce the mimetype) |
+
+- The gateway needs no change and no new version for this: an older gateway relays the mimetype and the images, over the text and the binary tunnel alike. The web client ships with the gateway image, so in practice the client is upgraded by deploying the gateway, and a tab opened before that keeps PNG until it is reloaded.
+- molcajeted logs the mimetypes a client announced as `image` in `connection established`, and counts the images under `format="zstd"`.
+- `--image-zstd false` (`MOLCAJETED_IMAGE_ZSTD=false`) keeps every client of a daemon on PNG. A single session stays on PNG with `?png` in its URL.
+- molcajeted now links libzstd, which the `zstd-sys` crate compiles from its bundled source: building needs a C compiler, as it already did for `ring`.
+
 ## Observability options
 
 Everything is off by default and costs nothing unless enabled (metrics calls are no-ops without a recorder).
@@ -145,7 +160,7 @@ Everything is off by default and costs nothing unless enabled (metrics calls are
 | `--client-reports` | `MOLCAJETE_CLIENT_REPORTS` | gateway | Accepts browser performance reports (`POST /api/telemetry/client`) |
 | `RUST_LOG` | | both | Log level filter (default `info`) |
 
-The images default to `MOLCAJETE_LOG_FORMAT=json`. The gateway also reads `MOLCAJETE_CONFIG`, `MOLCAJETE_LISTEN` and `MOLCAJETE_STATIC_DIR`; molcajeted reads `MOLCAJETED_BIND_HOST`, `MOLCAJETED_BIND_PORT`, `MOLCAJETED_VIDEO` and `MOLCAJETED_FFMPEG`.
+The images default to `MOLCAJETE_LOG_FORMAT=json`. The gateway also reads `MOLCAJETE_CONFIG`, `MOLCAJETE_LISTEN` and `MOLCAJETE_STATIC_DIR`; molcajeted reads `MOLCAJETED_BIND_HOST`, `MOLCAJETED_BIND_PORT`, `MOLCAJETED_VIDEO`, `MOLCAJETED_FFMPEG` and `MOLCAJETED_IMAGE_ZSTD`.
 
 ### Profiling
 
@@ -177,7 +192,7 @@ remote server -> molcajeted: diff / scroll and move detection / PNG, JPEG, video
 | --- | --- | --- | --- |
 | `molcajeted_frame_flush_seconds` | histogram | protocol | CPU time to diff and encode one frame |
 | `molcajeted_flush_phase_seconds` | histogram | protocol, phase | Time per flush phase: `video`, `scroll`, `moves`, `pixels` (includes image encoding), `refine` |
-| `molcajeted_image_encode_seconds` | histogram | protocol, format | Encoding one image (`png`, `jpeg`) |
+| `molcajeted_image_encode_seconds` | histogram | protocol, format | Encoding one image (`png`, `jpeg`, `zstd`: the zstd image type, see below) |
 | `molcajeted_image_encoded_bytes` | histogram | protocol, format | Size of one encoded image: many small images cost the client a decode each |
 | `molcajeted_image_bytes_total`, `molcajeted_image_pixels_total` | counter | protocol, format | Encoded size and pixels processed (compression efficiency) |
 | `molcajeted_video_encode_seconds` | histogram | codec, key | Encoding one video frame (including the ffmpeg round trip) |
@@ -213,7 +228,7 @@ The page batches the client's once-per-second `stats` and posts them every 10 se
 | `molcajete_client_frame_lag_seconds` | From receiving a frame's `sync` to applying it and acknowledging: waiting for its images to decode and for the frames before it (average per second) |
 | `molcajete_client_frame_receive_seconds` | From a frame's first instruction to its `sync`: how long its data took to arrive and be parsed (average per second) |
 | `molcajete_client_frame_present_seconds` | From applying a frame to having drawn the canvas with it: the wait for the next animation frame plus the composite (average per second; no sample for a second without a drawn frame). The browser shows the canvas at a later display refresh, which is not included |
-| `molcajete_client_image_decode_seconds` | Decoding one image (average per second) |
+| `molcajete_client_image_decode_seconds` | Decoding one image (average per second). For PNG, JPEG and WebP: from handing the data to the browser's decoder to the decoded image, waiting included. For zstd images: the decode itself, which runs while the frame is drawn |
 | `molcajete_client_images_ops` | Images decoded per second |
 | `molcajete_client_rtt_seconds` | Tunnel ping round trip |
 | `molcajete_client_frames_fps` | Frames applied per second |
@@ -229,7 +244,7 @@ Main events of the JSON logs. In Loki, extract the fields with `| json`.
 | `tunnel established` / `tunnel closed` | gateway | `tunnel_id`, `connection`, `session`, `peer`, `guacd_id`, `handshake_ms`, `duration_s`, `bytes_to_browser`, `status` |
 | `client report` | gateway | `session`, `fps_avg`, `fps_min`, `frame_lag_ms_avg/max`, `frame_present_ms_avg/max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `display_width/height` |
 | `connection established` / `connection closed` | molcajeted | `id`, `protocol`, `peer`, `width`, `height`, `image`, `video`, `duration_s` |
-| `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `video_*` |
+| `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `flush_ms_avg/max`, `client_ack_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*`, `video_*` |
 | `video mode started` | molcajeted | `codec`, area, `kbps` |
 
 Keys to follow one session end to end:
@@ -279,7 +294,7 @@ histogram_quantile(0.99, sum by (le) (rate(molcajeted_socket_write_seconds_bucke
 | Symptom | Suspect | Next step |
 | --- | --- | --- |
 | High `frame_flush` p95 | Server CPU | Narrow down with `flush_phase`, then look at the molcajeted CPU flamegraph for that time range |
-| High `phase="pixels"` and `image_encode{format="png"}` | PNG encoding | Compare bytes per pixel with encoding time and tune the compression level or the JPEG conditions |
+| High `phase="pixels"` and `image_encode{format="png"}` | PNG encoding | Compare bytes per pixel with encoding time and tune the compression level or the JPEG conditions. A molcajete client should get `format="zstd"` for nearly all lossless images; if it gets PNG, check `image=` in `connection established` and `--image-zstd` |
 | `video_encode` above the frame interval (16 ms at best for RDP and VNC) | Video encoder | Compare codecs, and check whether a hardware encoder is available |
 | High `client_ack` but low `client_frame_lag` | Network or proxy | Check `client_rtt`, proxy buffering and `socket_write` waits |
 | High `client_frame_lag` and `client_queued_ops` | Browser decoding or GPU | Compare `mode=main` with `worker`, and profile with the browser's DevTools Performance panel |

@@ -13,6 +13,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { ZSTD_IMAGE, zstdImage } from "./zstd-image.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const web = path.join(root, "web/public");
@@ -446,6 +447,148 @@ await test("cursor instruction produces a CSS cursor", async () => {
   });
   if (!cursor.startsWith('url("data:image/png')) throw new Error(`cursor: ${cursor.slice(0, 40)}`);
   if (!cursor.includes(" 1 1")) throw new Error(`hotspot missing: ${cursor.slice(-30)}`);
+});
+
+// ---------------------------------------------------------------------------
+// zstd images (molcajete_protocol::zimage): decoded in wasm when their frame
+// is drawn, and uploaded from wasm memory.
+// ---------------------------------------------------------------------------
+
+const b64 = (buffer) => buffer.toString("base64");
+const GREEN = [0, 255, 0, 255];
+const solid = (color) => () => color.slice(0, 3);
+/** `img` + `blob`s (cut at `chunk` base64 characters) + `end`. */
+const zstdStream = (stream, mode, layer, x, y, image, chunk = 4096) => {
+  const data = b64(image);
+  const blobs = [];
+  for (let i = 0; i < data.length; i += chunk) blobs.push(["blob", stream, data.slice(i, i + chunk)]);
+  return [["img", stream, mode, layer, ZSTD_IMAGE, x, y], ...blobs, ["end", stream]];
+};
+/** Feeds instructions given as arrays and waits for the queue to drain. */
+const feedAll = (instructions) =>
+  page.evaluate(async (list) => {
+    feed(...list.map((i) => ins(...i)));
+    await settle();
+  }, instructions);
+
+await test("zstd image: indexed and RGB pixels are exact", async () => {
+  // 2, 3, 9 and 200 colours take 1, 2, 4 and 8 bits per index; the widths
+  // leave padding at the end of every row.
+  const shade = (n) => (x, y) => {
+    const c = (x * 7 + y * 13) % n;
+    return [c, 255 - c, (c * 31) & 0xff];
+  };
+  const many = (x, y) => [x * 9, y * 11, (x * y) & 0xff];
+  await feedAll([
+    ["size", 0, 128, 64],
+    ...zstdStream(1, 14, 0, 0, 0, zstdImage(9, 5, shade(2))),
+    ...zstdStream(2, 14, 0, 16, 0, zstdImage(7, 5, shade(3))),
+    ...zstdStream(3, 14, 0, 32, 0, zstdImage(13, 5, shade(9))),
+    ...zstdStream(4, 14, 0, 48, 0, zstdImage(33, 9, shade(200))),
+    // More than 256 colours: RGB, in several blobs.
+    ...zstdStream(5, 14, 0, 0, 16, zstdImage(28, 23, many), 100),
+    ["sync", 1],
+  ]);
+  const cases = [[0, 2, 9, 5], [16, 3, 7, 5], [32, 9, 13, 5], [48, 200, 33, 9]];
+  for (const [left, n, w, h] of cases) {
+    for (const [x, y] of [[0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1], [w >> 1, h >> 1]]) {
+      await expectPixel(`${n} colours at ${x},${y}`, `px(0, ${left + x}, ${y})`, [...shade(n)(x, y), 255], 0);
+    }
+  }
+  for (const [x, y] of [[0, 0], [27, 0], [0, 22], [27, 22], [13, 7]]) {
+    await expectPixel(`RGB at ${x},${y}`, `px(0, ${x}, ${16 + y})`, [...many(x, y), 255], 0);
+  }
+  await expectPixel("outside", () => px(0, 100, 40), CLEAR);
+});
+
+await test("zstd image through a clip and a transform", async () => {
+  await feedAll([
+    ["size", 0, 64, 64],
+    ["rect", 0, 0, 0, 64, 64], ["cfill", 14, 0, 0, 0, 255, 255],
+    ["push", 0],
+    ["rect", 0, 10, 10, 4, 4], ["clip", 0],
+    ...zstdStream(1, 14, 0, 8, 8, zstdImage(8, 8, solid(RED))),
+    ["pop", 0],
+    ["transform", 0, 1, 0, 0, 1, 20, 30],
+    ...zstdStream(2, 14, 0, 0, 0, zstdImage(8, 8, solid(GREEN))),
+    ["sync", 1],
+  ]);
+  await expectPixel("inside the clip", () => px(0, 11, 11), RED);
+  await expectPixel("image outside the clip", () => px(0, 9, 9), [0, 0, 255, 255]);
+  await expectPixel("translated image", () => px(0, 23, 33), GREEN);
+  await expectPixel("where it would be untranslated", () => px(0, 3, 3), [0, 0, 255, 255]);
+});
+
+await test("zstd image with SRC, ROVER and into a buffer", async () => {
+  await feedAll([
+    ["size", 0, 32, 32],
+    ["rect", 0, 0, 0, 32, 32], ["cfill", 14, 0, 255, 0, 0, 255],
+    // SRC replaces the whole layer: what the image does not cover is cleared.
+    ...zstdStream(1, 12, 0, 4, 4, zstdImage(4, 4, solid(GREEN))),
+    // ROVER draws behind what is there.
+    ["size", 1, 32, 32],
+    ["rect", 1, 0, 0, 8, 8], ["cfill", 14, 1, 255, 0, 0, 255],
+    ...zstdStream(2, 11, 1, 0, 0, zstdImage(16, 16, solid(GREEN))),
+    // A buffer grows to fit an image.
+    ...zstdStream(3, 12, -3, 0, 0, zstdImage(40, 24, solid([1, 2, 3]))),
+    ["sync", 1],
+  ]);
+  await expectPixel("SRC image", () => px(0, 5, 5), GREEN);
+  await expectPixel("SRC clears the rest", () => px(0, 20, 20), CLEAR);
+  await expectPixel("ROVER keeps what was drawn", () => px(1, 4, 4), RED);
+  await expectPixel("ROVER fills the rest", () => px(1, 12, 12), GREEN);
+  await expectPixel("ROVER outside the image", () => px(1, 20, 20), CLEAR);
+  await expectPixel("buffer", () => px(-3, 39, 23), [1, 2, 3, 255]);
+  const size = await page.evaluate(() => Array.from(client.debug_layer_size(-3)));
+  if (size.join() !== "40,24") throw new Error(`buffer size ${size}`);
+});
+
+await test("zstd, PNG and JPEG in one frame are drawn in order", async () => {
+  // The zstd images are ready as soon as they have arrived, the others
+  // only after their decoders: each must still cover what came before it.
+  const [red, white, blue] = await page.evaluate(async () => [
+    await pngBase64(16, 16, new Array(256).fill([255, 0, 0, 255]).flat()),
+    await pngBase64(8, 8, new Array(64).fill([255, 255, 255, 255]).flat()),
+    await jpegBase64(16, 16, "rgb(0, 0, 255)"),
+  ]);
+  await feedAll([
+    ["size", 0, 64, 64],
+    ["img", 1, 14, 0, "image/png", 0, 0], ["blob", 1, red], ["end", 1],
+    ...zstdStream(2, 14, 0, 8, 0, zstdImage(16, 16, solid(GREEN))),
+    ["img", 3, 14, 0, "image/jpeg", 16, 0], ["blob", 3, blue], ["end", 3],
+    ...zstdStream(4, 14, 0, 28, 0, zstdImage(8, 16, solid([255, 255, 0]))),
+    ["img", 5, 14, 0, "image/png", 30, 4], ["blob", 5, white], ["end", 5],
+    ["sync", 1],
+    // The next frame is complete at once, and must still come second.
+    ...zstdStream(6, 14, 0, 0, 8, zstdImage(4, 4, solid([9, 9, 9]))),
+    ["sync", 2],
+  ]);
+  await expectPixel("PNG", () => px(0, 2, 2), RED);
+  await expectPixel("zstd over PNG", () => px(0, 12, 2), GREEN);
+  await expectPixel("JPEG over zstd", () => px(0, 20, 2), [0, 0, 255, 255], 8);
+  await expectPixel("zstd over JPEG", () => px(0, 29, 2), [255, 255, 0, 255]);
+  await expectPixel("PNG over zstd", () => px(0, 32, 6), [255, 255, 255, 255]);
+  await expectPixel("second frame over the first", () => px(0, 2, 10), [9, 9, 9, 255]);
+  await expectPixel("first frame beside it", () => px(0, 6, 10), RED);
+});
+
+await test("damaged zstd image is skipped and does not hold its frame", async () => {
+  const good = zstdImage(8, 8, solid(GREEN));
+  const cut = good.subarray(0, good.length - 3);
+  const noise = Buffer.from(Array.from({ length: 64 }, (_, i) => (i * 37) & 0xff));
+  await feedAll([
+    ["size", 0, 32, 32],
+    ["rect", 0, 0, 0, 32, 32], ["cfill", 14, 0, 0, 0, 255, 255],
+    ...zstdStream(1, 14, 0, 0, 0, cut),
+    ...zstdStream(2, 14, 0, 8, 0, noise),
+    ...zstdStream(3, 14, 0, 16, 0, Buffer.alloc(0)),
+    ...zstdStream(4, 14, 0, 24, 0, good),
+    ["sync", 1],
+  ]);
+  const queued = await page.evaluate(() => client.debug_queued());
+  if (queued !== 0) throw new Error(`${queued} operations still queued`);
+  for (const x of [2, 10, 18]) await expectPixel(`damaged image at ${x}`, `px(0, ${x}, 2)`, [0, 0, 255, 255]);
+  await expectPixel("the image after them", () => px(0, 26, 2), GREEN);
 });
 
 await browser.close();

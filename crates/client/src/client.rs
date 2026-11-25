@@ -22,7 +22,7 @@ use web_sys::{
 };
 
 use crate::audio::{RawAudioPlayer, RawFormat};
-use crate::display::{DisplayEvent, DrawOp, ImageSlot, ImageState, Op};
+use crate::display::{DisplayEvent, DrawOp, ImageSlot, ImageState, Op, QueuedImage};
 use crate::geom::Rect;
 use crate::gl::CanvasTarget;
 use crate::input::{self, Composition, Keyboard, WheelAccumulator};
@@ -225,6 +225,8 @@ pub struct Inner {
     audio_forward: bool,
     /// Offer the binary tunnel subprotocol when connecting.
     binary_tunnel: bool,
+    /// Whether the zstd image type is announced to the server.
+    zstd_images: bool,
     scale_mode: ScaleMode,
     auto_resize: bool,
     pending_resize: Option<(u32, u32)>,
@@ -375,6 +377,7 @@ impl Inner {
                 audio: HashMap::new(),
                 audio_forward: false,
                 binary_tunnel: true,
+                zstd_images: true,
                 scale_mode: ScaleMode::Fit,
                 auto_resize: true,
                 pending_resize: None,
@@ -520,7 +523,15 @@ impl Inner {
             if base.contains('?') { '&' } else { '?' },
             String::from(js_sys::encode_uri_component(connection)),
         );
-        for image in ["image/png", "image/jpeg", "image/webp"] {
+        // The zstd type is ours: molcajeted sends it to no one else, and a
+        // stock guacd ignores what it does not know.
+        let zstd = self
+            .zstd_images
+            .then_some(molcajete_protocol::zimage::MIMETYPE);
+        for image in ["image/png", "image/jpeg", "image/webp"]
+            .into_iter()
+            .chain(zstd)
+        {
             url += &format!(
                 "&image={}",
                 String::from(js_sys::encode_uri_component(image))
@@ -667,6 +678,13 @@ impl Inner {
     /// the gateway. Applies to the next [`Inner::connect`].
     pub fn set_binary_tunnel(&mut self, enabled: bool) {
         self.binary_tunnel = enabled;
+    }
+
+    /// Whether to announce the zstd image type, which molcajeted then uses
+    /// for lossless updates instead of PNG. Applies to the next
+    /// [`Inner::tunnel_url`].
+    pub fn set_zstd_images(&mut self, enabled: bool) {
+        self.zstd_images = enabled;
     }
 
     /// The WebSocket subprotocol in use (empty when not connected).
@@ -1144,6 +1162,12 @@ impl Inner {
                 data,
                 slot,
             }) => {
+                if mimetype == molcajete_protocol::zimage::MIMETYPE {
+                    // Nothing to wait for: the frame decodes it when it is
+                    // drawn, in wasm.
+                    slot.finish(ImageState::Ready(QueuedImage::Zstd(data.into_vec())));
+                    return;
+                }
                 let (data, opaque) = data.into_image(&mimetype);
                 self.decode_image(data, opaque, &mimetype, slot);
             }
@@ -1239,7 +1263,7 @@ impl Inner {
         let started = scope::performance_now();
         wasm_bindgen_futures::spawn_local(async move {
             slot.finish(match crate::image::decode(data, mimetype, opaque).await {
-                Ok(image) => ImageState::Ready(image),
+                Ok(image) => ImageState::Ready(image.into()),
                 Err(err) => {
                     web_sys::console::warn_2(&"image decode failed".into(), &err);
                     ImageState::Failed

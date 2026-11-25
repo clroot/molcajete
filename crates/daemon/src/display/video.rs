@@ -488,7 +488,13 @@ mod tests {
 
     fn display_with_video() -> (Display, EncodeLog) {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut display = Display::new(ImageFormats { jpeg: true }, false);
+        let mut display = Display::new(
+            ImageFormats {
+                jpeg: true,
+                zstd: false,
+            },
+            false,
+        );
         let factory_log = log.clone();
         display.enable_video(
             vec![(VideoCodec::Av1, 300 * 300), (VideoCodec::H264, u64::MAX)],

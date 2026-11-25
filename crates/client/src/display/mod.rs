@@ -5,6 +5,10 @@
 //! been decoded. This mirrors `Guacamole.Display` and guarantees that the user
 //! never sees a half-drawn frame, while the actual pixel work happens on the
 //! GPU through [`crate::gl::Renderer`].
+//!
+//! Images of the zstd type (`molcajete_protocol::zimage`) need no decoder of
+//! the browser and nothing to wait for: they are queued as received and
+//! decoded when their frame is drawn.
 
 mod frames;
 pub mod path;
@@ -15,14 +19,35 @@ use std::collections::{HashMap, VecDeque};
 use molcajete_protocol::{CompositeMode, LineCap, LineJoin, TransferFunction};
 
 use crate::geom::{Affine, Rect};
-use crate::gl::{Clip, CompositeItem, CompositeNode, Paint, Readback, Renderer, Surface};
+use crate::gl::{
+    Clip, CompositeItem, CompositeNode, ImageSource, Paint, Readback, Renderer, Surface,
+};
 use crate::image::DecodedImage;
 use frames::Frames;
+use molcajete_protocol::zimage;
 use path::{Path, Shape};
 use present::Unpresented;
 
-pub type ImageState = frames::ImageState<DecodedImage>;
-pub type ImageSlot = frames::ImageSlot<DecodedImage>;
+/// An image a queued draw is ready to use.
+pub enum QueuedImage {
+    /// Decoded by the browser.
+    Decoded(DecodedImage),
+    /// A zstd image as it was received; decoded when it is drawn.
+    Zstd(Vec<u8>),
+}
+
+impl From<DecodedImage> for QueuedImage {
+    fn from(image: DecodedImage) -> Self {
+        Self::Decoded(image)
+    }
+}
+
+pub type ImageState = frames::ImageState<QueuedImage>;
+pub type ImageSlot = frames::ImageSlot<QueuedImage>;
+
+/// The pixel buffer of zstd images is given back after an image larger
+/// than this many bytes (4 megapixels), and otherwise kept for the next.
+const KEPT_PIXEL_BYTES: usize = 16 << 20;
 
 /// Drawing operations, already decoded from instructions.
 #[derive(Debug, Clone)]
@@ -391,6 +416,9 @@ pub struct Display {
     queued_syncs: usize,
     /// The images each queued frame still waits for.
     frames: Frames,
+    /// Decoder of zstd images and the pixels of the one being drawn.
+    zstd: zimage::Decoder,
+    pixels: Vec<u8>,
     width: u32,
     height: u32,
     cursor: SoftwareCursor,
@@ -434,6 +462,8 @@ impl Display {
             queue: VecDeque::new(),
             queued_syncs: 0,
             frames: Frames::default(),
+            zstd: zimage::Decoder::default(),
+            pixels: Vec::new(),
             width: 0,
             height: 0,
             cursor: SoftwareCursor::default(),
@@ -573,12 +603,16 @@ impl Display {
                         x,
                         y,
                         slot,
-                    } => {
-                        if let ImageState::Ready(image) = slot.take() {
-                            self.draw_image(layer, mode, x, y, &image);
+                    } => match slot.take() {
+                        ImageState::Ready(QueuedImage::Decoded(image)) => {
+                            self.draw_image(layer, mode, x, y, ImageSource::Decoded(&image));
                             image.close();
                         }
-                    }
+                        ImageState::Ready(QueuedImage::Zstd(data)) => {
+                            self.draw_zstd_image(layer, mode, x, y, &data);
+                        }
+                        ImageState::Pending | ImageState::Failed => {}
+                    },
                 }
             }
         }
@@ -995,16 +1029,36 @@ impl Display {
         }
     }
 
-    fn draw_image(
-        &mut self,
-        layer: i32,
-        mode: CompositeMode,
-        x: i32,
-        y: i32,
-        image: &DecodedImage,
-    ) {
+    /// Decodes a zstd image and draws it, all at once: the pixels go from
+    /// wasm memory into the texture.
+    fn draw_zstd_image(&mut self, layer: i32, mode: CompositeMode, x: i32, y: i32, data: &[u8]) {
+        let started = crate::scope::performance_now();
+        let mut pixels = std::mem::take(&mut self.pixels);
+        match self.zstd.decode(data, &mut pixels) {
+            Ok((width, height)) => {
+                self.stats
+                    .decode
+                    .add(crate::scope::performance_now() - started);
+                let image = ImageSource::Pixels {
+                    rgba: &pixels,
+                    width,
+                    height,
+                };
+                self.draw_image(layer, mode, x, y, image);
+            }
+            Err(err) => {
+                web_sys::console::warn_1(&format!("image decode failed: {err}").into());
+            }
+        }
+        if pixels.capacity() <= KEPT_PIXEL_BYTES {
+            self.pixels = pixels;
+        }
+    }
+
+    fn draw_image(&mut self, layer: i32, mode: CompositeMode, x: i32, y: i32, image: ImageSource) {
+        let (width, height) = image.size();
         self.touch(layer);
-        self.fit(layer, x, y, image.width as i32, image.height as i32);
+        self.fit(layer, x, y, width as i32, height as i32);
         let mode = self.layer(layer).resolve_mode(mode);
         let clip = self.prepare_clip(layer);
         let l = &self.layers[&layer];

@@ -143,6 +143,13 @@ mod wasm_api {
             self.run(|inner| inner.set_binary_tunnel(enabled));
         }
 
+        /// Whether to announce the zstd image type, which molcajeted then
+        /// sends instead of PNG (on by default; takes effect at the next
+        /// `tunnel_url`).
+        pub fn set_zstd_images(&self, enabled: bool) {
+            self.run(|inner| inner.set_zstd_images(enabled));
+        }
+
         /// The WebSocket subprotocol the gateway selected: `guacamole`
         /// (text) or `molcajete-binary-v1`. Empty before the tunnel is open.
         pub fn tunnel_protocol(&self) -> String {

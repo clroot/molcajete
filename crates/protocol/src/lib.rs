@@ -19,6 +19,7 @@ mod status;
 mod types;
 mod version;
 pub mod video;
+pub mod zimage;
 
 pub use instruction::{Instruction, InstructionBuilder, element_length, encode_element};
 pub use parser::{Limits, ParseError, Parser, RawInstruction, parse_all};

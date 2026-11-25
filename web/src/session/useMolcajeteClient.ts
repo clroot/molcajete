@@ -7,6 +7,8 @@ type Reporter = InstanceType<Awaited<ReturnType<typeof loadReporter>>['SessionRe
 const forceMainThread = new URLSearchParams(location.search).has('main');
 // `?text` keeps the tunnel on the Guacamole text protocol (base64 data).
 const forceTextTunnel = new URLSearchParams(location.search).has('text');
+// `?png` does not announce the zstd image type: lossless updates are PNG.
+const forcePngImages = new URLSearchParams(location.search).has('png');
 
 type Options = {
   displayRef: RefObject<HTMLDivElement | null>;
@@ -48,6 +50,7 @@ export function useMolcajeteClient({displayRef, connectionId, onEvent, onStartFa
         const client = await MolcajeteSession.create(displayRef.current!, {
           worker: forceMainThread ? false : undefined,
           binary: forceTextTunnel ? false : undefined,
+          zstd: forcePngImages ? false : undefined,
         });
         if (!isCurrent) {
           client.free();
