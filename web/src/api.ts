@@ -87,6 +87,16 @@ export type UserInput = Partial<Grants> & {
   groups?: string[];
 };
 
+/** How people can sign in (`GET /api/auth/providers`). */
+export type AuthProviders = {
+  passwordLogin: boolean;
+  /** Single sign-on through an OpenID Connect provider, when configured. */
+  oidc: {displayName: string} | null;
+};
+
+/** Where single sign-on starts; a page navigation, not a fetch. */
+export const OIDC_LOGIN_URL = 'api/auth/oidc/login';
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -127,10 +137,22 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 const id = (value: string) => encodeURIComponent(value);
 
+// The configuration does not change while the page is open.
+let providers: Promise<AuthProviders> | null = null;
+function authProviders(): Promise<AuthProviders> {
+  providers ??= request<AuthProviders>('GET', 'auth/providers').catch(err => {
+    providers = null;
+    throw err;
+  });
+  return providers;
+}
+
 export const api = {
   me: () => request<User>('GET', 'auth/me'),
   login: (username: string, password: string) => request<User>('POST', 'auth/login', {username, password}),
-  logout: () => request<void>('POST', 'auth/logout'),
+  /** `logoutUrl`: where to sign out at the identity provider too. */
+  logout: () => request<{logoutUrl?: string} | undefined>('POST', 'auth/logout'),
+  providers: authProviders,
   changePassword: (currentPassword: string, newPassword: string) =>
     request<void>('PUT', 'auth/password', {currentPassword, newPassword}),
 
