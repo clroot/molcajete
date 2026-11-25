@@ -9,6 +9,8 @@ import ConnectionsPage from './connections/ConnectionsPage';
 import UsersPage from './users/UsersPage';
 import GroupsPage from './groups/GroupsPage';
 import SessionPage from './session/SessionPage';
+import RecordingsPage from './recordings/RecordingsPage';
+import PlaybackPage from './recordings/PlaybackPage';
 
 type Auth = {status: 'checking'} | {status: 'signedOut'} | {status: 'signedIn'; user: User};
 
@@ -56,12 +58,17 @@ function SignedInApp({user, onSignOut}: {user: User; onSignOut: () => void}) {
   if (route.name === 'session') {
     return <SessionPage key={route.connectionId} connectionId={route.connectionId} />;
   }
+  if (route.name === 'playback' && user.isAdmin) {
+    return <PlaybackPage key={route.recordingId} recordingId={route.recordingId} />;
+  }
   return (
     <AppFrame user={user} route={route} onSignOut={onSignOut}>
       {route.name === 'users' && user.isAdmin ? (
         <UsersPage currentUser={user} />
       ) : route.name === 'groups' && user.isAdmin ? (
         <GroupsPage />
+      ) : route.name === 'recordings' && user.isAdmin ? (
+        <RecordingsPage />
       ) : (
         <ConnectionsPage user={user} />
       )}

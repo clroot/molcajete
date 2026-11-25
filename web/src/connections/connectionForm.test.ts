@@ -15,6 +15,7 @@ const rdp = {
   guacdHost: null,
   guacdPort: null,
   parameters: {hostname: '10.0.0.20', security: 'nla', 'color-depth': '16'},
+  attributes: {},
 };
 
 describe('connection form', () => {
@@ -75,6 +76,28 @@ describe('connection form', () => {
     });
     expect(toConnection({...form, guacdPort: 'x'})).toMatchObject({ok: false});
     expect(toConnection({...form, name: ' '})).toMatchObject({ok: false});
+  });
+
+  test('keeps recording choices as attributes, not parameters', () => {
+    const recorded = {...rdp, attributes: {'record-sessions': 'true', 'record-exclude-mouse': 'true'}};
+    const form = toConnectionForm(recorded);
+    expect(form.recording).toEqual({record: true, keys: false, mouse: false, molcajeteFormats: false});
+    expect(form.extras.map(e => e.name)).toEqual(['color-depth']);
+    expect(toConnection(form)).toEqual({ok: true, connection: recorded});
+    const keys = toConnection({...form, recording: {...form.recording, keys: true, mouse: true}});
+    expect(keys).toMatchObject({
+      ok: true,
+      connection: {
+        attributes: {'record-sessions': 'true', 'record-keys': 'true'},
+        parameters: rdp.parameters,
+      },
+    });
+    expect(emptyConnectionForm().recording).toEqual({
+      record: false,
+      keys: false,
+      mouse: true,
+      molcajeteFormats: false,
+    });
   });
 
   test('suggests URL-safe ids', () => {

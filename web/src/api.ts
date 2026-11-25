@@ -77,7 +77,37 @@ export type Connection = {
   parameters: Record<string, string>;
   /** Where a new connection goes; editing does not move it. */
   parentId?: string | null;
+  /** molcajete's own settings, never sent to guacd (see `ATTRIBUTES`). */
+  attributes?: Record<string, string>;
 };
+
+/** Connection attributes the gateway knows; flags are "true" or absent. */
+export const ATTRIBUTES = {
+  record: 'record-sessions',
+  recordKeys: 'record-keys',
+  recordExcludeMouse: 'record-exclude-mouse',
+  recordMolcajeteFormats: 'record-molcajete-formats',
+} as const;
+
+/** A recorded session (`/api/recordings`). */
+export type Recording = {
+  id: string;
+  connectionId: string;
+  connectionName: string;
+  protocol: string;
+  userId: string;
+  username: string;
+  fileName: string;
+  /** The recording holds the key presses of the session. */
+  includeKeys: boolean;
+  startedAt: number;
+  /** Null while the session is still being recorded. */
+  endedAt: number | null;
+  sizeBytes: number;
+};
+
+/** Optional features of the gateway (`/api/settings`). */
+export type GatewaySettings = {clientReports: boolean; recordings: boolean};
 
 export type UserInput = Partial<Grants> & {
   username?: string;
@@ -191,7 +221,19 @@ export const api = {
   updateGroup: (groupId: string, input: GroupInput) =>
     request<GroupDetail>('PUT', `groups/${id(groupId)}`, input),
   deleteGroup: (groupId: string) => request<void>('DELETE', `groups/${id(groupId)}`),
+
+  recordings: () => request<Recording[]>('GET', 'recordings'),
+  recording: (recordingId: string) => request<Recording>('GET', `recordings/${id(recordingId)}`),
+  deleteRecording: (recordingId: string) => request<void>('DELETE', `recordings/${id(recordingId)}`),
+
+  settings: () => request<GatewaySettings>('GET', 'settings'),
 };
+
+/** Where the file of a recording is served; `download` asks the browser to save it. */
+export function recordingFileUrl(recordingId: string, download = false): string {
+  const path = `api/recordings/${id(recordingId)}/file${download ? '?download=true' : ''}`;
+  return new URL(path, document.baseURI).href;
+}
 
 /** Connection managers and administrators manage connections and folders. */
 export function canManageConnections(user: User) {
