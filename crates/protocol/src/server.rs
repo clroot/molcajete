@@ -302,8 +302,19 @@ pub enum ServerInstruction<'a> {
         message: &'a str,
         status: Status,
     },
+    /// The link under the pointer in a terminal (molcajeted, SSH): its
+    /// target URL, or `None` when the pointer left it. Stock guacd never
+    /// sends it.
+    Link {
+        url: Option<&'a str>,
+    },
     Log {
         message: &'a str,
+    },
+    /// Whether the terminal has a selection (molcajeted, SSH). Sent as
+    /// `0` when a click cleared it; a new selection arrives as `clipboard`.
+    Selection {
+        active: bool,
     },
     /// Server-side mouse position (e.g. another user moving the cursor).
     Mouse {
@@ -634,7 +645,13 @@ impl<'a> ServerInstruction<'a> {
                 // A missing/invalid status is reported as a generic server error.
                 status: d.status(1).unwrap_or(Status::SERVER_ERROR),
             },
+            "link" => S::Link {
+                url: Some(d.s(0)).filter(|url| !url.is_empty()),
+            },
             "log" => S::Log { message: d.s(0) },
+            "selection" => S::Selection {
+                active: d.s(0) == "1",
+            },
             "mouse" => S::Mouse {
                 x: d.i32(0)?,
                 y: d.i32(1)?,
@@ -729,6 +746,27 @@ mod tests {
                 ServerInstruction::DisplayControl { available }
             );
         }
+    }
+
+    #[test]
+    fn links_and_selection() {
+        let ins = Instruction::new("link", ["https://example.com"]);
+        assert_eq!(
+            ServerInstruction::decode(&&ins).unwrap(),
+            ServerInstruction::Link {
+                url: Some("https://example.com")
+            }
+        );
+        let none = Instruction::new("link", Vec::<&str>::new());
+        assert_eq!(
+            ServerInstruction::decode(&&none).unwrap(),
+            ServerInstruction::Link { url: None }
+        );
+        let cleared = Instruction::new("selection", ["0"]);
+        assert_eq!(
+            ServerInstruction::decode(&&cleared).unwrap(),
+            ServerInstruction::Selection { active: false }
+        );
     }
 
     #[test]

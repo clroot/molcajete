@@ -151,6 +151,11 @@ impl Terminal {
         viewport_to_point(self.display_offset(), viewport)
     }
 
+    /// The link at a viewport cell, if any.
+    pub fn link_at(&self, col: usize, row: usize) -> Option<super::link::Link> {
+        super::link::link_at(&self.term, self.point(col, row))
+    }
+
     /// Starts a selection at a viewport cell. `side` tells which half of
     /// the cell the pointer is on.
     pub fn start_selection(&mut self, kind: SelectionType, col: usize, row: usize, side: Side) {

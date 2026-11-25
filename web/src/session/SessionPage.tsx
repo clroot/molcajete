@@ -17,7 +17,9 @@ import SessionMenu, {type ScaleMode} from './SessionMenu';
 import SessionMenuButton from './SessionMenuButton';
 import SessionGuide from './SessionGuide';
 import {readPreference, writePreference} from './storage';
-import {StatsPanel, UnstableNotice} from './SessionBadges';
+import {LinkStatus, StatsPanel, UnstableNotice} from './SessionBadges';
+import {hasLinks, isTerminal} from './terminal';
+import {useCopyFeedback} from './useCopyFeedback';
 
 const styles = stylex.create({
   display: {position: 'fixed', inset: 0, backgroundColor: 'black', overflow: 'hidden'},
@@ -41,14 +43,19 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
   const [scaleMode, setScaleMode] = useState<ScaleMode>('fit');
   const [showStats, setShowStats] = useState(false);
   const [hasSeenGuide, setHasSeenGuide] = useState(() => readPreference('sessionGuideSeen', false));
+  const [hasSeenTerminalGuide, setHasSeenTerminalGuide] = useState(() =>
+    readPreference('terminalGuideSeen', false),
+  );
+  const terminal = isTerminal(protocol);
+  const onCopyEvent = useCopyFeedback(terminal);
 
   const onEvent = useCallback(
     (event: SessionEvent) => {
       dispatch(event);
       // Copies on the remote side land in the local clipboard as well.
-      if (event.type === 'clipboard') navigator.clipboard?.writeText(event.detail).catch(() => {});
+      onCopyEvent(event);
     },
-    [dispatch],
+    [dispatch, onCopyEvent],
   );
   const onStartFailed = useCallback(
     (detail: string) => dispatch({type: 'failed', title: 'The client could not start', detail}),
@@ -79,6 +86,10 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
     if (mode) client()?.set_auto_resize(followsWindow);
   }, [mode, client, followsWindow]);
 
+  useEffect(() => {
+    if (mode) client()?.set_terminal_shortcuts(terminal);
+  }, [mode, client, terminal]);
+
   const reconnect = () => {
     dispatch({type: 'reconnecting'});
     connect();
@@ -99,8 +110,14 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
   const dismissGuide = () => {
     setHasSeenGuide(true);
     writePreference('sessionGuideSeen', true);
+    if (terminal) {
+      setHasSeenTerminalGuide(true);
+      writePreference('terminalGuideSeen', true);
+    }
     client()?.focus();
   };
+  // Shown once, and once more for the first terminal after that.
+  const isGuideDue = !hasSeenGuide || (terminal && !hasSeenTerminalGuide);
 
   const {status} = session;
   const isConnected = status.kind === 'connected';
@@ -118,10 +135,11 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
       )}
       {status.kind === 'connected' && session.isUnstable && <UnstableNotice />}
       {showStats && session.stats && <StatsPanel stats={session.stats} mode={mode ?? '?'} />}
+      {isConnected && terminal && session.link && <LinkStatus url={session.link} />}
 
       {isConnected && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
-      {isConnected && !hasSeenGuide && !session.required && !isMenuOpen && (
-        <SessionGuide onDismiss={dismissGuide} />
+      {isConnected && isGuideDue && !session.required && !isMenuOpen && (
+        <SessionGuide terminal={terminal ? {hasLinks: hasLinks(protocol)} : null} onDismiss={dismissGuide} />
       )}
 
       {session.required && (
@@ -141,6 +159,7 @@ export default function SessionPage({connectionId}: {connectionId: string}) {
         isOpen={isMenuOpen}
         onOpenChange={setMenuOpen}
         connectionName={connectionName}
+        isTerminal={terminal}
         clipboard={session.clipboard}
         onClipboardChange={text => {
           dispatch({type: 'clipboard', detail: text});

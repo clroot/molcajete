@@ -175,6 +175,11 @@ mod wasm_api {
             self.run(|inner| inner.send_clipboard(text));
         }
 
+        /// Pastes text into a terminal (sends it, then Ctrl+Shift+V).
+        pub fn paste_text(&self, text: &str) {
+            self.run(|inner| inner.paste_text(text));
+        }
+
         /// Provides a value requested by the server via `required`.
         pub fn send_argv(&self, name: &str, value: &str) {
             self.run(|inner| inner.send_argv(name, value));

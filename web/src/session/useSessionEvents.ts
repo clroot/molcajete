@@ -17,6 +17,8 @@ export type SessionState = {
   stats: SessionStats | null;
   /** False once the server said it cannot change the remote display during the session. */
   canChangeDisplay: boolean;
+  /** Target of the link under the pointer in a terminal. */
+  link: string | null;
 };
 
 type Action =
@@ -32,6 +34,7 @@ const initialState: SessionState = {
   isUnstable: false,
   stats: null,
   canChangeDisplay: true,
+  link: null,
 };
 
 export function reduce(state: SessionState, action: Action): SessionState {
@@ -39,7 +42,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
     case 'state':
       // A new connection may reach a different server.
       if (action.detail === 'connecting')
-        return {...state, status: {kind: 'connecting'}, canChangeDisplay: true};
+        return {...state, status: {kind: 'connecting'}, canChangeDisplay: true, link: null};
       if (action.detail === 'waiting') return {...state, status: {kind: 'connecting'}};
       if (action.detail === 'connected') return {...state, status: {kind: 'connected'}};
       // Keep the error that caused the disconnect on screen.
@@ -70,6 +73,8 @@ export function reduce(state: SessionState, action: Action): SessionState {
       return {...state, stats: action.detail};
     case 'display-control':
       return {...state, canChangeDisplay: action.detail};
+    case 'link':
+      return {...state, link: action.detail};
     case 'reconnecting':
       return {...state, status: {kind: 'connecting'}, required: null};
     case 'name':

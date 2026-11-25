@@ -175,6 +175,16 @@ molcajeted asks in every `sync` how long the client took to apply the frame, and
 - The gateway needs no change: an older gateway relays the extra arguments over the text and the binary tunnel alike. As with the other client changes, a tab opened before the gateway (and with it the web client) was upgraded keeps the old pacing until it is reloaded.
 - `molcajeted_client_apply_seconds` records the reported times; it stays empty for sessions of clients that do not report them. `molcajeted_unacked_frames` must stay within the window (3 for RDP and VNC, 2 for SSH).
 
+### Terminal copy, paste and links and mixed versions
+
+The terminal shortcuts ([architecture.md](architecture.md), section 2.10) live in the web client; links and the cleared selection come from molcajeted.
+
+| Web client | Daemon | Result |
+| --- | --- | --- |
+| new | new molcajeted (SSH) | everything: copy and paste shortcuts, toasts, links |
+| new | stock guacd (SSH, telnet, Kubernetes) | copy and paste shortcuts and toasts; no links; after a click clears the selection, the copy shortcut still copies the previous selection |
+| older | new molcajeted | as before; the underline and the hand pointer show, but links cannot be opened |
+
 ## Observability options
 
 Everything is off by default and costs nothing unless enabled (metrics calls are no-ops without a recorder).
