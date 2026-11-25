@@ -41,7 +41,9 @@ mod wasm_api {
     /// Events are delivered to the handler installed with
     /// [`MolcajeteClient::set_event_handler`] as `(type, detail)`:
     /// `state`, `error`, `name`, `clipboard`, `resize`, `required`,
-    /// `unstable`, `stats`, `msg`, `focus`.
+    /// `unstable`, `stats`, `msg`, `focus`; for files `filesystem`,
+    /// `undefine`, `get-error`, `stream-start`, `stream-data`,
+    /// `stream-end` and `stream-ack`.
     #[wasm_bindgen]
     pub struct MolcajeteClient {
         inner: Shared,
@@ -189,6 +191,37 @@ mod wasm_api {
 
         pub fn send_key(&self, keysym: u32, pressed: bool) {
             self.run(|inner| inner.send_key(keysym, pressed));
+        }
+
+        /// Asks the filesystem object `object` (announced by a `filesystem`
+        /// event) for a directory listing or a file at `name`. The answer
+        /// arrives as a stream (`stream-start`) or a `get-error` event.
+        pub fn get(&self, object: i32, name: &str) {
+            self.run(|inner| inner.get(object, name));
+        }
+
+        /// Acknowledges an incoming file stream (`stream-start`, then each
+        /// `stream-data`); an error `code` stops it.
+        pub fn ack_stream(&self, stream: i32, message: &str, code: u16) {
+            self.run(|inner| inner.ack_stream(stream, message, code));
+        }
+
+        /// Opens an upload into `object` at the path `name`, or with a
+        /// negative `object` into the server's upload directory. Returns the
+        /// stream (-1 if none is free); the server acknowledges it and each
+        /// blob with `stream-ack` events.
+        pub fn open_upload(&self, object: i32, mimetype: &str, name: &str) -> i32 {
+            let mut stream = -1;
+            self.run(|inner| stream = inner.open_upload(object, mimetype, name));
+            stream
+        }
+
+        pub fn upload_blob(&self, stream: i32, data: &[u8]) {
+            self.run(|inner| inner.upload_blob(stream, data));
+        }
+
+        pub fn end_upload(&self, stream: i32) {
+            self.run(|inner| inner.end_upload(stream));
         }
 
         /// Presses and releases Ctrl+Alt+Delete.

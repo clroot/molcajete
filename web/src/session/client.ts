@@ -45,7 +45,40 @@ export type SessionEvent =
   /** The copy shortcut wrote the selection to the local clipboard, or could not. */
   | {type: 'copy'; detail: {ok: boolean}}
   /** Whether an audio stream is open while the browser holds its sound back until a click or key press. */
-  | {type: 'audio'; detail: {blocked: boolean}};
+  | {type: 'audio'; detail: {blocked: boolean}}
+  /** A filesystem the server exposes for file transfer (SFTP, the RDP drive). */
+  | {type: 'filesystem'; detail: Filesystem}
+  | {type: 'filesystem-removed'; detail: {object: number}}
+  /** Progress of an upload or a download. */
+  | {type: 'transfer'; detail: Transfer};
+
+export type Filesystem = {
+  object: number;
+  name: string;
+  /** False when the connection does not allow it; stock guacd does not say, and may refuse later. */
+  canDownload: boolean;
+  canUpload: boolean;
+};
+
+export type FileEntry = {
+  /** Path inside the filesystem, from `/`. */
+  path: string;
+  name: string;
+  type: 'directory' | 'file';
+  /** Bytes, when the server says (molcajeted). */
+  size: number | null;
+};
+
+export type Transfer = {
+  id: string;
+  direction: 'upload' | 'download';
+  name: string;
+  path: string;
+  state: 'active' | 'done' | 'failed' | 'cancelled';
+  bytes: number;
+  total: number | null;
+  error?: string;
+};
 
 export interface MolcajeteSession {
   readonly mode: 'worker' | 'main';
@@ -65,6 +98,17 @@ export interface MolcajeteSession {
   /** The remote host's IME composes text; keys are sent as pressed. */
   set_remote_composition(enabled: boolean): void;
   release_keys(): void;
+  /** Lists a directory of a filesystem (from a `filesystem` event). */
+  list(object: number, path: string): Promise<FileEntry[]>;
+  /** Uploads into a filesystem at `path`, or without them into the server's upload directory. Returns the transfer id. */
+  upload(file: File, target?: {object?: number; path?: string}): string;
+  /** Downloads a file; call it from the click. Resolves to the transfer id, or null when the save dialog was cancelled. */
+  download(
+    object: number,
+    path: string,
+    options?: {name?: string; size?: number | null},
+  ): Promise<string | null>;
+  cancel_transfer(id: string): void;
   /** Controls the player of a client created with `playback: true` (public/molcajete-player.js). */
   playback(command: 'load', url: string): void;
   playback(command: 'seek', time: number): void;
@@ -89,6 +133,9 @@ export type PlaybackStatus =
 
 type ClientModule = {
   MolcajeteSession: {
+    /** `file`: written to disk as it arrives; `blob`: collected in memory first. */
+    readonly downloadMethod: 'file' | 'blob';
+    readonly BLOB_WARNING_BYTES: number;
     create(
       container: HTMLElement,
       options?: {
