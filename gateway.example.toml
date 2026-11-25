@@ -33,8 +33,9 @@ port = 4822
 username = "admin"
 password = "change-me"
 
-# Single sign-on through an OpenID Connect provider (docs/deployment.md,
-# "Single sign-on"). docker/keycloak/ has a test realm for it.
+# Single sign-on through an OpenID Connect provider (docs/administration.md,
+# "Single sign-on"; every key in docs/deployment.md, "[oidc]").
+# docker/keycloak/ has a test realm for it.
 # [oidc]
 # issuer = "https://sso.example.com/realms/example"
 # client_id = "molcajete"
