@@ -227,6 +227,12 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Whether text from the browser's clipboard reaches the server. A
+    /// read-only connection takes nothing from the browser, as in guacd.
+    pub fn accepts_paste(&self) -> bool {
+        !self.read_only && !self.disable_paste
+    }
+
     pub fn parse(params: &impl ParamSource, info: &ClientInfo) -> Result<Self, SettingsError> {
         let security = match params
             .value("security")
@@ -453,6 +459,8 @@ mod tests {
         assert_eq!(s.domain.as_deref(), Some("CORP"));
         assert_eq!(s.security, Security::Nla);
         assert!(s.ignore_cert && s.read_only);
+        // Read-only takes no clipboard from the browser either.
+        assert!(!s.accepts_paste());
         assert_eq!((s.width, s.height), (1920, 1080));
         assert_eq!(s.desktop_scale_factor(), 200);
         assert_eq!(s.device_scale_factor(), 180);
