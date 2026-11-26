@@ -86,6 +86,17 @@ pub(super) const FPS: u32 = 30;
 const H264_BITS_PER_PIXEL: f32 = 0.1;
 const MIN_BITRATE_KBPS: u32 = 300;
 const MAX_BITRATE_KBPS: u32 = 16_000;
+/// Frames after which a video looks at how many of them its encoder left
+/// out to hold the bitrate.
+const SKIP_WINDOW: u32 = 30;
+/// Share of skipped frames (one in this many) from which the bitrate is
+/// raised: content that costs more than the area's bitrate allows (noise, a
+/// terminal repainting colours) otherwise plays at a fraction of its frame
+/// rate.
+const SKIPPED_SHARE: u32 = 4;
+/// The bitrate is doubled at most this many times, to 8 times what the
+/// area's size asks for (and never beyond [`MAX_BITRATE_KBPS`]).
+const MAX_RAISES: u32 = 3;
 
 // Encoders and the factory sit in a `Mutex` only to make `Display` `Sync`
 // (sessions hold `&Display` across awaits); access is always through
@@ -137,9 +148,34 @@ pub(super) struct ActiveVideo {
     settled: u32,
     frames: u64,
     bytes: usize,
+    /// How the encoder is set up (the bitrate as raised so far).
+    config: EncoderConfig,
+    /// Times the bitrate was doubled.
+    raises: u32,
+    /// Frames given to the encoder since the bitrate was last looked at,
+    /// and those of them it left out.
+    encoded: u32,
+    skipped: u32,
+    /// The next frame starts the stream anew.
+    key_next: bool,
 }
 
 impl ActiveVideo {
+    /// Counts a frame the encoder took (`skipped`: and left out); returns
+    /// whether the bitrate should be raised, which is looked at once every
+    /// [`SKIP_WINDOW`] frames.
+    fn starved(&mut self, skipped: bool) -> bool {
+        self.encoded += 1;
+        self.skipped += u32::from(skipped);
+        if self.encoded < SKIP_WINDOW {
+            return false;
+        }
+        let starved = self.skipped * SKIPPED_SHARE >= self.encoded;
+        self.encoded = 0;
+        self.skipped = 0;
+        starved && self.raises < MAX_RAISES && self.config.bitrate_kbps < MAX_BITRATE_KBPS
+    }
+
     /// Records the busy area `candidate` of this frame; returns the area
     /// the video should be restarted over, if it should.
     ///
@@ -466,6 +502,11 @@ impl Display {
             settled: 0,
             frames: 0,
             bytes: 0,
+            config,
+            raises: 0,
+            encoded: 0,
+            skipped: 0,
+            key_next: false,
         });
         self.video_frame(now, true, out)
     }
@@ -522,6 +563,8 @@ impl Display {
         };
         #[cfg(not(test))]
         let changed = self.changed_tiles(&mut video);
+        let key = key || video.key_next;
+        video.key_next = false;
         self.video = Some(video);
         if changed.is_empty() && !key {
             return FlushStats::default();
@@ -545,8 +588,14 @@ impl Display {
             }
         };
         video.last_change = now;
+        let starved = video.starved(encoded.data.is_empty());
         if encoded.data.is_empty() {
-            // The encoder buffers this frame; it comes out with a later one.
+            // The encoder left this frame out to hold its bitrate; what it
+            // shows comes with the next one.
+            self.metrics.video_frame_skipped(codec);
+            if starved {
+                self.raise_bitrate(out);
+            }
             return FlushStats::default();
         }
         let timestamp = now.duration_since(video.started).as_millis() as u32;
@@ -557,12 +606,61 @@ impl Display {
         self.metrics
             .video_frame(codec, encoded.key, encode_time, framed.len());
         out.blob(VIDEO_STREAM, &framed);
+        if starved {
+            self.raise_bitrate(out);
+        }
         FlushStats {
             images: 1,
             bytes: framed.len(),
             pixels: rect.area(),
             ..FlushStats::default()
         }
+    }
+
+    /// Doubles the bitrate of the video, whose encoder leaves out too many
+    /// frames at the present one: the stream ends and a new one starts on
+    /// the same layer, with a new encoder and a key frame. The layer keeps
+    /// what it shows meanwhile.
+    fn raise_bitrate(&mut self, out: &mut Output) {
+        let (Some(video), Some(support)) = (&mut self.video, &mut self.video_support) else {
+            return;
+        };
+        // Whatever comes of it, this was one of the attempts.
+        video.raises += 1;
+        let config = EncoderConfig {
+            bitrate_kbps: (video.config.bitrate_kbps * 2).min(MAX_BITRATE_KBPS),
+            ..video.config.clone()
+        };
+        let factory = support.factory.get_mut().unwrap_or_else(|e| e.into_inner());
+        let encoder = match factory(&config) {
+            Ok(encoder) => encoder,
+            Err(err) => {
+                // The video goes on as it is.
+                debug!(error = %err, kbps = config.bitrate_kbps, "no encoder for a higher bitrate");
+                return;
+            }
+        };
+        info!(
+            codec = ?config.codec,
+            width = config.width,
+            height = config.height,
+            kbps = config.bitrate_kbps,
+            "video bitrate raised"
+        );
+        metrics::counter!(
+            "molcajeted_video_bitrate_raises_total",
+            "codec" => super::metrics::codec_label(config.codec),
+        )
+        .increment(1);
+        *out += &InstructionBuilder::new("end").arg(VIDEO_STREAM).finish();
+        *out += &InstructionBuilder::new("video")
+            .arg(VIDEO_STREAM)
+            .arg(VIDEO_LAYER)
+            .str_arg(config.codec.mimetype())
+            .finish();
+        video.encoder = Mutex::new(encoder);
+        video.config = config;
+        video.key_next = true;
     }
 
     /// Brings `video.frame` up to date with the framebuffer and returns the
@@ -756,6 +854,163 @@ mod tests {
                 key: force_key,
             })
         }
+    }
+
+    /// Leaves out every frame whose index is in `skip`, as an encoder
+    /// holding its bitrate does.
+    struct SkippingEncoder {
+        skip: Vec<u32>,
+        frames: u32,
+    }
+
+    impl VideoEncoder for SkippingEncoder {
+        fn codec(&self) -> VideoCodec {
+            VideoCodec::H264
+        }
+
+        fn encode(&mut self, rgba: &[u8], force_key: bool) -> Result<EncodedFrame, VideoError> {
+            let index = self.frames;
+            self.frames += 1;
+            let data = if self.skip.contains(&index) {
+                Vec::new()
+            } else {
+                vec![0, 0, 0, 1, 0x65, rgba[0]]
+            };
+            Ok(EncodedFrame {
+                data,
+                key: force_key,
+            })
+        }
+    }
+
+    #[test]
+    fn a_frame_the_encoder_skips_is_left_out_and_the_video_goes_on() {
+        let mut display = Display::new(
+            ImageFormats {
+                jpeg: true,
+                zstd: false,
+            },
+            false,
+        );
+        display.enable_video(
+            vec![(VideoCodec::H264, u64::MAX)],
+            Box::new(|_| {
+                Ok(Box::new(SkippingEncoder {
+                    skip: vec![2, 3, 6],
+                    frames: 0,
+                }))
+            }),
+        );
+        let mut out = Output::text();
+        display.resize(640, 480, &mut out);
+        display.flush(&mut out);
+        let (mut starts, mut blobs, mut silent) = (0, 0, 0);
+        for frame in 0..40u32 {
+            let mut out = Output::text();
+            display.put(100, 70, 300, 200, &noise(frame, 300, 200));
+            display.flush(&mut out);
+            starts += u32::from(out.contains("5.video"));
+            assert!(!out.contains("3.end,3.101;"), "frame {frame}: {out}");
+            if starts > 0 {
+                // Nothing else is sent for the area of a skipped frame.
+                assert!(!out.contains("3.img"), "frame {frame}: {out}");
+                blobs += u32::from(out.contains("4.blob,3.101,"));
+                silent += u32::from(!out.contains("4.blob,3.101,"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(starts, 1);
+        assert_eq!(silent, 3);
+        assert!(blobs > 10, "video frames: {blobs}");
+        assert!(display.video.is_some());
+        assert_eq!(display.video_support.as_ref().unwrap().failures, 0);
+    }
+
+    /// Leaves out every other frame while its bitrate is below `enough`.
+    struct StarvedEncoder {
+        config: EncoderConfig,
+        enough: u32,
+        frames: u32,
+    }
+
+    impl VideoEncoder for StarvedEncoder {
+        fn codec(&self) -> VideoCodec {
+            self.config.codec
+        }
+
+        fn encode(&mut self, rgba: &[u8], force_key: bool) -> Result<EncodedFrame, VideoError> {
+            self.frames += 1;
+            let key = force_key || self.frames == 1;
+            let skip = self.config.bitrate_kbps < self.enough && self.frames.is_multiple_of(2);
+            Ok(EncodedFrame {
+                data: if skip {
+                    Vec::new()
+                } else {
+                    vec![0, 0, 0, 1, 0x65, rgba[0]]
+                },
+                key: key && !skip,
+            })
+        }
+    }
+
+    /// Plays 150 busy frames through an encoder that needs `enough` kbps;
+    /// returns the bitrates it was created with and what was sent.
+    fn play_starved(enough: u32) -> (Vec<u32>, String) {
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let mut display = Display::new(
+            ImageFormats {
+                jpeg: true,
+                zstd: false,
+            },
+            false,
+        );
+        let log = created.clone();
+        display.enable_video(
+            vec![(VideoCodec::H264, u64::MAX)],
+            Box::new(move |config| {
+                log.lock().unwrap().push(config.bitrate_kbps);
+                Ok(Box::new(StarvedEncoder {
+                    config: config.clone(),
+                    enough,
+                    frames: 0,
+                }))
+            }),
+        );
+        let mut out = Output::text();
+        display.resize(640, 480, &mut out);
+        display.flush(&mut out);
+        let mut sent = String::new();
+        for frame in 0..150u32 {
+            let mut out = Output::text();
+            display.put(100, 70, 300, 200, &noise(frame, 300, 200));
+            display.flush(&mut out);
+            sent += &out.to_string();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(display.video.is_some());
+        assert_eq!(display.video_support.as_ref().unwrap().failures, 0);
+        let created = created.lock().unwrap().clone();
+        (created, sent)
+    }
+
+    #[test]
+    fn the_bitrate_is_raised_while_the_encoder_skips_many_frames() {
+        // 384×256 asks for the smallest bitrate.
+        let (created, sent) = play_starved(1000);
+        assert_eq!(created, [300, 600, 1200]);
+        // Each time the stream starts anew on the layer, which stays.
+        assert_eq!(sent.matches("5.video,3.101,1.1,").count(), 3, "{sent}");
+        assert_eq!(sent.matches("3.end,3.101;").count(), 2);
+        assert!(!sent.contains("7.dispose"));
+        // The area never goes back to images in between.
+        let video = &sent[sent.find("5.video").expect("a video")..];
+        assert!(!video.contains("3.img"));
+    }
+
+    #[test]
+    fn the_bitrate_is_raised_only_so_far() {
+        let (created, _) = play_starved(u32::MAX);
+        assert_eq!(created, [300, 600, 1200, 2400]);
     }
 
     fn display_with_video() -> (Display, EncodeLog) {
@@ -1113,6 +1368,11 @@ mod tests {
             rect,
             width: config.width,
             height: config.height,
+            config: config.clone(),
+            raises: 0,
+            encoded: 0,
+            skipped: 0,
+            key_next: false,
             encoder: Mutex::new(Box::new(FakeEncoder {
                 log: EncodeLog::default(),
                 config,

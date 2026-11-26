@@ -58,7 +58,8 @@ pub struct EncoderConfig {
 pub struct EncodedFrame {
     /// One access unit (H.264/H.265 Annex B incl. start codes) or one AV1
     /// temporal unit (low-overhead OBUs). Key frames carry the codec
-    /// configuration in-band.
+    /// configuration in-band. Empty when the encoder left the frame out to
+    /// hold its bitrate: the stream goes on with the next frame.
     pub data: Vec<u8>,
     pub key: bool,
 }
