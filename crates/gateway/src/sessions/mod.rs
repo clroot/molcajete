@@ -25,10 +25,18 @@
 //! whose session it joined and how. Ending a session ([`Registry::end`])
 //! ends everyone who joined it; so does the owner's tunnel closing, and
 //! revoking a link ends those who joined through it.
+//!
+//! # Recording on demand
+//!
+//! An owner's session has a [`record::Slot`] for recordings started from
+//! its session menu: [`record`] joins the session with a connection of its
+//! own that writes the recording, and the owner's tunnel adds their mouse
+//! and keys to it while one runs.
 
 pub mod api;
 pub mod history;
 pub mod policy;
+pub mod record;
 pub mod share;
 
 use std::collections::HashMap;
@@ -43,6 +51,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::db::now_millis;
+use crate::guacd::ClientInfo;
 
 /// Why a session was ended by someone other than its user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -119,6 +128,9 @@ pub struct SessionStart {
     pub page_id: Option<String>,
     /// Set for a session that joined another one.
     pub joined: Option<Joined>,
+    /// What the browser announced in the handshake, which a recorder
+    /// joining the session announces too ([`record`]).
+    pub client: ClientInfo,
 }
 
 /// How a session joined another (its owner's).
@@ -167,7 +179,13 @@ pub struct LiveSession {
     pub bytes_to_guacd: u64,
     /// The latest round trip the page reported (client reports only).
     pub rtt_ms: Option<u64>,
+    /// The recording of *Record sessions*, which lasts the whole session.
     pub recording_id: Option<String>,
+    /// The session is being recorded right now, by *Record sessions* or
+    /// from its session menu.
+    pub recording: bool,
+    /// Every recording of the session so far, oldest first.
+    pub recording_ids: Vec<String>,
     pub guacd_id: String,
     #[serde(skip)]
     pub guacd: (String, u16),
@@ -180,6 +198,8 @@ pub struct LiveSession {
     pub read_only: bool,
     #[serde(skip)]
     pub joined: Option<Joined>,
+    #[serde(skip)]
+    pub client: ClientInfo,
 }
 
 fn as_string<S: serde::Serializer>(id: &Uuid, serializer: S) -> Result<S::Ok, S::Error> {
@@ -211,12 +231,14 @@ struct Entry {
     traffic: Arc<Traffic>,
     rtt_ms: AtomicU64,
     end: watch::Sender<Option<Ending>>,
+    recording: Arc<record::Slot>,
 }
 
 impl Entry {
     fn snapshot(&self, id: Uuid) -> LiveSession {
         let s = &self.start;
         let rtt = self.rtt_ms.load(Ordering::Relaxed);
+        let on_demand = self.recording.recordings();
         LiveSession {
             id,
             user_id: s.user_id.clone(),
@@ -230,12 +252,15 @@ impl Entry {
             bytes_to_guacd: self.traffic.to_guacd.load(Ordering::Relaxed),
             rtt_ms: (rtt != NO_RTT).then_some(rtt),
             recording_id: s.recording_id.clone(),
+            recording: s.recording_id.is_some() || self.recording.current().is_some(),
+            recording_ids: s.recording_id.iter().cloned().chain(on_demand).collect(),
             guacd_id: s.guacd_id.clone(),
             guacd: s.guacd.clone(),
             joined_to: s.joined.map(|j| j.owner),
             join_kind: s.joined.map(|j| j.via.as_str()),
             read_only: s.joined.is_some_and(|j| j.read_only),
             joined: s.joined,
+            client: s.client.clone(),
         }
     }
 
@@ -309,6 +334,7 @@ impl Registry {
             traffic: Arc::default(),
             rtt_ms: AtomicU64::new(NO_RTT),
             end,
+            recording: Arc::default(),
         });
         let owner = entry.start.joined.map(|j| j.owner);
         self.map().insert(id, entry.clone());
@@ -467,6 +493,11 @@ impl Registry {
         true
     }
 
+    /// Where recordings of session `id` started from its menu are kept.
+    pub fn recording_slot(&self, id: Uuid) -> Option<Arc<record::Slot>> {
+        self.map().get(&id).map(|entry| entry.recording.clone())
+    }
+
     /// Records the round trip the page of tunnel `id` measured.
     pub fn set_rtt(&self, id: Uuid, rtt_ms: f64) {
         if let Some(entry) = self.map().get(&id)
@@ -520,12 +551,19 @@ impl Registration {
     pub fn start(&self) -> &SessionStart {
         &self.entry.start
     }
+
+    /// The recording started from the session menu, if one runs: the
+    /// owner's tunnel adds their input to it.
+    pub fn recording(&self) -> &record::Slot {
+        &self.entry.recording
+    }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
         self.registry.map().remove(&self.id);
         if self.entry.start.joined.is_none() {
+            self.entry.recording.stop(record::Stop::SessionEnded);
             // Whoever joined leaves with the owner (stock guacd would keep
             // them), and nobody can join any more.
             let id = self.id;
@@ -553,6 +591,7 @@ mod tests {
             recording_id: None,
             page_id: None,
             joined: None,
+            client: ClientInfo::default(),
         }
     }
 

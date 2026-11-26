@@ -33,6 +33,7 @@ pub async fn record(db: &Database, registration: &Registration, status: Status) 
         bytes_to_browser: traffic.to_browser.load(Ordering::Relaxed) as i64,
         bytes_to_guacd: traffic.to_guacd.load(Ordering::Relaxed) as i64,
         recording_id: start.recording_id.clone(),
+        recording_ids: Vec::new(),
     };
     if let Err(err) = db.insert_history_entry(&entry).await {
         metrics::counter!("molcajete_gateway_history_write_failures_total").increment(1);

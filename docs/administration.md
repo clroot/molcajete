@@ -258,7 +258,7 @@ How the flow is secured: the ID token's signature, issuer, audience, expiry, non
 
 ## Session recordings
 
-The gateway can write every session of a connection to a file, whichever daemon serves it, stock guacd or molcajeted. Administrators play the recordings back in the browser, download them, or turn them into video with Guacamole's `guacenc`.
+The gateway can write every session of a connection to a file, whichever daemon serves it, stock guacd or molcajeted, or let the user of a session record parts of it from the session menu. Administrators play the recordings back in the browser, download them, or turn them into video with Guacamole's `guacenc`.
 
 ### Recording a connection
 
@@ -276,6 +276,20 @@ A session that is to be recorded never runs unrecorded: if its file cannot be cr
 
 Connections that use guacd's own recording parameters (`recording-path` and the like) keep working: those parameters go to stock guacd unchanged and guacd writes its own files on its host. molcajeted does not implement them; use *Record sessions* instead.
 
+### Recording from the session menu
+
+With *Allow recording from the session menu* on (`record-on-demand`, off by default; the form offers it while *Record sessions* is off), the user who opened a session can start and stop recording it under *Recording* in the session menu (Ctrl+Alt+Shift). Each start-to-stop span is a recording of its own, listed under *Recordings* like any other: for a reproduction, a walkthrough or a risky change, without recording every other session of the connection. Stopping is not needed: a recording also stops when the session ends.
+
+- A recording started in the middle of a session begins with the screen as it was, not black: the gateway joins the session with a read-only connection of its own to the same daemon, which sends a joining user the whole display first. It plays in molcajete's player and in `guacenc` and the stock player.
+- *Record the mouse*, *Record key presses* and *Keep molcajete's image and video formats* apply as for *Record sessions*. The recording's connection announces the stock formats unless the connection keeps molcajete's, whatever the user's own tunnel uses, so the user's session keeps molcajete's faster formats while it is recorded.
+- While recording, the session shows a *Recording* badge and the menu item reads *Stop recording*. Users who joined the session see the badge too, and are told once when they join a session being recorded or when recording starts while they are connected.
+- The user who started a recording can list, play and download it under *Recordings*, which appears in their menu while the gateway records. Recordings made by *Record sessions* stay for administrators only, even those of the user's own sessions. Only administrators delete recordings.
+- With *Record sessions* on, every session is recorded from start to end and the menu cannot stop it; it says so instead. With recording off in the gateway (`[recordings] enabled = false`) the menu has no recording item and starting one is refused.
+- Starting and stopping are in the [audit log](#actions) (`recording.start`, `recording.stop`).
+- The recording's connection costs the daemon what another user joining the session costs: molcajeted builds frames for each joined user, and with molcajete's video formats kept it runs one more video encoder.
+
+The API is `POST /api/my-sessions/{page}/recording` to start (201 with `recordingId`; 403 when the connection or the gateway does not allow it, 409 when the session is recorded already) and `DELETE` to stop (204 once the recording is complete; 404 when nothing is recorded, 409 for *Record sessions*); `GET /api/my-sessions/{page}` reports the state under `recording`.
+
 ### Compatibility with Guacamole's tools
 
 A recording is what guacd writes for `recording-path`: the instructions the browser received, as Guacamole protocol text, with the user's mouse and, if chosen, keys in between. The stock player (`guacamole-common-js`'s `SessionRecording`) and `guacenc` read it, as does molcajete's player:
@@ -292,11 +306,11 @@ molcajeted's zstd images and video streams are unknown to those tools; a session
 
 ### Playing recordings back
 
-*Recordings* lists every recorded session, newest first, with the connection, the user, the protocol, the length (or *Recording* while the session is still going), the size and whether key presses are included. Each one can be played, downloaded as a `.guac` file, or deleted once the session has ended. Connection and user names are copied into the recording when it starts, so a recording outlives a renamed or deleted connection or user.
+*Recordings* lists every recording, newest first, with the connection, the user, the protocol, the length (or *Recording* while the session is still going), the size and whether key presses are included. Each one can be played, downloaded as a `.guac` file, or deleted once the session has ended. Connection and user names are copied into the recording when it starts, so a recording outlives a renamed or deleted connection or user.
 
 The player plays in the browser at 1×, 2×, 4× or 8×, pauses, and seeks anywhere with the position slider. Audio is not played back. Seeking backwards replays from the start. Seeking to the end of an hour of a screen that changed 20 times a second for the whole hour took 2.8 s with molcajete's formats, 5.0 s with the PNG images of an ordinary recorded molcajeted session and 16.2 s for a stock guacd recording; ordinary desktop sessions change much less and seek proportionally faster ([architecture](architecture.md) has the measurements).
 
-Only administrators can list, play, download or delete recordings; every other request gets 403. Downloads and deletions go into the [audit log](#audit-log).
+Administrators list, play, download and delete every recording. Other users list, play and download only the ones they started from the session menu; any other recording answers 404, and deleting answers 403. Downloads and deletions go into the [audit log](#audit-log).
 
 ### Retention
 
@@ -313,7 +327,7 @@ The gateway knows every session it relays. Administrators see the open ones unde
 
 ### Active sessions
 
-*Active sessions* lists every open session: the user and the address they connect from, the connection and its protocol, when it started and for how long it has run, the bytes received and sent so far, the latest round trip the user's page measured (only with [client reports](observability.md#browser-reports) on) and a link to its recording when it is recorded. The list refreshes every three seconds while the page is open. A session appears once its remote desktop has answered (after the handshake) and disappears when its tunnel closes.
+*Active sessions* lists every open session: the user and the address they connect from, the connection and its protocol, when it started and for how long it has run, the bytes received and sent so far, the latest round trip the user's page measured (only with [client reports](observability.md#browser-reports) on) and links to its recordings, with *Recording* while it is being recorded. The list refreshes every three seconds while the page is open. A session appears once its remote desktop has answered (after the handshake) and disappears when its tunnel closes.
 
 Sessions are kept in the gateway's memory, not in the database: a restarted gateway has none (their tunnels were closed with it). With more than one gateway replica, each lists and ends only its own sessions.
 
@@ -334,9 +348,9 @@ These sessions close with `CLIENT_FORBIDDEN` (771), and the user's page says **A
 
 ### Connection history
 
-Every session is stored in the database (`molcajete_connection_history`) when it closes: the user and the connection as they were named then, the protocol, the user's address, when it started and ended, the status it closed with, who ended it and why (when someone did), the bytes relayed each way and its recording. Sessions whose handshake failed never started and are not in it; the gateway's log and `molcajete_gateway_handshake_failures_total` have those.
+Every session is stored in the database (`molcajete_connection_history`) when it closes: the user and the connection as they were named then, the protocol, the user's address, when it started and ended, the status it closed with, who ended it and why (when someone did), the bytes relayed each way and its recordings: the one of *Record sessions*, and every recording started from its session menu. Sessions whose handshake failed never started and are not in it; the gateway's log and `molcajete_gateway_handshake_failures_total` have those.
 
-*Connection history* lists sessions most recently started first, with their duration and how they ended: *Closed*, an error (such as *Remote desktop error (515)*), or ended by an administrator, because the user was disabled or deleted, or because their access was removed, with the administrator's name. Filter by user (username or id), connection (name or id) and start date. *Export CSV* downloads every session that matches (up to 100 000) with the columns `started_at` and `ended_at` (UTC), `duration_seconds`, `user`, `user_id`, `connection`, `connection_id`, `protocol`, `peer_address`, `outcome` (`closed`, `admin`, `user_disabled`, `user_deleted`, `access_revoked` or the error's name such as `UPSTREAM_ERROR`), `status` (the numeric Guacamole status), `ended_by`, `bytes_to_browser`, `bytes_to_guacd` and `recording_id`.
+*Connection history* lists sessions most recently started first, with their duration and how they ended: *Closed*, an error (such as *Remote desktop error (515)*), or ended by an administrator, because the user was disabled or deleted, or because their access was removed, with the administrator's name. Filter by user (username or id), connection (name or id) and start date. *Export CSV* downloads every session that matches (up to 100 000) with the columns `started_at` and `ended_at` (UTC), `duration_seconds`, `user`, `user_id`, `connection`, `connection_id`, `protocol`, `peer_address`, `outcome` (`closed`, `admin`, `user_disabled`, `user_deleted`, `access_revoked` or the error's name such as `UPSTREAM_ERROR`), `status` (the numeric Guacamole status), `ended_by`, `bytes_to_browser`, `bytes_to_guacd`, `recording_id` (the recording of *Record sessions*) and `recording_ids` (every recording of the session, separated by spaces).
 
 Both pages and their API are for administrators only.
 
@@ -403,6 +417,7 @@ The gateway keeps a record of every administrative change and every sign-in in i
 | `connection.access`, `folder.access` | Who is granted a connection or folder (users and groups added and removed). |
 | `folder.create`, `folder.rename`, `folder.move`, `folder.delete` | Folders. |
 | `recording.download`, `recording.delete` | Recordings downloaded (playing one back in the page is not recorded) or deleted. |
+| `recording.start`, `recording.stop` | The user of a session started or stopped recording it from the session menu. The target is the recording; `session` (its tunnel id) is in the changes, `connection` for a start, and `reason` for a stop: `stopped` by the user (the actor), or with no actor `session_ended`, `daemon_closed` or `error`. |
 | `secrets.encrypt`, `secrets.rotate` | Stored credentials encrypted at start because they were in plain text (`count`), and re-encrypted by `rotate-key` (`count`, `keyId`). No actor. |
 | `session.share`, `session.unshare` | A user created a share link of their session (`linkId`, `readOnly`, `expiresAt`) or revoked one (`linkId`). The target is the session. |
 | `session.join` | A user joined a session through a share link (`linkId`, `readOnly`, `owner`, `connection`). The target is the session joined. |

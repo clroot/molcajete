@@ -11,7 +11,7 @@ type Props = {
   onChange: (recording: RecordingChoices) => void;
 };
 
-/** The *Record sessions* switch and what a recording holds. */
+/** *Record sessions*, recording from the session menu, and what a recording holds. */
 export default function RecordingSettings({recording, onChange}: Props) {
   const settings = useApiData(api.settings);
   const isOffInGateway = settings.status === 'ready' && !settings.data.recordings;
@@ -26,14 +26,22 @@ export default function RecordingSettings({recording, onChange}: Props) {
         value={recording.record}
         onChange={record => update({record})}
       />
-      {recording.record && isOffInGateway && (
+      {!recording.record && (
+        <Switch
+          label="Allow recording from the session menu"
+          description="The user of a session can start and stop recording it. They can play and download what they record; administrators see it too."
+          value={recording.onDemand}
+          onChange={onDemand => update({onDemand})}
+        />
+      )}
+      {(recording.record || recording.onDemand) && isOffInGateway && (
         <Banner
           status="warning"
           title="Recording is turned off in the gateway configuration"
           description="Sessions are not recorded until [recordings] enabled is true."
         />
       )}
-      {recording.record && (
+      {(recording.record || recording.onDemand) && (
         <VStack gap={4}>
           <Switch
             label="Record the mouse"
@@ -51,7 +59,11 @@ export default function RecordingSettings({recording, onChange}: Props) {
             <Banner
               status="warning"
               title="Key presses include passwords"
-              description="Anything typed during the session, passwords too, can be read from the recording by every administrator."
+              description={
+                recording.record
+                  ? 'Anything typed during the session, passwords too, can be read from the recording by every administrator.'
+                  : 'Anything typed while recording, passwords too, can be read from the recording by every administrator and by the user who recorded it.'
+              }
             />
           )}
           <Switch

@@ -19,8 +19,11 @@ import ConfirmDeleteDialog from '../shell/ConfirmDeleteDialog';
 import {protocolLabel} from '../connections/protocols';
 import {formatClock, formatSize} from './format';
 
-/** Recorded sessions, newest first, for administrators. */
-export default function RecordingsPage() {
+/**
+ * Recorded sessions, newest first: every one for administrators, who also
+ * delete them; for other users, those they recorded from the session menu.
+ */
+export default function RecordingsPage({isAdmin}: {isAdmin: boolean}) {
   const recordings = useApiData(api.recordings);
   const [deleting, setDeleting] = useState<Recording | null>(null);
   const showToast = useToast();
@@ -97,7 +100,7 @@ export default function RecordingsPage() {
               {label: 'Play', onClick: () => navigate(href.playback(r.id))},
               {label: 'Download', onClick: () => location.assign(recordingFileUrl(r.id, true))},
               // A session still being recorded cannot be deleted.
-              ...(r.endedAt === null ? [] : [{label: 'Delete', onClick: () => setDeleting(r)}]),
+              ...(r.endedAt === null || !isAdmin ? [] : [{label: 'Delete', onClick: () => setDeleting(r)}]),
             ]}
           />
         </HStack>
@@ -106,7 +109,13 @@ export default function RecordingsPage() {
   ];
 
   return (
-    <PageFrame title="Recordings" description="Sessions of the connections that have Record sessions on.">
+    <PageFrame
+      title="Recordings"
+      description={
+        isAdmin
+          ? 'Sessions recorded by Record sessions, and recordings users started from the session menu.'
+          : 'What you recorded from the session menu.'
+      }>
       <AsyncContent data={recordings} errorTitle="Could not load recordings">
         {list => (
           <Table
@@ -118,7 +127,11 @@ export default function RecordingsPage() {
               <EmptyState
                 icon={<FilmIcon width={32} height={32} />}
                 title="No recordings yet"
-                description="Turn on Record sessions in a connection's settings to record its sessions."
+                description={
+                  isAdmin
+                    ? "Turn on Record sessions in a connection's settings to record its sessions, or let users record from the session menu."
+                    : 'Start recording from the session menu (Ctrl+Alt+Shift) of a connection that allows it.'
+                }
               />
             }
           />

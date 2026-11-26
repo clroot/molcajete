@@ -55,6 +55,9 @@ pub struct Encoder {
     out: Vec<u8>,
     include_mouse: bool,
     include_keys: bool,
+    /// Leave out the pointer positions the daemon sends (see
+    /// [`Encoder::without_daemon_pointer`]).
+    skip_daemon_mouse: bool,
     base64: String,
     /// The start of a blob shorter than [`MAX_BLOB_BYTES`], kept until the
     /// stream's next data, so that blob records of any size become blobs
@@ -82,6 +85,7 @@ impl Encoder {
             out: Vec::new(),
             include_mouse,
             include_keys,
+            skip_daemon_mouse: false,
             base64: String::new(),
             partial: Vec::new(),
             partial_stream: 0,
@@ -93,6 +97,15 @@ impl Encoder {
         }
     }
 
+    /// Leaves out the `mouse` instructions of the daemon. A user who joined
+    /// a session is sent the pointer of the others, the owner's included,
+    /// which the recording of an on-demand recorder (a joined connection)
+    /// already takes from the owner's tunnel, or must leave out.
+    pub fn without_daemon_pointer(mut self) -> Self {
+        self.skip_daemon_mouse = true;
+        self
+    }
+
     /// An instruction from the daemon. The tunnel's own instructions (empty
     /// opcode) are not part of the session, and neither is file transfer:
     /// filesystems, listings and the files themselves (guacd does not
@@ -102,6 +115,7 @@ impl Encoder {
         let stream = |index: usize| raw.arg(index).parse::<i32>().ok();
         match raw.opcode() {
             "" | "filesystem" | "undefine" | "get-error" => {}
+            "mouse" if self.skip_daemon_mouse => {}
             "body" => self.file_streams.extend(stream(1)),
             "file" => self.file_streams.extend(stream(0)),
             "blob" if stream(0).is_some_and(|s| self.file_streams.contains(&s)) => {}
@@ -271,6 +285,18 @@ pub struct RecordedUser {
     pub username: String,
 }
 
+/// Where a recording comes from: the session and, for one started from
+/// the session menu, who started it.
+#[derive(Debug, Clone)]
+pub struct Origin<'a> {
+    /// The session's tunnel id.
+    pub session: uuid::Uuid,
+    /// The user whose session it is.
+    pub user: &'a RecordedUser,
+    /// Set for a recording started from the session menu.
+    pub started_by: Option<&'a RecordedUser>,
+}
+
 /// A recording being written. Both directions of the tunnel encode into it
 /// and [`Recorder::flush`] hands the text to a writer thread; a full queue
 /// slows the tunnel down rather than losing data.
@@ -278,8 +304,9 @@ pub struct Recorder {
     entry: Recording,
     path: PathBuf,
     encoder: Mutex<Encoder>,
-    tx: mpsc::Sender<Vec<u8>>,
-    writer: JoinHandle<u64>,
+    /// Taken by [`Recorder::finish`]; what is encoded afterwards is dropped.
+    tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    writer: Mutex<Option<JoinHandle<u64>>>,
 }
 
 impl Recorder {
@@ -288,12 +315,18 @@ impl Recorder {
         &self.entry.id
     }
 
-    /// Creates the file and its index entry.
+    /// Unix milliseconds.
+    pub fn started_at(&self) -> i64 {
+        self.entry.started_at
+    }
+
+    /// Creates the file and its index entry. The connection's choices
+    /// decide whether the mouse and the keys are recorded.
     pub async fn start(
         db: &Database,
         directory: &Path,
         connection: &ConnectionRecord,
-        user: &RecordedUser,
+        origin: Origin<'_>,
     ) -> anyhow::Result<Self> {
         let started_at = now_millis();
         let id = uuid::Uuid::new_v4().to_string();
@@ -312,13 +345,15 @@ impl Recorder {
             connection_id: connection.id.clone(),
             connection_name: connection.name.clone(),
             protocol: connection.protocol.clone(),
-            user_id: user.id.clone(),
-            username: user.username.clone(),
+            user_id: origin.user.id.clone(),
+            username: origin.user.username.clone(),
             file_name,
             include_keys: connection.flag(attributes::RECORD_KEYS),
             started_at,
             ended_at: None,
             size_bytes: 0,
+            session_id: Some(origin.session.to_string()),
+            started_by: origin.started_by.map(|u| u.id.clone()),
         };
         if let Err(err) = db.create_recording(&entry).await {
             let _ = tokio::fs::remove_file(&path).await;
@@ -330,15 +365,19 @@ impl Recorder {
             move || write_all(file, rx, &path)
         });
         info!(recording = %entry.id, file = %path.display(), "recording the session");
+        let mut encoder = Encoder::new(
+            !connection.flag(attributes::RECORD_EXCLUDE_MOUSE),
+            entry.include_keys,
+        );
+        if origin.started_by.is_some() {
+            encoder = encoder.without_daemon_pointer();
+        }
         Ok(Self {
-            encoder: Mutex::new(Encoder::new(
-                !connection.flag(attributes::RECORD_EXCLUDE_MOUSE),
-                entry.include_keys,
-            )),
+            encoder: Mutex::new(encoder),
             entry,
             path,
-            tx,
-            writer,
+            tx: Mutex::new(Some(tx)),
+            writer: Mutex::new(Some(writer)),
         })
     }
 
@@ -349,49 +388,54 @@ impl Recorder {
         }
     }
 
+    fn sender(&self) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.tx.lock().ok().and_then(|tx| tx.clone())
+    }
+
     /// Queues what was encoded for writing.
     pub async fn flush(&self) {
         let chunk = match self.encoder.lock() {
             Ok(mut encoder) => encoder.take(),
             Err(_) => return,
         };
-        if !chunk.is_empty() {
+        if !chunk.is_empty()
+            && let Some(tx) = self.sender()
+        {
             // The writer only goes away by panicking, which it reports.
-            let _ = self.tx.send(chunk).await;
+            let _ = tx.send(chunk).await;
         }
     }
 
     /// Writes the rest, closes the file and completes the index entry.
-    pub async fn finish(self, db: &Database) {
+    /// Only the first call does anything.
+    pub async fn finish(&self, db: &Database) {
         let rest = match self.encoder.lock() {
             Ok(mut encoder) => encoder.finish(),
             Err(_) => Vec::new(),
         };
+        let Some(tx) = self.tx.lock().ok().and_then(|mut tx| tx.take()) else {
+            return;
+        };
         if !rest.is_empty() {
-            let _ = self.tx.send(rest).await;
+            let _ = tx.send(rest).await;
         }
-        let Self {
-            entry,
-            path,
-            tx,
-            writer,
-            ..
-        } = self;
         drop(tx);
+        let Some(writer) = self.writer.lock().ok().and_then(|mut w| w.take()) else {
+            return;
+        };
+        let path = &self.path;
         let size = match writer.await {
             Ok(size) => size,
             Err(err) => {
                 error!(error = %err, file = %path.display(), "recording writer failed");
-                tokio::fs::metadata(&path).await.map_or(0, |m| m.len())
+                tokio::fs::metadata(path).await.map_or(0, |m| m.len())
             }
         };
-        if let Err(err) = db
-            .finish_recording(&entry.id, now_millis(), size as i64)
-            .await
-        {
-            error!(error = %err, recording = %entry.id, "cannot complete the recording index");
+        let id = &self.entry.id;
+        if let Err(err) = db.finish_recording(id, now_millis(), size as i64).await {
+            error!(error = %err, recording = %id, "cannot complete the recording index");
         }
-        info!(recording = %entry.id, bytes = size, "recording complete");
+        info!(recording = %id, bytes = size, "recording complete");
     }
 }
 
@@ -769,6 +813,8 @@ mod tests {
             started_at: ended_at.unwrap_or(now) - 1000,
             ended_at,
             size_bytes: size,
+            session_id: None,
+            started_by: None,
         }
     }
 
@@ -871,6 +917,8 @@ mod tests {
             started_at: 0,
             ended_at: None,
             size_bytes: 0,
+            session_id: None,
+            started_by: None,
         };
         let dir = Path::new("/rec");
         assert_eq!(

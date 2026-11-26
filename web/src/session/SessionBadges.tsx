@@ -5,6 +5,7 @@ import {Icon} from '@astryxdesign/core/Icon';
 import {Kbd} from '@astryxdesign/core/Kbd';
 import {StatusDot} from '@astryxdesign/core/StatusDot';
 import {Text} from '@astryxdesign/core/Text';
+import type {ReactNode} from 'react';
 import {EyeIcon, SpeakerXMarkIcon} from '@heroicons/react/24/outline';
 import {formatStats, type SessionStats} from './client';
 import {terminalKeys} from './terminal';
@@ -20,8 +21,6 @@ const styles = stylex.create({
     pointerEvents: 'none',
   },
   topRight: {position: 'fixed', top: 8, right: 8, pointerEvents: 'none'},
-  // Under the read-only badge when both show.
-  secondTopRight: {top: 56},
   bottomLeft: {
     position: 'fixed',
     bottom: 8,
@@ -59,23 +58,23 @@ export function UnstableNotice() {
   );
 }
 
+/** The badges in the top right corner, one under the other. */
+export function CornerBadges({children}: {children: ReactNode}) {
+  return (
+    <VStack gap={2} hAlign="end" xstyle={styles.topRight}>
+      {children}
+    </VStack>
+  );
+}
+
 /** Others connected to this session: always on screen while an administrator watches. */
-export function WatchersNotice({
-  administrators,
-  others,
-  isSecond = false,
-}: {
-  administrators: string[];
-  others: number;
-  /** Shown under another badge in the same corner. */
-  isSecond?: boolean;
-}) {
+export function WatchersNotice({administrators, others}: {administrators: string[]; others: number}) {
   const text =
     administrators.length > 0
       ? `${administrators.join(', ')} (administrator) ${administrators.length === 1 ? 'is' : 'are'} watching`
       : `${others} ${others === 1 ? 'person is' : 'people are'} connected to this session`;
   return (
-    <Card padding={2} elevation="med" xstyle={[styles.topRight, isSecond && styles.secondTopRight]}>
+    <Card padding={2} elevation="med">
       <HStack gap={2} vAlign="center">
         <Icon icon={EyeIcon} color={administrators.length > 0 ? 'warning' : 'secondary'} size="sm" />
         <Text>{text}</Text>
@@ -99,10 +98,22 @@ export function AudioHint() {
 /** Says that keys, clicks and touches do not reach the remote side. */
 export function ReadOnlyBadge() {
   return (
-    <Card padding={2} elevation="med" xstyle={styles.topRight}>
+    <Card padding={2} elevation="med">
       <HStack gap={2} vAlign="center">
         <StatusDot variant="neutral" label="Read-only" />
         <Text>Read-only</Text>
+      </HStack>
+    </Card>
+  );
+}
+
+/** Says that the session is being recorded, for as long as it is. */
+export function RecordingBadge() {
+  return (
+    <Card padding={2} elevation="med">
+      <HStack gap={2} vAlign="center">
+        <StatusDot variant="error" label="Recording" isPulsing />
+        <Text>Recording</Text>
       </HStack>
     </Card>
   );

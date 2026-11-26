@@ -77,7 +77,8 @@ function SignedInApp({user, onSignOut}: {user: Me; onSignOut: () => void}) {
   if (route.name === 'watch' && user.isAdmin) {
     return <JoinedSessionPage key={route.sessionId} kind="watch" id={route.sessionId} />;
   }
-  if (route.name === 'playback' && user.isAdmin) {
+  // Users play the recordings they made; the gateway refuses others.
+  if (route.name === 'playback') {
     return <PlaybackPage key={route.recordingId} recordingId={route.recordingId} />;
   }
   return (
@@ -86,8 +87,8 @@ function SignedInApp({user, onSignOut}: {user: Me; onSignOut: () => void}) {
         <UsersPage currentUser={user} />
       ) : route.name === 'groups' && user.isAdmin ? (
         <GroupsPage />
-      ) : route.name === 'recordings' && user.isAdmin ? (
-        <RecordingsPage />
+      ) : route.name === 'recordings' ? (
+        <RecordingsPage isAdmin={user.isAdmin} />
       ) : route.name === 'audit' && user.isAdmin ? (
         <AuditPage />
       ) : route.name === 'activeSessions' && user.isAdmin ? (

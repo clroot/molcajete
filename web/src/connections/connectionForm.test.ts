@@ -152,7 +152,13 @@ describe('connection form', () => {
   test('keeps recording choices as attributes, not parameters', () => {
     const recorded = {...rdp, attributes: {'record-sessions': 'true', 'record-exclude-mouse': 'true'}};
     const form = toConnectionForm(recorded);
-    expect(form.recording).toEqual({record: true, keys: false, mouse: false, molcajeteFormats: false});
+    expect(form.recording).toEqual({
+      record: true,
+      keys: false,
+      mouse: false,
+      molcajeteFormats: false,
+      onDemand: false,
+    });
     expect(form.extras.map(e => e.name)).toEqual(['color-depth']);
     expect(toConnection(form)).toEqual({ok: true, connection: recorded});
     const keys = toConnection({...form, recording: {...form.recording, keys: true, mouse: true}});
@@ -168,6 +174,13 @@ describe('connection form', () => {
       keys: false,
       mouse: true,
       molcajeteFormats: false,
+      onDemand: false,
+    });
+    // Recording from the session menu is an attribute of its own.
+    const onDemand = toConnection({...form, recording: {...form.recording, record: false, onDemand: true}});
+    expect(onDemand).toMatchObject({
+      ok: true,
+      connection: {attributes: {'record-on-demand': 'true', 'record-exclude-mouse': 'true'}},
     });
   });
 

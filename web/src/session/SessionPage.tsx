@@ -20,13 +20,16 @@ import SessionGuide from './SessionGuide';
 import {readPreference, writePreference} from './storage';
 import {
   AudioHint,
+  CornerBadges,
   LinkStatus,
   ReadOnlyBadge,
+  RecordingBadge,
   StatsPanel,
   UnstableNotice,
   WatchersNotice,
 } from './SessionBadges';
 import SharingSection from './SharingSection';
+import RecordingSection from './RecordingSection';
 import {newPageId, useSharedSession, type Participant} from './sharing';
 import {unlockAudio} from './audio';
 import {hasLinks, isTerminal} from './terminal';
@@ -205,14 +208,13 @@ export default function SessionPage({connectionId, ticket}: Props) {
       {showStats && session.stats && <StatsPanel stats={session.stats} mode={mode ?? '?'} />}
       {isConnected && terminal && session.link && <LinkStatus url={session.link} />}
       {isConnected && session.isAudioBlocked && <AudioHint />}
-      {isConnected && restrictions.readOnly && <ReadOnlyBadge />}
-      {participants && participants.length > 0 && (
-        <WatchersNotice
-          administrators={administrators}
-          others={participants.length}
-          isSecond={isConnected && restrictions.readOnly}
-        />
-      )}
+      <CornerBadges>
+        {isConnected && restrictions.readOnly && <ReadOnlyBadge />}
+        {shared?.recording.active && <RecordingBadge />}
+        {participants && participants.length > 0 && (
+          <WatchersNotice administrators={administrators} others={participants.length} />
+        )}
+      </CornerBadges>
       {!isFilesOpen && (
         <ActiveTransfers transfers={files.transfers} onCancel={id => client()?.cancel_transfer(id)} />
       )}
@@ -276,6 +278,9 @@ export default function SessionPage({connectionId, ticket}: Props) {
                 client()?.disconnect();
               }
             : leave
+        }
+        recording={
+          shared && <RecordingSection pageId={pageId} recording={shared.recording} onChange={reloadShared} />
         }
         sharing={shared && <SharingSection pageId={pageId} shared={shared} onChange={reloadShared} />}
         onOpenFiles={files.filesystems.length > 0 ? openFiles : null}

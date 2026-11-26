@@ -66,10 +66,13 @@ pub mod attributes {
     /// Let molcajeted use its own image and video formats in recorded
     /// sessions, which only molcajete's player can play.
     pub const RECORD_MOLCAJETE_FORMATS: &str = "record-molcajete-formats";
+    /// Let the user of a session record it from the session menu.
+    pub const RECORD_ON_DEMAND: &str = "record-on-demand";
 
     /// Every attribute the gateway knows.
     pub const ALL: &[&str] = &[
         RECORD,
+        RECORD_ON_DEMAND,
         RECORD_KEYS,
         RECORD_EXCLUDE_MOUSE,
         RECORD_MOLCAJETE_FORMATS,

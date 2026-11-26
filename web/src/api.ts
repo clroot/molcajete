@@ -108,6 +108,7 @@ export const ATTRIBUTES = {
   recordKeys: 'record-keys',
   recordExcludeMouse: 'record-exclude-mouse',
   recordMolcajeteFormats: 'record-molcajete-formats',
+  recordOnDemand: 'record-on-demand',
 } as const;
 
 /** A recorded session (`/api/recordings`). */
@@ -125,6 +126,10 @@ export type Recording = {
   /** Null while the session is still being recorded. */
   endedAt: number | null;
   sizeBytes: number;
+  /** The session (tunnel id); null for recordings older than this field. */
+  sessionId: string | null;
+  /** Who started it from the session menu; null for *Record sessions*. */
+  startedBy: string | null;
 };
 
 /** One entry of the audit log (`/api/audit`). */

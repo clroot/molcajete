@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 use super::*;
 
-type Socket =
+pub(super) type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// What the fake guacd was asked for: the `select` and the `read-only`
@@ -22,7 +22,7 @@ struct Opened {
     read_only: String,
 }
 
-const ARGS: &str = "4.args,13.VERSION_1_5_0,8.hostname,9.read-only;";
+pub(super) const ARGS: &str = "4.args,13.VERSION_1_5_0,8.hostname,9.read-only;";
 
 /// A guacd whose connections can be joined, like stock guacd: a new
 /// connection gets the id `$<n>`, a join (`select,$<n>`) answers `ready`
@@ -90,7 +90,7 @@ async fn sharing_app(extra: &str) -> (TestApp, SocketAddr, mpsc::UnboundedReceiv
 
 /// Opens a tunnel with `query` as `cookie`; `Ok` once the first frame
 /// arrived, `Err` with the close status otherwise.
-async fn tunnel(addr: SocketAddr, query: &str, cookie: &str) -> Result<Socket, String> {
+pub(super) async fn tunnel(addr: SocketAddr, query: &str, cookie: &str) -> Result<Socket, String> {
     let mut request = format!("ws://{addr}/websocket-tunnel?{query}")
         .into_client_request()
         .unwrap();
@@ -109,7 +109,7 @@ async fn tunnel(addr: SocketAddr, query: &str, cookie: &str) -> Result<Socket, S
 }
 
 /// The status the tunnel closes with, which must come within a second.
-async fn closed_with(socket: &mut Socket) -> String {
+pub(super) async fn closed_with(socket: &mut Socket) -> String {
     let close = async {
         loop {
             match socket.next().await.expect("a close frame").unwrap() {
@@ -132,7 +132,7 @@ async fn opened(rx: &mut mpsc::UnboundedReceiver<Opened>) -> Opened {
 }
 
 /// Creates user `carol`, who has no grant of `granted`, and signs in.
-async fn carol(app: &TestApp, admin: &str) -> String {
+pub(super) async fn carol(app: &TestApp, admin: &str) -> String {
     app.call(
         admin,
         Method::POST,
@@ -144,7 +144,7 @@ async fn carol(app: &TestApp, admin: &str) -> String {
     app.login("carol", "carol-password-1").await
 }
 
-async fn share(app: &TestApp, cookie: &str, page: &str, body: Value) -> Value {
+pub(super) async fn share(app: &TestApp, cookie: &str, page: &str, body: Value) -> Value {
     app.call(
         cookie,
         Method::POST,
@@ -155,7 +155,7 @@ async fn share(app: &TestApp, cookie: &str, page: &str, body: Value) -> Value {
     .await
 }
 
-const BOB_PAGE: &str = "connection=granted&page=bob-tab";
+pub(super) const BOB_PAGE: &str = "connection=granted&page=bob-tab";
 
 #[tokio::test]
 async fn owners_share_links_that_others_join_and_revoke_them() {

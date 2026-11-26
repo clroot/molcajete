@@ -34,8 +34,11 @@ pub struct HistoryEntry {
     pub ended_by: Option<String>,
     pub bytes_to_browser: i64,
     pub bytes_to_guacd: i64,
-    /// The recording of the session, if it was recorded.
+    /// The recording of the session, if *Record sessions* recorded it.
     pub recording_id: Option<String>,
+    /// Every recording of the session, oldest first: the one of
+    /// `recording_id` and those started from the session menu.
+    pub recording_ids: Vec<String>,
 }
 
 const COLUMNS: &str = "history_id, user_id, username, connection_id, connection_name, protocol, \
@@ -60,6 +63,7 @@ impl HistoryEntry {
             bytes_to_browser: row.try_get("bytes_to_browser")?,
             bytes_to_guacd: row.try_get("bytes_to_guacd")?,
             recording_id: row.try_get("recording_id")?,
+            recording_ids: Vec::new(),
         })
     }
 }
@@ -145,10 +149,23 @@ impl Database {
             q = q.bind(time);
         }
         let rows = q.bind(limit).bind(offset).fetch_all(&self.pool).await?;
-        Ok(rows
+        let mut entries: Vec<HistoryEntry> = rows
             .iter()
             .map(HistoryEntry::from_row)
-            .collect::<Result<_, _>>()?)
+            .collect::<Result<_, _>>()?;
+        let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        let mut recordings = self.recordings_of_sessions(&ids).await?;
+        for entry in &mut entries {
+            let mut all = recordings.remove(&entry.id).unwrap_or_default();
+            // Recordings made before they named their session.
+            if let Some(id) = &entry.recording_id
+                && !all.contains(id)
+            {
+                all.insert(0, id.clone());
+            }
+            entry.recording_ids = all;
+        }
+        Ok(entries)
     }
 
     /// Deletes sessions that ended before `cutoff` (Unix milliseconds);
@@ -187,6 +204,7 @@ mod tests {
             bytes_to_browser: 5_000_000_000,
             bytes_to_guacd: 42,
             recording_id: None,
+            recording_ids: Vec::new(),
         }
     }
 
@@ -199,6 +217,7 @@ mod tests {
             ended.end_reason = Some("admin".into());
             ended.ended_by = Some("root".into());
             ended.recording_id = Some("rec".into());
+            ended.recording_ids = vec!["rec".into()];
             for e in [
                 entry("a", "bob", "win", 1_000),
                 entry("b", "bob", "linux", 2_000),

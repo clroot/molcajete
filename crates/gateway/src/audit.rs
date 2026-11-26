@@ -98,6 +98,13 @@ pub mod action {
     /// A recording file was downloaded (not played back in the page).
     pub const RECORDING_DOWNLOAD: &str = "recording.download";
     pub const RECORDING_DELETE: &str = "recording.delete";
+    /// The owner of a session started recording it from the session menu
+    /// (`session`, `connection`); the target is the new recording.
+    pub const RECORDING_START: &str = "recording.start";
+    /// A recording started from the session menu stopped (`session`,
+    /// `reason`: `stopped` by its owner, who is the actor, or
+    /// `session_ended`, `daemon_closed`, `error`).
+    pub const RECORDING_STOP: &str = "recording.stop";
 
     /// At start, connection credentials stored in plain text were encrypted
     /// (`count`): the first start after upgrading, or a name newly treated
@@ -165,6 +172,8 @@ pub mod action {
         CONNECTION_ACCESS,
         RECORDING_DOWNLOAD,
         RECORDING_DELETE,
+        RECORDING_START,
+        RECORDING_STOP,
         SECRETS_ENCRYPT,
         SECRETS_ROTATE,
         SESSION_END,

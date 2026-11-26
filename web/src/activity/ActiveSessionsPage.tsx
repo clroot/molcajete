@@ -3,8 +3,8 @@ import {Table, pixel, type TableColumn} from '@astryxdesign/core/Table';
 import {HStack, VStack} from '@astryxdesign/core/Stack';
 import {AlertDialog} from '@astryxdesign/core/AlertDialog';
 import {Button} from '@astryxdesign/core/Button';
-import {Link} from '@astryxdesign/core/Link';
 import {Text} from '@astryxdesign/core/Text';
+import {StatusDot} from '@astryxdesign/core/StatusDot';
 import {Timestamp} from '@astryxdesign/core/Timestamp';
 import {EmptyState} from '@astryxdesign/core/EmptyState';
 import {useToast} from '@astryxdesign/core/Toast';
@@ -16,6 +16,7 @@ import PageFrame from '../shell/PageFrame';
 import AsyncContent from '../shell/AsyncContent';
 import {protocolLabel} from '../connections/protocols';
 import {formatClock, formatSize} from '../recordings/format';
+import RecordingLinks from '../recordings/RecordingLinks';
 import {sessionsApi, type LiveSession} from './api';
 
 /** How often the list refreshes while the page is visible. */
@@ -126,14 +127,20 @@ export default function ActiveSessionsPage({currentUser}: {currentUser: User}) {
       ),
     },
     {
-      key: 'recordingId',
+      key: 'recordingIds',
       header: 'Recording',
-      width: pixel(110),
+      width: pixel(130),
       renderCell: s =>
-        s.recordingId ? (
-          <Link href={href.playback(s.recordingId)}>Recorded</Link>
+        s.recording ? (
+          <VStack gap={0.5}>
+            <HStack gap={2} vAlign="center">
+              <StatusDot variant="error" label="Recording" isPulsing />
+              <Text>Recording</Text>
+            </HStack>
+            <RecordingLinks ids={s.recordingIds} />
+          </VStack>
         ) : (
-          <Text color="secondary">—</Text>
+          <RecordingLinks ids={s.recordingIds} />
         ),
     },
     {

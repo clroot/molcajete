@@ -156,7 +156,7 @@ fn outcome(status: i64, reason: Option<&str>) -> String {
 async fn history_csv(state: &AppState, filter: &HistoryFilter) -> Result<Response, ApiError> {
     let mut csv = String::from(
         "started_at,ended_at,duration_seconds,user,user_id,connection,connection_id,protocol,\
-         peer_address,outcome,status,ended_by,bytes_to_browser,bytes_to_guacd,recording_id\r\n",
+         peer_address,outcome,status,ended_by,bytes_to_browser,bytes_to_guacd,recording_id,recording_ids\r\n",
     );
     let mut written = 0;
     while written < MAX_CSV {
@@ -181,6 +181,8 @@ async fn history_csv(state: &AppState, filter: &HistoryFilter) -> Result<Respons
                 entry.bytes_to_browser.to_string(),
                 entry.bytes_to_guacd.to_string(),
                 entry.recording_id.clone().unwrap_or_default(),
+                // Every recording of the session, separated by spaces.
+                entry.recording_ids.join(" "),
             ];
             let row: Vec<String> = fields.iter().map(|f| audit::csv_field(f)).collect();
             csv.push_str(&row.join(","));

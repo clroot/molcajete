@@ -39,7 +39,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::db::{ConnectionRecord, attributes, now_millis};
 use crate::guacd::{self, ClientInfo, GuacdSession};
-use crate::recording::{self, RecordedUser, Recorder};
+use crate::recording::{self, Origin, RecordedUser, Recorder};
 use crate::sessions::{self, SessionStart, Traffic};
 
 /// WebSocket subprotocol of the stock Guacamole tunnel.
@@ -271,7 +271,12 @@ async fn serve_tunnel(
     let recorder = if record {
         let directory = state.config.recordings.directory(&state.config.server);
         let user = request.user.clone().unwrap_or_default();
-        match Recorder::start(&state.db, &directory, &connection, &user).await {
+        let origin = Origin {
+            session: tunnel_id,
+            user: &user,
+            started_by: None,
+        };
+        match Recorder::start(&state.db, &directory, &connection, origin).await {
             Ok(recorder) => Some(recorder),
             Err(err) => {
                 error!(error = %err, dir = %directory.display(), "cannot start the recording; refusing the session");
@@ -306,6 +311,7 @@ async fn serve_tunnel(
             recording_id: recorder.as_ref().map(|r| r.id().to_owned()),
             page_id: request.page.clone(),
             joined: None,
+            client: request.info.clone(),
         },
     );
     let session_id = request.session.as_deref().filter(|_| state.client_reports);
@@ -334,7 +340,10 @@ async fn serve_tunnel(
         request.binary,
         &counters,
         registration.traffic(),
-        recorder.as_ref(),
+        Recording {
+            whole: recorder.as_ref(),
+            on_demand: Some(registration.recording()),
+        },
         async { registration.ended().await.reason.status() },
     )
     .await;
@@ -462,6 +471,7 @@ async fn serve_joined(
             recording_id: None,
             page_id: None,
             joined: Some(join.joined),
+            client: request.info.clone(),
         },
     );
     let address = crate::auth::ClientAddress(request.peer.clone().unwrap_or_default());
@@ -486,7 +496,7 @@ async fn serve_joined(
         request.binary,
         &counters,
         registration.traffic(),
-        None,
+        Recording::default(),
         async { registration.ended().await.reason.status() },
     )
     .await;
@@ -557,12 +567,23 @@ impl Framing {
     }
 }
 
+/// What a tunnel records.
+#[derive(Default, Clone, Copy)]
+pub struct Recording<'a> {
+    /// The recording of *Record sessions*: what the browser is sent, and
+    /// its mouse and keys.
+    pub whole: Option<&'a Recorder>,
+    /// Where a recording started from the session menu runs, which only
+    /// takes the browser's mouse and keys from here
+    /// ([`sessions::record`]).
+    pub on_demand: Option<&'a sessions::record::Slot>,
+}
+
 /// Pumps data in both directions until either side terminates or `ended`
 /// resolves with the status to close the tunnel with (an administrator
 /// ended the session). `browser_binary` tells whether the browser selected
-/// the binary subprotocol. Relayed bytes are counted into `traffic`. With
-/// a `recorder`, what the browser is sent and its mouse and keys are
-/// recorded too.
+/// the binary subprotocol. Relayed bytes are counted into `traffic`, and
+/// recorded as `recording` says.
 #[allow(clippy::too_many_arguments)]
 pub async fn relay(
     socket: WebSocket,
@@ -571,9 +592,10 @@ pub async fn relay(
     browser_binary: bool,
     counters: &RelayCounters,
     traffic: &Traffic,
-    recorder: Option<&Recorder>,
+    recording: Recording<'_>,
     ended: impl Future<Output = Status>,
 ) -> RelayStats {
+    let recorder = recording.whole;
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
 
@@ -615,7 +637,7 @@ pub async fn relay(
         };
         tokio::select! {
             status = to_browser => status,
-            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &traffic.to_guacd, recorder) => status,
+            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &traffic.to_guacd, recording) => status,
             status = ended => {
                 debug!(%status, "session ended by the gateway");
                 status
@@ -824,7 +846,7 @@ async fn browser_to_guacd(
     out: &mpsc::Sender<Message>,
     counter: &Counter,
     total: &AtomicU64,
-    recorder: Option<&Recorder>,
+    recording: Recording<'_>,
 ) -> Status {
     let mut parser = Parser::with_limits(Limits::STRICT);
     let mut forward = Vec::with_capacity(4096);
@@ -840,6 +862,9 @@ async fn browser_to_guacd(
         };
         parser.feed(text.as_bytes());
         forward.clear();
+        // A recording started from the menu may start or stop at any time.
+        let on_demand = recording.on_demand.and_then(|slot| slot.recorder());
+        let recorders = || recording.whole.into_iter().chain(on_demand.as_deref());
         loop {
             match parser.next_raw() {
                 Ok(Some(raw)) if raw.opcode().is_empty() => {
@@ -855,8 +880,8 @@ async fn browser_to_guacd(
                     }
                 }
                 Ok(Some(raw)) => {
-                    if let Some(recorder) = recorder {
-                        let now = now_millis();
+                    let now = now_millis();
+                    for recorder in recorders() {
                         recorder.record(|e| e.client_instruction(&raw, now));
                     }
                     forward.extend_from_slice(raw.as_bytes());
@@ -868,7 +893,7 @@ async fn browser_to_guacd(
                 }
             }
         }
-        if let Some(recorder) = recorder {
+        for recorder in recorders() {
             recorder.flush().await;
         }
         if !forward.is_empty() {
