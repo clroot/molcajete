@@ -58,6 +58,9 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajeted_connections_active` | gauge | protocol | Open connections |
 | `molcajeted_connections_total` | counter | protocol, result | Connections by how they ended: `ok`, `error`, `handshake_failed`, `unsupported` (protocol `unknown` for the last two when the handshake did not get that far). The relay for IronRDP's web client counts as protocol `rdp-relay`, here and in the two metrics around this one |
 | `molcajeted_session_duration_seconds` | histogram | protocol | Session length |
+| `molcajeted_sessions_detached` | gauge | protocol | Sessions held without a client after their tunnel dropped, waiting for the same tab to resume them |
+| `molcajeted_sessions_resumed_total` | counter | protocol, from | Clients that got a held session back: `from="detached"` after a dropped tunnel, `from="attached"` when a client took over a session whose old tunnel was still open |
+| `molcajeted_sessions_expired_total` | counter | protocol | Held sessions ended because nobody came back within the grace period, or because too many were held (`--resume-max-detached`) |
 | `molcajeted_joined_users_active` | gauge | protocol | Users who joined a connection (share links, administrators watching); each also counts in the frame and image metrics, since it gets frames of its own |
 | `molcajeted_remote_received_bytes_total` | counter | protocol | Bytes read from the remote server's socket (`rdp`: TLS records, handshake included; `rdp-relay`: the same for IronRDP's client; `vnc`) |
 | `molcajeted_remote_frames_total` | counter | protocol | `rdp` only: frames the server marked the end of with Frame Marker surface commands (graphics pipeline frames are counted by `molcajeted_rdp_gfx_frames_total`). Zero for a server that sends classic bitmap updates; molcajeted then cannot keep its updates whole |
@@ -99,6 +102,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajete_gateway_recording_failures_total` | counter | connection, protocol | Sessions refused because their recording could not be started |
 | `molcajete_gateway_tunnels_active` | gauge | connection, protocol | Open tunnels |
 | `molcajete_gateway_tunnels_total` | counter | connection, protocol, status | Closed tunnels by Guacamole status code |
+| `molcajete_gateway_tunnels_resumed_total` | counter | connection, protocol | Tunnels that got back a session molcajeted held (`tunnel established` logs `resumed=true`) |
 | `molcajete_gateway_tunnel_duration_seconds` | histogram | connection, protocol | Tunnel length |
 | `molcajete_gateway_relayed_bytes_total` | counter | connection, protocol, direction | Bytes relayed: `to_browser` (as read from the daemon), `to_guacd` |
 | `molcajete_gateway_logins_throttled_total` | counter | reason | Password sign-ins refused before the password was checked: `address` or `username` (too many failures, `429`), `busy` (no free password check within `verification_wait_secs`, `503`). See [Repeated failed sign-ins](administration.md#repeated-failed-sign-ins) |
