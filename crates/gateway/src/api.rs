@@ -1299,7 +1299,8 @@ pub async fn delete_group(
 }
 
 // ---------------------------------------------------------------------------
-// Recordings (administrators only)
+// Recordings: administrators see every one; other users the ones they
+// started from the session menu. Only administrators delete them.
 
 fn recordings_dir(state: &AppState) -> std::path::PathBuf {
     state.config.recordings.directory(&state.config.server)
@@ -1316,12 +1317,28 @@ async fn with_current_size(state: &AppState, mut recording: Recording) -> Record
     recording
 }
 
+/// Recording `id`, if `user` may open it: administrators every one, others
+/// those they started. 404 otherwise, as for one that does not exist.
+async fn visible_recording(state: &AppState, user: &User, id: &str) -> ApiResult<Recording> {
+    let recording = state.db.recording(id).await?;
+    if user.is_admin || recording.started_by.as_deref() == Some(user.id.as_str()) {
+        Ok(recording)
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
 pub async fn list_recordings(
     State(state): State<Arc<AppState>>,
-    AdminUser(_): AdminUser,
+    CurrentUser(user): CurrentUser,
 ) -> ApiResult<Json<Vec<Recording>>> {
+    let all = if user.is_admin {
+        state.db.list_recordings().await?
+    } else {
+        state.db.recordings_started_by(&user.id).await?
+    };
     let mut recordings = Vec::new();
-    for recording in state.db.list_recordings().await? {
+    for recording in all {
         recordings.push(with_current_size(&state, recording).await);
     }
     Ok(Json(recordings))
@@ -1329,10 +1346,10 @@ pub async fn list_recordings(
 
 pub async fn get_recording(
     State(state): State<Arc<AppState>>,
-    AdminUser(_): AdminUser,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Recording>> {
-    let recording = state.db.recording(&id).await?;
+    let recording = visible_recording(&state, &user, &id).await?;
     Ok(Json(with_current_size(&state, recording).await))
 }
 
@@ -1356,7 +1373,7 @@ fn recording_entry(action: &'static str, by: &User, recording: &Recording) -> En
 
 pub async fn recording_file(
     State(state): State<Arc<AppState>>,
-    AdminUser(admin): AdminUser,
+    CurrentUser(user): CurrentUser,
     address: ClientAddress,
     Path(id): Path<String>,
     Query(query): Query<FileQuery>,
@@ -1364,7 +1381,7 @@ pub async fn recording_file(
 ) -> ApiResult<Response> {
     use tower::ServiceExt as _;
 
-    let recording = state.db.recording(&id).await?;
+    let recording = visible_recording(&state, &user, &id).await?;
     let path = recording::file_path(&recordings_dir(&state), &recording)
         .ok_or_else(ApiError::not_found)?;
     if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -1385,7 +1402,7 @@ pub async fn recording_file(
                 .headers_mut()
                 .insert(header::CONTENT_DISPOSITION, value);
         }
-        let entry = recording_entry(action::RECORDING_DOWNLOAD, &admin, &recording);
+        let entry = recording_entry(action::RECORDING_DOWNLOAD, &user, &recording);
         audit::record(&state.db, entry.from(&address)).await;
     }
     Ok(response)

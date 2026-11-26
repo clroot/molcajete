@@ -293,6 +293,10 @@ fn router(state: Arc<AppState>) -> Router {
             post(sessions::share::create_link),
         )
         .route(
+            "/my-sessions/{page}/recording",
+            post(sessions::record::start).delete(sessions::record::stop),
+        )
+        .route(
             "/my-sessions/{page}/links/{id}",
             delete(sessions::share::revoke_link),
         )
@@ -480,6 +484,8 @@ mod tests {
 
     /// Live sessions and the connection history (src/tests/live_sessions.rs).
     mod live_sessions;
+    /// Recording sessions from the session menu (src/tests/on_demand_recording.rs).
+    mod on_demand_recording;
     /// Share links and administrators watching sessions (src/tests/sharing.rs).
     mod sharing;
 
@@ -1967,7 +1973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_administrators_reach_recordings() {
+    async fn users_reach_only_the_recordings_they_started() {
         let app = app().await;
         let directory = app
             .state
@@ -1987,6 +1993,8 @@ mod tests {
             started_at: 1_000,
             ended_at: Some(2_000),
             size_bytes: 22,
+            session_id: None,
+            started_by: None,
         };
         std::fs::write(directory.join("done.guac"), "4.sync,4.1000,1.0;0123").unwrap();
         app.state.db.create_recording(&done).await.unwrap();
@@ -2004,9 +2012,15 @@ mod tests {
             "/api/recordings/done/file",
         ] {
             assert_eq!(app.get(path, None).await.status(), StatusCode::UNAUTHORIZED);
+        }
+        // Recordings of *Record sessions* are the administrators' alone,
+        // even of bob's own sessions.
+        let listed = body_json(app.get("/api/recordings", Some(&bob)).await).await;
+        assert_eq!(listed, serde_json::json!([]));
+        for path in ["/api/recordings/done", "/api/recordings/done/file"] {
             assert_eq!(
                 app.get(path, Some(&bob)).await.status(),
-                StatusCode::FORBIDDEN
+                StatusCode::NOT_FOUND
             );
         }
         let delete = |cookie: &str, id: &str| {

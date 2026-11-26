@@ -112,7 +112,11 @@ pub async fn record_join(state: &AppState, user: &User, address: &ClientAddress,
 }
 
 /// The caller's own session opened from page `page`.
-fn own_session(state: &AppState, user: &User, page: &str) -> Result<LiveSession, ApiError> {
+pub(super) fn own_session(
+    state: &AppState,
+    user: &User,
+    page: &str,
+) -> Result<LiveSession, ApiError> {
     state
         .sessions
         .by_page(&user.id, page)
@@ -142,7 +146,8 @@ struct LinkView {
 }
 
 /// `GET /api/my-sessions/{page}`: the caller's live session from page
-/// `page`: who joined it, its links and whether it may be shared.
+/// `page`: who joined it, its links, whether it may be shared, and whether
+/// it is recorded or may be ([`super::record::menu_state`]).
 pub async fn get(
     State(state): State<Arc<AppState>>,
     CurrentUser(user): CurrentUser,
@@ -185,6 +190,7 @@ pub async fn get(
         "links": links,
         "sharing": state.config.sharing.links,
         "maxLinkMinutes": state.config.sharing.max_link_minutes,
+        "recording": super::record::menu_state(&state, &session).await,
     })))
 }
 
@@ -284,7 +290,8 @@ pub async fn revoke_link(
 }
 
 /// `GET /api/join/{token}`: what a share link opens, for the page to show
-/// before joining. 404 for an unknown, expired or revoked link.
+/// before joining and to tell while joined whether the session is being
+/// recorded. 404 for an unknown, expired or revoked link.
 pub async fn describe_link(
     State(state): State<Arc<AppState>>,
     CurrentUser(_): CurrentUser,
@@ -303,5 +310,6 @@ pub async fn describe_link(
         "owner": session.username,
         "readOnly": link.read_only,
         "expiresAt": link.expires_at,
+        "recording": session.recording,
     })))
 }

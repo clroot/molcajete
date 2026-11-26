@@ -28,10 +28,17 @@ pub struct Recording {
     /// `None` while the session is still being recorded.
     pub ended_at: Option<i64>,
     pub size_bytes: i64,
+    /// The session (tunnel id) recorded; a session can have several
+    /// recordings. `None` for recordings older than this field.
+    pub session_id: Option<String>,
+    /// The user who started the recording from the session menu, who may
+    /// play and download it. `None` for recordings of *Record sessions*.
+    pub started_by: Option<String>,
 }
 
 const COLUMNS: &str = "recording_id, connection_id, connection_name, protocol, user_id, \
-                       username, file_name, include_keys, started_at, ended_at, size_bytes";
+                       username, file_name, include_keys, started_at, ended_at, size_bytes, \
+                       session_id, started_by";
 
 fn from_row(row: &AnyRow) -> Result<Recording, sqlx::Error> {
     Ok(Recording {
@@ -46,6 +53,8 @@ fn from_row(row: &AnyRow) -> Result<Recording, sqlx::Error> {
         started_at: row.try_get("started_at")?,
         ended_at: row.try_get("ended_at")?,
         size_bytes: row.try_get("size_bytes")?,
+        session_id: row.try_get("session_id")?,
+        started_by: row.try_get("started_by")?,
     })
 }
 
@@ -55,8 +64,8 @@ impl Database {
             self,
             "INSERT INTO molcajete_recording \
              (recording_id, connection_id, connection_name, protocol, user_id, username, \
-              file_name, include_keys, started_at, ended_at, size_bytes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              file_name, include_keys, started_at, ended_at, size_bytes, session_id, started_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&r.id)
         .bind(&r.connection_id)
@@ -69,6 +78,8 @@ impl Database {
         .bind(r.started_at)
         .bind(r.ended_at)
         .bind(r.size_bytes)
+        .bind(r.session_id.as_deref())
+        .bind(r.started_by.as_deref())
         .execute(&self.pool)
         .await
         .map_err(DbError::from_sqlx)?;
@@ -109,6 +120,51 @@ impl Database {
             .map(from_row)
             .collect::<Result<_, _>>()
             .map_err(DbError::from)
+    }
+
+    /// The recordings `user_id` started from the session menu, newest
+    /// first.
+    pub async fn recordings_started_by(&self, user_id: &str) -> DbResult<Vec<Recording>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM molcajete_recording WHERE started_by = ? \
+             ORDER BY started_at DESC, recording_id"
+        );
+        let rows = query!(self, &sql)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(from_row)
+            .collect::<Result<_, _>>()
+            .map_err(DbError::from)
+    }
+
+    /// The ids of the recordings of each of `sessions` (tunnel ids), oldest
+    /// first. Sessions without recordings are left out.
+    pub async fn recordings_of_sessions(
+        &self,
+        sessions: &[String],
+    ) -> DbResult<std::collections::HashMap<String, Vec<String>>> {
+        let mut found: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for chunk in sessions.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT recording_id, session_id FROM molcajete_recording \
+                 WHERE session_id IN ({placeholders}) ORDER BY started_at, recording_id"
+            );
+            let mut q = query!(self, &sql);
+            for session in chunk {
+                q = q.bind(session);
+            }
+            for row in q.fetch_all(&self.pool).await? {
+                let session: String = row.try_get("session_id")?;
+                found
+                    .entry(session)
+                    .or_default()
+                    .push(row.try_get("recording_id")?);
+            }
+        }
+        Ok(found)
     }
 
     /// Recordings that were still open when the gateway stopped.
@@ -154,6 +210,42 @@ mod tests {
             started_at,
             ended_at: None,
             size_bytes: 0,
+            session_id: None,
+            started_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recordings_by_session_and_starter() {
+        for (db, _dir) in every_backend().await {
+            let name = db.dialect().name();
+            let mut a = recording("a", 1_000);
+            a.session_id = Some("s1".into());
+            let mut b = recording("b", 2_000);
+            b.session_id = Some("s1".into());
+            b.started_by = Some("u1".into());
+            let mut c = recording("c", 3_000);
+            c.session_id = Some("s2".into());
+            c.started_by = Some("u2".into());
+            for r in [&a, &b, &c, &recording("old", 500)] {
+                db.create_recording(r).await.unwrap();
+            }
+            assert_eq!(db.recording("b").await.unwrap(), b, "{name}");
+            let by_session = db
+                .recordings_of_sessions(&["s1".into(), "s2".into(), "s3".into()])
+                .await
+                .unwrap();
+            assert_eq!(by_session.len(), 2, "{name}");
+            assert_eq!(by_session["s1"], ["a", "b"], "{name}");
+            assert_eq!(by_session["s2"], ["c"], "{name}");
+            let mine: Vec<_> = db
+                .recordings_started_by("u1")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(mine, ["b"], "{name}");
         }
     }
 
