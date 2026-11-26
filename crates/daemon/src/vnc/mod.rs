@@ -57,6 +57,14 @@ struct Settings {
     disable_resize: bool,
 }
 
+impl Settings {
+    /// Whether text from the browser's clipboard reaches the server. A
+    /// read-only connection takes nothing from the browser, as in guacd.
+    fn accepts_paste(&self) -> bool {
+        !self.read_only && !self.disable_paste
+    }
+}
+
 pub async fn run(
     reader: GuacReader,
     mut writer: GuacWriter,
@@ -305,7 +313,7 @@ async fn run_session(
                             request_update(&mut rfb_writer, &display).await?;
                         }
                     }
-                    Some(ClientEvent::Clipboard(text)) if !settings.disable_paste => {
+                    Some(ClientEvent::Clipboard(text)) if settings.accepts_paste() => {
                         rfb_writer.cut_text(&text).await?;
                     }
                     Some(ClientEvent::Disconnect) => break Ok(()),
@@ -373,4 +381,25 @@ async fn request_update(
             display.height().min(u16::MAX as u32) as u16,
         )
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    fn settings(read_only: bool, disable_paste: bool) -> Settings {
+        Settings {
+            read_only,
+            disable_copy: false,
+            disable_paste,
+            disable_resize: false,
+        }
+    }
+
+    #[test]
+    fn read_only_takes_no_clipboard() {
+        assert!(settings(false, false).accepts_paste());
+        assert!(!settings(false, true).accepts_paste());
+        assert!(!settings(true, false).accepts_paste());
+    }
 }

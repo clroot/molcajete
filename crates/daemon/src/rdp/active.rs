@@ -582,7 +582,7 @@ impl<'a> Session<'a> {
             }
             ClientEvent::Size { width, height } => self.request_resize(width, height),
             ClientEvent::Argv { name, value } => self.client_parameter(&name, &value),
-            ClientEvent::Clipboard(text) if !self.settings.disable_paste => {
+            ClientEvent::Clipboard(text) if self.settings.accepts_paste() => {
                 self.client_clipboard(text).await?;
             }
             ClientEvent::Sync {

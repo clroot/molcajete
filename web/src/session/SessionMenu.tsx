@@ -71,12 +71,12 @@ const CLIPBOARD_HELP = {
  */
 function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Props) {
   const canCopy = !restrictions.disableCopy;
-  const canPaste = !restrictions.disablePaste;
+  // A read-only connection takes nothing from the browser, the clipboard
+  // included.
+  const canPaste = !restrictions.disablePaste && !restrictions.readOnly;
   if (!canCopy && !canPaste) {
     return <Text color="secondary">Copying and pasting are turned off for this connection.</Text>;
   }
-  // Read-only terminals take no keys, pasted text included.
-  const canPasteKeys = canPaste && !restrictions.readOnly;
   return (
     <>
       <TextArea
@@ -94,7 +94,7 @@ function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Pro
         rows={5}
         hasSpellCheck={false}
       />
-      {isTerminal && (canCopy || canPasteKeys) && (
+      {isTerminal && (canCopy || canPaste) && (
         <VStack gap={2}>
           {canCopy && (
             <HStack gap={2} vAlign="center">
@@ -102,7 +102,7 @@ function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Pro
               <Text color="secondary">copies the selected text</Text>
             </HStack>
           )}
-          {canPasteKeys && (
+          {canPaste && (
             <HStack gap={2} vAlign="center">
               <Kbd keys={terminalKeys.paste} />
               <Text color="secondary">pastes from this computer</Text>
