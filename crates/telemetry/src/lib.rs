@@ -7,9 +7,9 @@
 //! - **metrics** are recorded with the [`metrics`] facade; only when
 //!   `--telemetry-listen` is set is a Prometheus recorder installed, and
 //!   `GET /metrics` on that address renders them;
-//! - **CPU profiles** (`--profiling`, needs the `profiling` feature) are
-//!   served in pprof format at `GET /debug/pprof/profile?seconds=N`, the
-//!   endpoint Pyroscope / Alloy `pyroscope.scrape` and `go tool pprof`
+//! - **CPU profiles** (`--profiling`, needs the `profiling` feature and
+//!   Unix) are served in pprof format at `GET /debug/pprof/profile?seconds=N`,
+//!   the endpoint Pyroscope / Alloy `pyroscope.scrape` and `go tool pprof`
 //!   expect, and as an SVG at `GET /debug/pprof/flamegraph?seconds=N`.
 //!
 //! The telemetry listener is separate from the service port so that it is
@@ -180,7 +180,7 @@ fn install_recorder() -> anyhow::Result<PrometheusHandle> {
     Ok(handle)
 }
 
-#[cfg(feature = "profiling")]
+#[cfg(all(feature = "profiling", unix))]
 mod profiling {
     use std::sync::Mutex;
     use std::time::Duration;
@@ -266,10 +266,13 @@ mod profiling {
     }
 }
 
-#[cfg(not(feature = "profiling"))]
+#[cfg(not(all(feature = "profiling", unix)))]
 mod profiling {
     pub(super) fn routes(_app: axum::Router) -> anyhow::Result<axum::Router> {
-        anyhow::bail!("--profiling needs a build with the `profiling` feature")
+        if cfg!(unix) {
+            anyhow::bail!("--profiling needs a build with the `profiling` feature")
+        }
+        anyhow::bail!("--profiling is only available on Unix")
     }
 }
 

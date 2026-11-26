@@ -9,7 +9,8 @@ publish = false
 
 [features]
 default = ["profiling"]
-# `/debug/pprof/profile` and `/debug/pprof/flamegraph` (pprof-rs, SIGPROF sampling).
+# `/debug/pprof/profile` and `/debug/pprof/flamegraph` (pprof-rs, SIGPROF sampling;
+# Unix only, a no-op on other platforms).
 profiling = ["dep:pprof"]
 
 [dependencies]
@@ -24,4 +25,6 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 tokio = { version = "1", features = ["net", "rt", "signal", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# SIGPROF sampling does not exist on Windows.
+[target.'cfg(unix)'.dependencies]
 pprof = { version = "0.15", optional = true, default-features = false, features = ["prost-codec", "flamegraph"] }
