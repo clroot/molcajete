@@ -374,6 +374,10 @@ export default function SessionPage({connectionId, ticket}: Props) {
           setKeyBarChoice(shows);
           writePreference('terminalKeys', shows);
         }}
+        fullScreenVideo={session.videoMode === null ? null : session.videoMode === 'full-screen'}
+        onFullScreenVideoChange={isFullScreen =>
+          client()?.send_argv('video-mode', isFullScreen ? 'full-screen' : 'auto')
+        }
         showStats={showStats}
         onShowStatsChange={setShowStats}
         remoteComposition={hasRemoteIme(protocol) ? remoteComposition : null}

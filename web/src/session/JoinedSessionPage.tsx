@@ -19,7 +19,7 @@ import {useMolcajeteClient} from './useMolcajeteClient';
 import {useMenuShortcut} from './useMenuShortcut';
 import StatusOverlay from './StatusOverlay';
 import SessionMenuButton from './SessionMenuButton';
-import type {ScaleMode} from './SessionMenu';
+import {FullScreenVideoSwitch, type ScaleMode} from './SessionMenu';
 import {CornerBadges, RecordingBadge} from './SessionBadges';
 import {REFRESH_MS, sharingApi} from './sharing';
 
@@ -245,6 +245,14 @@ export default function JoinedSessionPage({kind, id}: JoinTarget) {
                     {value: 'native', label: 'Native (1:1)'},
                   ]}
                 />
+                {session.videoMode !== null && (
+                  <FullScreenVideoSwitch
+                    value={session.videoMode === 'full-screen'}
+                    onChange={isFullScreen =>
+                      client()?.send_argv('video-mode', isFullScreen ? 'full-screen' : 'auto')
+                    }
+                  />
+                )}
               </VStack>
             </LayoutContent>
           }
