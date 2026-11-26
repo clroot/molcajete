@@ -582,7 +582,7 @@ A flush (`Display::flush`) runs these steps over the 64×64 tiles touched since 
 
 The share of repeated pixels separates screen content from photographs well: it is 94 to 97% in windows and pages with more than 256 colours in recorded sessions and 3 to 15% in photographs. Without a row filter Zstandard needs 22 to 74% more bytes than PNG for a photograph and 37 to 45% fewer for those windows, so the rule keeps PNG exactly where its filters earn something. The check costs one look at a quarter of the rows of an image that already failed to fit a palette (0.17 ms on a 5120×512 photograph against 83 ms to encode it as PNG, `display::bench::zstd_images`).
 
-Lossy refinement: each tile has a heat (about updates per second, decaying). Lossy tiles are re-sent losslessly once their heat falls below 0.25; the idle timer makes this happen without a new change.
+Lossy refinement: each tile has a heat (about updates per second, decaying). Lossy tiles are re-sent losslessly once their heat falls below 0.25; the idle timer makes this happen without a new change. Adjacent cool tiles go out together, in images of up to 512×512 pixels encoded side by side, and at most 4 megapixels per flush: a screen that was busy as a whole (a video that stopped) cools down as a whole, and what is left follows in the next idle flushes. On the 5K benchmark (`display::bench::refine`, 5 encoding threads) refining a whole screen sent as JPEG took one flush of 290 ms with 3360 PNG images (108 ms as zstd images) when every tile was encoded on its own, and takes four flushes of at most 39 ms with 100 images.
 
 ### 6.3 Parallel encoding
 

@@ -87,6 +87,13 @@ const HASH_B: u64 = 0x9e37_79b9_7f4a_7c15;
 const HOT: f32 = 3.0;
 /// Heat below which lossy areas are re-sent losslessly.
 const COOL: f32 = 0.25;
+/// Lossy areas are re-sent in images of at most this many tiles per side,
+/// which are encoded side by side.
+const REFINE_BLOCK_TILES: u32 = 8;
+/// Pixels re-sent losslessly per flush at most; what is left follows in the
+/// next flushes ([`Display::idle_deadline`]). A whole screen that cools
+/// down at once would otherwise hold the session for one long flush.
+const REFINE_PIXELS_PER_FLUSH: u64 = 4 << 20;
 
 const MODE_OVER: u8 = 0xE;
 const MODE_SRC: u8 = 0xC;
@@ -974,18 +981,23 @@ impl Display {
         stats
     }
 
-    /// Merges dirty tiles into rectangles: horizontal runs, extended over
-    /// consecutive tile rows with the same run.
+    /// Merges dirty tiles into rectangles.
     fn dirty_regions(&self) -> Vec<Rect> {
+        // Tiles under the video are left to it.
+        self.tile_regions(|tx, ty| {
+            self.dirty[(ty * self.tile_cols + tx) as usize] && !self.tile_in_video(tx, ty)
+        })
+    }
+
+    /// Merges the tiles chosen by `wanted(tx, ty)` into rectangles:
+    /// horizontal runs, extended over consecutive tile rows with the same
+    /// run.
+    fn tile_regions(&self, wanted: impl Fn(u32, u32) -> bool) -> Vec<Rect> {
         // (first column, end column, first row, end row) in tiles.
         let mut open: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut done = Vec::new();
         for ty in 0..self.tile_rows {
-            // Tiles under the video are left to it.
-            let row_runs = runs(self.tile_cols as usize, 0, |tx| {
-                self.dirty[(ty * self.tile_cols) as usize + tx]
-                    && !self.tile_in_video(tx as u32, ty)
-            });
+            let row_runs = runs(self.tile_cols as usize, 0, |tx| wanted(tx as u32, ty));
             let mut next_open = Vec::new();
             for (a, b) in row_runs {
                 let (a, b) = (a as u32, b as u32);
@@ -1603,52 +1615,59 @@ impl Display {
     }
 
     /// Re-sends lossy areas losslessly once they stopped changing.
+    ///
+    /// Adjacent tiles go out as one image: an area that was busy as a whole
+    /// (a video that stopped) cools down as a whole, and one image per tile
+    /// of it would be thousands, encoded one after the other.
     fn refine_lossy(&mut self, out: &mut Output) -> FlushStats {
-        let mut stats = FlushStats::default();
         if self.lossless {
-            return stats;
+            return FlushStats::default();
         }
-        for ty in 0..self.tile_rows {
+        let mut cool = vec![false; self.lossy.len()];
+        let mut pixels = 0;
+        'tiles: for ty in 0..self.tile_rows {
             for tx in 0..self.tile_cols {
                 let i = (ty * self.tile_cols + tx) as usize;
                 if !self.lossy[i] || self.heat[i] > COOL || self.tile_in_video(tx, ty) {
                     continue;
                 }
-                self.lossy[i] = false;
-                let tile =
-                    Rect::new(tx * TILE, ty * TILE, TILE, TILE).clip(self.width, self.height);
-                let data = self.extract(&self.pixels, &tile);
-                let region = Region {
-                    width: tile.w,
-                    height: tile.h,
-                    rgba: &data,
-                };
-                let opaque = is_opaque(&data);
-                let zstd = self.zstd;
-                let mut images = Vec::new();
-                let encoded = self.on_pool(|| encode_lossless(&region, opaque, zstd, &mut images));
-                self.record_images(&images, tile.area());
-                if let Some((mimetype, bytes)) = encoded {
-                    stats.images += 1;
-                    stats.bytes += bytes.len();
-                    stats.pixels += tile.area();
-                    self.emit_image(
-                        0,
-                        MODE_OVER,
-                        mimetype,
-                        tile.x as i32,
-                        tile.y as i32,
-                        &bytes,
-                        out,
-                    );
+                if pixels >= REFINE_PIXELS_PER_FLUSH {
+                    break 'tiles;
                 }
+                // Whatever the encoding makes of it, it is not tried again.
+                self.lossy[i] = false;
+                cool[i] = true;
+                pixels += Rect::new(tx * TILE, ty * TILE, TILE, TILE)
+                    .clip(self.width, self.height)
+                    .area();
             }
         }
-        stats
-    }
-
-    fn extract(&self, buf: &[u8], rect: &Rect) -> Vec<u8> {
-        extract(buf, self.width, rect)
+        if pixels == 0 {
+            return FlushStats::default();
+        }
+        let block = REFINE_BLOCK_TILES * TILE;
+        let rects = self
+            .tile_regions(|tx, ty| cool[(ty * self.tile_cols + tx) as usize])
+            .into_iter()
+            .flat_map(|region| {
+                (region.y..region.bottom())
+                    .step_by(block as usize)
+                    .flat_map(move |y| {
+                        (region.x..region.right())
+                            .step_by(block as usize)
+                            .map(move |x| {
+                                Rect::new(
+                                    x,
+                                    y,
+                                    block.min(region.right() - x),
+                                    block.min(region.bottom() - y),
+                                )
+                            })
+                    })
+            })
+            .collect();
+        // Cool areas are below the heat of a lossy encoding.
+        self.emit_rects(rects, out)
     }
 
     /// Sends `rects` of the framebuffer, in this order, and records them in
