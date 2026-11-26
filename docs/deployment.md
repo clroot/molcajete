@@ -122,6 +122,31 @@ gateway (pod) -> host.orb.internal:4822 -> molcajeted (launchd agent, 127.0.0.1:
 - Remote desktop addresses are resolved on the Mac, not in the pod: cluster DNS names do not work, while LAN and Tailnet addresses do. On OrbStack, `host.orb.internal` is the Mac itself, and its port 5900 is macOS Screen Sharing.
 - launchd does not rotate `StandardOutPath`. The log grows by a few lines per session; truncate it now and then or add an entry in `/etc/newsyslog.d/`.
 
+### Natively on Windows (NVENC, QSV, AMF)
+
+molcajeted in WSL or in a container on Windows encodes video in software: the GPU is not available to ffmpeg there. Run natively, it uses ffmpeg's hardware encoders (NVENC, QSV, AMF) when a trial encode works. The gateway builds for Windows too, so both can run on the same machine.
+
+1. Build the binaries, with the Rust MSVC toolchain on Windows, or from Linux with mingw-w64 (`x86_64-pc-windows-gnu` target). Neither needs NASM or CMake:
+
+   ```bash
+   cargo build --release -p molcajete-gateway -p molcajete-daemon
+   # from Linux: rustup target add x86_64-pc-windows-gnu
+   #             cargo build --release --target x86_64-pc-windows-gnu -p molcajete-gateway -p molcajete-daemon
+   ```
+
+   Build the web UI with `scripts/build-web.sh` (in WSL or Git Bash) and point the gateway's `MOLCAJETE_STATIC_DIR` at `web/dist`.
+
+2. Install an ffmpeg build that has the hardware encoders, and put it in `PATH` or set `MOLCAJETED_FFMPEG`. `grep '"video encoders"'` in molcajeted's log shows which ones it found.
+
+3. Run both as services. There is no built-in Windows service support: use a service wrapper (WinSW, NSSM) or a Task Scheduler task that starts at boot. Both stop cleanly on Ctrl+C, which service wrappers such as WinSW send before killing the process.
+
+What differs from Linux:
+
+- **Drive folders** must be on a drive letter (`C:\ProgramData\molcajete\drives\<connection>`); network shares (`\\server\share`) are refused. molcajeted serves the folder without following symbolic links or junctions out of it, and the browser's side refuses names Windows would read as something else than a file in the folder (`C:`, `a:stream`, `CON`, `nul.txt`, a trailing dot or space). A folder made by `create-drive-path` takes the permissions of its parent instead of being restricted to molcajeted's user: give the parent an ACL that only that user can read.
+- **The secret key file** (`<data_dir>\secret.key`) is created without restricted permissions, and no warning is logged when others can read it. Restrict it after the first start, for example with `icacls secret.key /inheritance:r /grant:r "%USERNAME%:F"`.
+- **`--profiling` is not available**: CPU profiles rely on `SIGPROF`. Metrics and logs work as on Linux.
+- **Smart App Control and WDAC** may block unsigned binaries. Sign them, or allow them through the organisation's policy.
+
 ### From source
 
 For development, `cargo run -p molcajete-gateway -- --config gateway.toml` and `cargo run -p molcajete-daemon -- -l 4823` run both processes from the checkout; the README's quick start builds the web client first. `docker/compose.yml` starts test targets (stock guacd, VNC, SSH, xrdp) that `gateway.example.toml` points at, and `docker/keycloak/` a Keycloak test realm with a matching `gateway.keycloak.toml`.
@@ -285,7 +310,7 @@ The key that [stored connection credentials](administration.md#stored-credential
 key_file = "/run/secrets/molcajete-secret-key"
 ```
 
-The gateway takes the key from `MOLCAJETE_SECRET_KEY` first, then `key_file`, then `key`. **Without any, it uses `<data_dir>/secret.key`**, and on the first start generates that file (mode 0600) and logs `generated a new secret key …; back it up together with the database`. That suits the single-host setup, where the key sits next to the SQLite file; with PostgreSQL or MySQL, or in Kubernetes, configure the key explicitly.
+The gateway takes the key from `MOLCAJETE_SECRET_KEY` first, then `key_file`, then `key`. **Without any, it uses `<data_dir>/secret.key`**, and on the first start generates that file (mode 0600; on Windows, see [Natively on Windows](#natively-on-windows-nvenc-qsv-amf)) and logs `generated a new secret key …; back it up together with the database`. That suits the single-host setup, where the key sits next to the SQLite file; with PostgreSQL or MySQL, or in Kubernetes, configure the key explicitly.
 
 **Back the key up along with the database, but store it separately** (a password manager or secrets store): a database restored without its key has lost its stored credentials, and a key kept in the same backup as the database protects nothing. Losing the key loses the stored credentials, not the connections: they have to be typed again.
 
@@ -479,7 +504,7 @@ The web client asks `GET /api/settings` which optional features are on: `clientR
 
 At startup molcajeted logs the encoders it found (`video encoders`). After three encoder failures in a session it stops using video for that session.
 
-**Drive folders (RDP).** A connection's shared drive (`drive-path`, see [administration](administration.md#file-transfer)) is a folder on the host molcajeted runs on, read and written as molcajeted's user. Keep the drives under one directory of their own, for example `/var/lib/molcajete/drives/<connection>`, with `create-drive-path` creating each connection's folder (the parent must exist). In a container, mount that directory as a volume, or the files are lost with the container; with several molcajeted replicas a session may land on any of them, so they need a shared volume (ReadWriteMany) or the drive's contents differ between sessions. Nothing is deleted automatically: clean up or set quotas on the directory. molcajeted serves the folder to the remote server without following symbolic links out of it and refuses symbolic links on the browser's side. SFTP needs nothing on the molcajeted host; files go through it without being stored.
+**Drive folders (RDP).** A connection's shared drive (`drive-path`, see [administration](administration.md#file-transfer)) is a folder on the host molcajeted runs on, read and written as molcajeted's user. Keep the drives under one directory of their own, for example `/var/lib/molcajete/drives/<connection>`, with `create-drive-path` creating each connection's folder (the parent must exist). In a container, mount that directory as a volume, or the files are lost with the container; with several molcajeted replicas a session may land on any of them, so they need a shared volume (ReadWriteMany) or the drive's contents differ between sessions. Nothing is deleted automatically: clean up or set quotas on the directory. molcajeted serves the folder to the remote server without following symbolic links out of it and refuses symbolic links on the browser's side (on Windows, junctions as well; see [Natively on Windows](#natively-on-windows-nvenc-qsv-amf)). SFTP needs nothing on the molcajeted host; files go through it without being stored.
 
 ## Upgrading
 
