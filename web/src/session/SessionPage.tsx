@@ -2,6 +2,7 @@
 // connection states show over it, and Ctrl+Alt+Shift opens the session menu.
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {useToast} from '@astryxdesign/core/Toast';
+import {useMediaQuery} from '@astryxdesign/core/hooks';
 import * as stylex from '@stylexjs/stylex';
 import {href, navigate} from '../route';
 import type {SessionEvent} from './client';
@@ -16,6 +17,9 @@ import StatusOverlay from './StatusOverlay';
 import CredentialsDialog from './CredentialsDialog';
 import SessionMenu, {type ScaleMode} from './SessionMenu';
 import SessionMenuButton from './SessionMenuButton';
+import TerminalKeyBar from './TerminalKeyBar';
+import {showsKeyBar} from './keyBar';
+import {useVisibleFrame} from './useVisibleFrame';
 import SessionGuide from './SessionGuide';
 import {readPreference, writePreference} from './storage';
 import {
@@ -41,7 +45,17 @@ import DropOverlay from './DropOverlay';
 import {useFileDrop} from './useFileDrop';
 
 const styles = stylex.create({
-  display: {position: 'fixed', inset: 0, backgroundColor: 'black', overflow: 'hidden'},
+  // The remote screen, and under it the terminal key bar when it shows.
+  frame: {
+    position: 'fixed',
+    inset: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    backgroundColor: 'black',
+  },
+  // What the on-screen keyboard leaves in view, instead of the whole window.
+  visible: (top: number, height: number) => ({top, bottom: 'auto', height}),
+  display: {position: 'relative', flexGrow: 1, minHeight: 0, overflow: 'hidden'},
 });
 
 const leave = () => navigate(href.connections);
@@ -86,6 +100,14 @@ export default function SessionPage({connectionId, ticket}: Props) {
   );
   const terminal = isTerminal(protocol);
   const onCopyEvent = useCopyFeedback(terminal);
+  // The key bar: this browser's choice, else on devices used by finger.
+  const isCoarsePointer = useMediaQuery('(pointer: coarse)');
+  const [keyBarChoice, setKeyBarChoice] = useState(() =>
+    readPreference<boolean | null>('terminalKeys', null),
+  );
+  // A read-only connection takes no keys.
+  const offersKeyBar = terminal && !restrictions.readOnly;
+  const wantsKeyBar = offersKeyBar && showsKeyBar(keyBarChoice, isCoarsePointer);
 
   const onEvent = useCallback(
     (event: SessionEvent) => {
@@ -155,8 +177,11 @@ export default function SessionPage({connectionId, ticket}: Props) {
     (open: boolean) => {
       setIsMenuOpen(open);
       // Keys held while the menu opens must not stay pressed remotely.
-      if (open) client()?.release_keys();
-      else client()?.focus();
+      if (open) {
+        client()?.release_keys();
+        client()?.hold_modifier('ctrl', 'off');
+        client()?.hold_modifier('alt', 'off');
+      } else client()?.focus();
     },
     [client],
   );
@@ -177,6 +202,27 @@ export default function SessionPage({connectionId, ticket}: Props) {
 
   const {status} = session;
   const isConnected = status.kind === 'connected';
+  const hasKeyBar = wantsKeyBar && isConnected;
+  const visibleFrame = useVisibleFrame(hasKeyBar);
+
+  const canPaste = !restrictions.disablePaste && !restrictions.readOnly;
+  const paste = async () => {
+    let text = '';
+    try {
+      text = (await navigator.clipboard?.readText()) ?? '';
+    } catch {
+      // Not allowed, or not offered by this browser.
+    }
+    // The Clipboard field of the session menu stands in for a clipboard
+    // the browser keeps to itself.
+    text ||= session.clipboard;
+    if (text) client()?.paste_text(text);
+    else
+      showToast({
+        body: 'Nothing to paste. If the browser does not share its clipboard, put the text in the Clipboard field of the session menu.',
+        type: 'error',
+      });
+  };
   // A session opened by a one-time link has no signed-in user to share it.
   const {shared, reload: reloadShared} = useSharedSession(pageId, isConnected && ticketId === undefined);
   const participants = shared?.participants;
@@ -194,7 +240,22 @@ export default function SessionPage({connectionId, ticket}: Props) {
   };
   return (
     <>
-      <div ref={displayRef} {...stylex.props(styles.display)} />
+      <div
+        {...stylex.props(
+          styles.frame,
+          visibleFrame && styles.visible(visibleFrame.top, visibleFrame.height),
+        )}>
+        <div ref={displayRef} {...stylex.props(styles.display)} />
+        {hasKeyBar && (
+          <TerminalKeyBar
+            modifiers={session.modifiers}
+            onHold={(name, hold) => client()?.hold_modifier(name, hold)}
+            onKey={keysym => client()?.press_key(keysym)}
+            onPaste={canPaste ? paste : null}
+            onOpenMenu={() => setMenuOpen(true)}
+          />
+        )}
+      </div>
 
       {status.kind !== 'connected' && (
         <StatusOverlay
@@ -222,7 +283,8 @@ export default function SessionPage({connectionId, ticket}: Props) {
         <DropOverlay target={protocol === 'ssh' ? 'your home folder' : `the ${dropTarget.name} drive`} />
       )}
 
-      {isConnected && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
+      {/* The key bar has the menu button itself. */}
+      {isConnected && !hasKeyBar && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
       {isConnected && isGuideDue && !session.required && !isMenuOpen && (
         <SessionGuide terminal={terminal ? {hasLinks: hasLinks(protocol)} : null} onDismiss={dismissGuide} />
       )}
@@ -265,6 +327,11 @@ export default function SessionPage({connectionId, ticket}: Props) {
           displayChoices.setResize(resize);
           // Before the size the effect sends, so that the server applies it.
           client()?.send_argv('resize-method', resize ? 'display-update' : '');
+        }}
+        keyBar={offersKeyBar ? showsKeyBar(keyBarChoice, isCoarsePointer) : null}
+        onKeyBarChange={shows => {
+          setKeyBarChoice(shows);
+          writePreference('terminalKeys', shows);
         }}
         showStats={showStats}
         onShowStatsChange={setShowStats}

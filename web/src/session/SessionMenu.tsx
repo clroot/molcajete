@@ -46,6 +46,9 @@ type Props = {
   remoteDisplay: RemoteDisplay | null;
   onRemoteScaleChange: (scale: RemoteScale) => void;
   onResizeToWindowChange: (resize: boolean) => void;
+  /** Whether the terminal key bar shows; `null` when the session has none to show. */
+  keyBar: boolean | null;
+  onKeyBarChange: (shows: boolean) => void;
   showStats: boolean;
   onShowStatsChange: (show: boolean) => void;
   /** `null` when the connection has no remote input method to compose with. */
@@ -148,6 +151,17 @@ export default function SessionMenu(props: Props) {
                 />
               )}
               <Clipboard {...props} />
+              {props.keyBar !== null && (
+                <VStack gap={4}>
+                  <Heading level={3}>Terminal</Heading>
+                  <Switch
+                    label="Show terminal keys"
+                    description="Esc, Tab, Ctrl, Alt and the arrow keys in a bar under the terminal, for typing on an on-screen keyboard."
+                    value={props.keyBar}
+                    onChange={props.onKeyBarChange}
+                  />
+                </VStack>
+              )}
               <VStack gap={4}>
                 <Heading level={3}>Display</Heading>
                 {remoteDisplay && (

@@ -25,6 +25,12 @@ export type SessionStats = {
   queuedOps: number;
 };
 
+/** How a modifier is held from the page: for the next key, or until it is turned off. */
+export type Hold = 'off' | 'once' | 'locked';
+
+/** Ctrl and Alt as the terminal key bar holds them. */
+export type HeldModifiers = {ctrl: Hold; alt: Hold};
+
 export type SessionEvent =
   | {
       type: 'state';
@@ -42,6 +48,8 @@ export type SessionEvent =
   | {type: 'link'; detail: string | null}
   /** The terminal has no selection any more (molcajeted SSH only); a selection arrives as `clipboard`. */
   | {type: 'selection'; detail: boolean}
+  /** Ctrl and Alt held with `hold_modifier`, after every change. */
+  | {type: 'modifiers'; detail: HeldModifiers}
   /** The copy shortcut wrote the selection to the local clipboard, or could not. */
   | {type: 'copy'; detail: {ok: boolean}}
   /** Whether an audio stream is open while the browser holds its sound back until a click or key press. */
@@ -92,6 +100,12 @@ export interface MolcajeteSession {
   set_terminal_shortcuts(enabled: boolean): void;
   send_argv(name: string, value: string): void;
   send_ctrl_alt_del(): void;
+  /** Presses and releases a key (an X11 keysym) with the held modifiers. */
+  press_key(keysym: number): void;
+  /** Holds Ctrl or Alt for the next key (`once`) or until `off` (`locked`); answered by `modifiers` events. */
+  hold_modifier(name: keyof HeldModifiers, hold: Hold): void;
+  /** Pastes text into a terminal, as its paste shortcut does. */
+  paste_text(text: string): void;
   set_scale_mode(mode: 'fit' | 'native'): void;
   /** Whether window size changes are sent to the server; turning it on sends the current size. */
   set_auto_resize(enabled: boolean): void;
