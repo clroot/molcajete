@@ -41,7 +41,7 @@ use crate::display::{Display, ImageFormats, Pacing};
 use crate::files::{self, Transfers};
 use crate::handshake::ClientInfo;
 use crate::io::GuacWriter;
-use crate::remote::DecodeTime;
+use crate::remote::{DecodeTime, WriteCause, Writes};
 use crate::send_error;
 use crate::session::{self, ClientEvent, Input, InputDecoder};
 
@@ -103,6 +103,8 @@ pub struct Session<'a> {
     decode_time: DecodeTime,
     /// Frames the server marked the end of.
     server_frames: metrics::Counter,
+    /// Writes to the server, by what caused them.
+    writes: Writes,
     /// Time spent copying graphics updates into the display since the
     /// last server PDU was decoded.
     copy_time: Duration,
@@ -173,6 +175,7 @@ impl<'a> Session<'a> {
             files,
             decode_time: DecodeTime::new("rdp"),
             server_frames: crate::remote::frames("rdp"),
+            writes: Writes::new("rdp"),
             copy_time: Duration::ZERO,
         }
     }
@@ -325,10 +328,11 @@ impl<'a> Session<'a> {
         self.pacer.mark_dirty(Instant::now());
     }
 
-    async fn write_rdp(&mut self, frame: &[u8]) -> std::io::Result<()> {
+    async fn write_rdp(&mut self, frame: &[u8], cause: WriteCause) -> std::io::Result<()> {
         if frame.is_empty() {
             return Ok(());
         }
+        self.writes.written(cause);
         self.rdp_writer.write_all(frame).await
     }
 
@@ -348,7 +352,7 @@ impl<'a> Session<'a> {
         };
         let decoded = started.elapsed();
         let frame_ended = ends_server_frame(action, &outputs);
-        let flow = self.stage_outputs(outputs).await?;
+        let flow = self.stage_outputs(outputs, WriteCause::Response).await?;
         self.pipeline_frames();
         if frame_ended {
             if !self.pacer.marks_frames() {
@@ -379,10 +383,16 @@ impl<'a> Session<'a> {
         Ok(flow)
     }
 
-    async fn stage_outputs(&mut self, outputs: Vec<ActiveStageOutput>) -> anyhow::Result<Flow> {
+    /// Acts on what the stage made of a PDU or of input; `cause` is why its
+    /// frames for the server are written.
+    async fn stage_outputs(
+        &mut self,
+        outputs: Vec<ActiveStageOutput>,
+        cause: WriteCause,
+    ) -> anyhow::Result<Flow> {
         for output in outputs {
             match output {
-                ActiveStageOutput::ResponseFrame(frame) => self.write_rdp(&frame).await?,
+                ActiveStageOutput::ResponseFrame(frame) => self.write_rdp(&frame, cause).await?,
                 ActiveStageOutput::GraphicsUpdate(rect) => {
                     let (width, height) = (
                         u32::from(self.image.width()),
@@ -544,7 +554,7 @@ impl<'a> Session<'a> {
             self.suppress_output_support,
         )?;
         for frame in frames {
-            self.write_rdp(&frame).await?;
+            self.write_rdp(&frame, WriteCause::Other).await?;
         }
         Ok(())
     }
@@ -616,13 +626,13 @@ impl<'a> Session<'a> {
             let outputs = self
                 .stage
                 .process_fastpath_input(&mut self.image, &events)?;
-            self.stage_outputs(outputs).await?;
+            self.stage_outputs(outputs, WriteCause::Input).await?;
         } else {
             let pdu = InputEventPdu(events.iter().filter_map(slow_path::input_event).collect());
             let mut buf = WriteBuf::new();
             self.stage
                 .encode_static(&mut buf, ShareDataPdu::Input(pdu))?;
-            self.write_rdp(buf.filled()).await?;
+            self.write_rdp(buf.filled(), WriteCause::Input).await?;
         }
         Ok(())
     }
@@ -663,7 +673,7 @@ impl<'a> Session<'a> {
         };
         for messages in messages {
             let frame = self.stage.process_svc_processor_messages(messages)?;
-            self.write_rdp(&frame).await?;
+            self.write_rdp(&frame, WriteCause::Other).await?;
         }
         if let Some(text) = remote_text
             && !self.settings.disable_copy
@@ -769,7 +779,7 @@ impl<'a> Session<'a> {
                         scale,
                         "requesting desktop layout"
                     );
-                    self.write_rdp(&frame?).await?;
+                    self.write_rdp(&frame?, WriteCause::Other).await?;
                     self.scale = scale;
                 }
             }

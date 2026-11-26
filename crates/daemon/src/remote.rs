@@ -27,6 +27,35 @@ pub fn frames(protocol: &'static str) -> Counter {
     counter!("molcajeted_remote_frames_total", "protocol" => protocol)
 }
 
+/// Why a session writes to the remote server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteCause {
+    /// An answer to something the server sent (acknowledgements of frames,
+    /// replies on channels, network measurements).
+    Response,
+    /// Keys and pointer events of the client.
+    Input,
+    /// Anything the session starts itself (clipboard, resizing, redraws).
+    Other,
+}
+
+/// `molcajeted_remote_writes_total{protocol, cause}`: writes to the remote
+/// server's connection. Each one is a TLS record and a system call of its
+/// own, so their number per second shows what batching them would save.
+pub struct Writes([Counter; 3]);
+
+impl Writes {
+    pub fn new(protocol: &'static str) -> Self {
+        Self(["response", "input", "other"].map(|cause| {
+            counter!("molcajeted_remote_writes_total", "protocol" => protocol, "cause" => cause)
+        }))
+    }
+
+    pub fn written(&self, cause: WriteCause) {
+        self.0[cause as usize].increment(1);
+    }
+}
+
 /// `molcajeted_remote_decode_seconds{protocol}`: time to decode one message
 /// from the remote server and apply it to the framebuffer.
 pub struct DecodeTime(Histogram);
