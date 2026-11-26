@@ -169,7 +169,7 @@ The connection's stored password never reaches the browser. The page gets a one-
 What an IronRDP session does not have:
 
 - **Recording.** The gateway records molcajete's own stream, so a connection with *Record sessions* cannot choose IronRDP (the form disables the section while it is on), and the session menu has no recording item.
-- **Sharing and watching** a session, the **file panel** and the **performance stats**. The session menu has *Ctrl+Alt+Del*, *Disconnect* and, where allowed, *Reconnect with molcajete*; keyboard, mouse and clipboard are IronRDP's own.
+- **Sharing and watching** a session, the **file panel** and the **performance stats**. The session menu has *Ctrl+Alt+Del*, *Disconnect* and, where allowed, *Reconnect with molcajete*; keyboard, mouse and clipboard are IronRDP's own. On a touch screen a finger dragged scrolls, a tap clicks, a finger resting for half a second presses the left button and drags with it, and a two-finger tap right-clicks.
 - **Standard RDP Security** (`security=rdp`), which neither client supports. The connection's `security` still chooses between NLA and TLS.
 - **The graphics pipeline.** IronRDP's web client gets the screen as bitmap updates. Its graphics pipeline offers no H.264, and a Windows 11 host left that offer unanswered, so it is turned off.
 
