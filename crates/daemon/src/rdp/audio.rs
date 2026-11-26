@@ -163,6 +163,7 @@ pub fn output(encoding: AudioEncoding) -> (SoundSink, AudioOutput) {
         encoding,
         stream: None,
         refused: false,
+        muted: false,
         decoder: None,
         samples: Vec::new(),
         bytes: Vec::new(),
@@ -258,6 +259,9 @@ pub struct AudioOutput {
     stream: Option<StreamFormat>,
     /// The client rejected the stream: nothing more is sent.
     refused: bool,
+    /// No client takes sound right now ([`AudioOutput::detach`]): what the
+    /// server plays is dropped.
+    muted: bool,
     /// Decoder of the last wave format.
     decoder: Option<(AudioFormat, AudioDecoder)>,
     samples: Vec<i16>,
@@ -267,6 +271,10 @@ pub struct AudioOutput {
 impl AudioOutput {
     /// Sends the audio received since the last call.
     pub fn pump(&mut self, out: &mut Output) {
+        if self.muted {
+            while self.events.try_recv().is_ok() {}
+            return;
+        }
         while let Ok(event) = self.events.try_recv() {
             match event {
                 SoundEvent::Wave { format, data } => self.wave(&format, &data, out),
@@ -337,6 +345,28 @@ impl AudioOutput {
         self.encoding.encode(&self.samples, &mut self.bytes);
         let frame = self.encoding.bytes_per_sample() * channels;
         out.blob_aligned(AUDIO_STREAM, &self.bytes, frame);
+    }
+
+    /// The client went away ([`crate::resume`]): sound is dropped until
+    /// [`AudioOutput::attach`].
+    pub fn detach(&mut self) {
+        self.stream = None;
+        self.muted = true;
+    }
+
+    /// A client attached that announced `mimetypes`: the next wave data
+    /// opens a stream for it, in the best encoding it takes, or sound stays
+    /// off if it takes none.
+    pub fn attach(&mut self, mimetypes: &[String]) {
+        self.stream = None;
+        self.refused = false;
+        match AudioEncoding::negotiate(mimetypes) {
+            Some(encoding) => {
+                self.encoding = encoding;
+                self.muted = false;
+            }
+            None => self.muted = true,
+        }
     }
 
     /// Ends the open stream; the next wave data opens a new one.

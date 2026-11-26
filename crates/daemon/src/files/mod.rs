@@ -249,11 +249,7 @@ impl Transfers {
     }
 
     fn spawn(opening: Opening, policy: Policy, name: String, out: &Output) -> Self {
-        let chunk = if out.is_binary() {
-            molcajete_protocol::binary::MAX_BLOB_DATA
-        } else {
-            crate::io::BLOB_MAX_BYTES
-        };
+        let chunk = chunk_for(out);
         let (requests, requests_rx) = mpsc::channel(MAX_QUEUED);
         let (replies_tx, replies) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
@@ -305,6 +301,37 @@ impl Transfers {
             warn!(stream, "file transfer requests are piling up");
         }
         true
+    }
+
+    /// The client went away ([`crate::resume`]): its uploads are deleted
+    /// and its downloads stop. Replies already on their way are dropped
+    /// with the rest of what the session sends while detached.
+    pub fn detach(&mut self) {
+        self.request(Request::Detach);
+    }
+
+    /// A client attached, writing to `out`: it is told about the
+    /// filesystem.
+    pub fn attach(&mut self, out: &Output) {
+        while self.replies.try_recv().is_ok() {}
+        self.request(Request::Attach {
+            chunk: chunk_for(out),
+        });
+    }
+
+    fn request(&mut self, request: Request) {
+        if self.requests.try_send(request).is_err() {
+            warn!("file transfer requests are piling up");
+        }
+    }
+}
+
+/// Bytes of file data per blob for a client writing to `out`.
+fn chunk_for(out: &Output) -> usize {
+    if out.is_binary() {
+        molcajete_protocol::binary::MAX_BLOB_DATA
+    } else {
+        crate::io::BLOB_MAX_BYTES
     }
 }
 

@@ -187,6 +187,7 @@ async fn run_session(
     .with_protocol("vnc")
     .with_pacing(Pacing::DESKTOP);
     session::enable_video(&mut display, info);
+    crate::resume::establish(writer);
     session::send_name(writer.buffer(), &server.name);
     display.resize(server.width as u32, server.height as u32, writer.buffer());
     writer.flush().await?;
@@ -207,6 +208,8 @@ async fn run_session(
     });
     let mut want_update = false;
     let mut frame_pending = false;
+    // What the client holds down, to let go of when it goes away.
+    let mut held = Held::default();
     let frame_timer = tokio::time::sleep(Duration::from_secs(3600));
     tokio::pin!(frame_timer);
     let mut keepalive = tokio::time::interval(Duration::from_secs(5));
@@ -288,9 +291,15 @@ async fn run_session(
                     Some(ClientEvent::Mouse { x, y, mask }) if !settings.read_only => {
                         let x = x.min(u16::MAX as i32) as u16;
                         let y = y.min(u16::MAX as i32) as u16;
+                        held.pointer = (x, y, mask as u8);
                         rfb_writer.pointer(x, y, mask as u8).await?;
                     }
                     Some(ClientEvent::Key { keysym, pressed }) if !settings.read_only => {
+                        if pressed {
+                            held.keys.insert(keysym);
+                        } else {
+                            held.keys.remove(&keysym);
+                        }
                         rfb_writer.key(keysym, pressed).await?;
                     }
                     Some(ClientEvent::Size { width, height }) if !settings.disable_resize => {
@@ -320,6 +329,31 @@ async fn run_session(
                         display.set_video_mode(VideoMode::from_param(Some(&value)), writer.buffer());
                     }
                     Some(ClientEvent::Disconnect) => break Ok(()),
+                    Some(ClientEvent::Detached) => {
+                        for keysym in std::mem::take(&mut held.keys) {
+                            rfb_writer.key(keysym, false).await?;
+                        }
+                        let (x, y, mask) = held.pointer;
+                        if mask != 0 {
+                            held.pointer.2 = 0;
+                            rfb_writer.pointer(x, y, 0).await?;
+                        }
+                        display.detach();
+                    }
+                    Some(ClientEvent::Attached(attach))
+                        if crate::resume::take_over(writer, &attach).await =>
+                    {
+                        let info = attach.info();
+                        session::send_name(writer.buffer(), &server.name);
+                        session::attach_display(&mut display, info, writer.buffer());
+                        if !settings.disable_resize {
+                            let w = info.width.min(u16::MAX as u32) as u16;
+                            let h = info.height.min(u16::MAX as u32) as u16;
+                            let _ = rfb_writer.set_desktop_size(w, h).await?;
+                        }
+                        frame_pending = true;
+                        frame_timer.as_mut().reset(tokio::time::Instant::now());
+                    }
                     _ => {}
                 }
                 if writer.pending() > 0 {
@@ -349,6 +383,14 @@ async fn run_session(
     let _ = writer.flush().await;
     rfb_task.abort();
     result
+}
+
+/// Keys and buttons the client holds down.
+#[derive(Default)]
+struct Held {
+    keys: std::collections::HashSet<u32>,
+    /// Position and button mask last sent.
+    pointer: (u16, u16, u8),
 }
 
 /// Encodes pending changes and ends the frame (if there was anything to send).

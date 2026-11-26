@@ -30,6 +30,15 @@ pub struct Mouse {
 }
 
 impl Mouse {
+    /// Releases the buttons held, where the pointer is.
+    pub fn release_all(&mut self) -> Vec<MousePdu> {
+        if self.mask & (LEFT | MIDDLE | RIGHT) == 0 {
+            self.mask = 0;
+            return Vec::new();
+        }
+        self.update(self.x, self.y, 0)
+    }
+
     /// Returns the events turning the previous state into the new one: a
     /// move first, then button changes, then wheel notches (sent when the
     /// wheel "button" goes down, as Guacamole clients press and release it).

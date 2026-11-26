@@ -91,6 +91,9 @@ pub struct Bridge {
     resized: bool,
     /// SFTP, when the connection has it (`enable-sftp`).
     files: Option<Transfers>,
+    /// The title the remote side set, if any (sent again to a client that
+    /// attaches later).
+    title: Option<String>,
 }
 
 impl Bridge {
@@ -117,6 +120,7 @@ impl Bridge {
             dirty_since: Instant::now(),
             resized: false,
             files,
+            title: None,
         };
         bridge.renderer.invalidate(size);
         bridge.set_pointer(PointerKind::Text);
@@ -141,6 +145,7 @@ impl Bridge {
         mut inputs: mpsc::Receiver<Input>,
         mut decoder: InputDecoder,
     ) -> anyhow::Result<()> {
+        crate::resume::establish(&mut self.writer);
         let mut keepalive = tokio::time::interval(KEEPALIVE);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -155,10 +160,14 @@ impl Bridge {
                         break;
                     };
                     let event = decoder.decode(&ins, self.writer.buffer());
-                    if let Some(event) = event
-                        && !self.client_event(event)
-                    {
-                        break;
+                    match event {
+                        Some(ClientEvent::Attached(attach)) => self.attached(&attach).await,
+                        Some(event) => {
+                            if !self.client_event(event) {
+                                break;
+                            }
+                        }
+                        None => {}
                     }
                 }
                 msg = channel.wait() => match msg {
@@ -295,9 +304,13 @@ impl Bridge {
         for event in self.terminal.take_events() {
             match event {
                 Event::PtyWrite(text) => self.send(text.into_bytes()),
-                Event::Title(title) => session::send_name(self.writer.buffer(), &title),
+                Event::Title(title) => {
+                    session::send_name(self.writer.buffer(), &title);
+                    self.title = Some(title);
+                }
                 Event::ResetTitle => {
-                    session::send_name(self.writer.buffer(), &self.settings.hostname)
+                    session::send_name(self.writer.buffer(), &self.settings.hostname);
+                    self.title = None;
                 }
                 Event::ClipboardStore(_, text) if !self.settings.disable_copy => {
                     session::send_clipboard(self.writer.buffer(), &text);
@@ -353,9 +366,45 @@ impl Bridge {
                 }
             }
             ClientEvent::Disconnect => return false,
+            ClientEvent::Detached => self.detached(),
             _ => {}
         }
         true
+    }
+
+    /// The client went away and the session is held for another
+    /// ([`crate::resume`]): what it held down no longer is, and nothing
+    /// more is encoded for it. The terminal goes on.
+    fn detached(&mut self) {
+        self.mods = Modifiers::default();
+        self.mouse.mask = 0;
+        self.mouse.selecting = false;
+        self.display.detach();
+        if let Some(files) = &mut self.files {
+            files.detach();
+        }
+    }
+
+    /// A client attached: it gets the title, the whole terminal and the
+    /// pointer, and the terminal takes its size.
+    async fn attached(&mut self, attach: &crate::resume::Attach) {
+        if !crate::resume::take_over(&mut self.writer, attach).await {
+            return;
+        }
+        let info = attach.info();
+        let title = self.title.as_deref().unwrap_or(&self.settings.hostname);
+        session::send_name(self.writer.buffer(), title);
+        session::attach_display(&mut self.display, info, self.writer.buffer());
+        if let Some(files) = &mut self.files {
+            files.attach(self.writer.buffer());
+        }
+        // The new client knows of no link under its pointer.
+        self.mouse.link = None;
+        self.mouse.cell = None;
+        self.renderer.set_link(None);
+        self.resize(info.width, info.height);
+        self.resized = true;
+        self.mark_dirty();
     }
 
     fn key(&mut self, keysym: u32, pressed: bool) {

@@ -78,6 +78,13 @@ impl Params {
     }
 }
 
+#[cfg(test)]
+impl From<HashMap<String, String>> for Params {
+    fn from(values: HashMap<String, String>) -> Self {
+        Self(values)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
     #[error("client disconnected during handshake")]
@@ -110,6 +117,19 @@ pub async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer: &mut GuacWriter<W>,
     arg_names: &[&str],
     connection_id: &str,
+) -> Result<(ClientInfo, Params), HandshakeError> {
+    let (info, params) = read_connect(reader, writer, arg_names).await?;
+    send_ready(writer, connection_id, false, info.binary).await?;
+    Ok((info, params))
+}
+
+/// The first part of [`negotiate`]: sends `args` and collects client
+/// information until `connect`. [`send_ready`] completes the handshake,
+/// once the caller knows which connection the client gets.
+pub async fn read_connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut GuacReader<R>,
+    writer: &mut GuacWriter<W>,
+    arg_names: &[&str],
 ) -> Result<(ClientInfo, Params), HandshakeError> {
     writer.push(
         &InstructionBuilder::new("args")
@@ -157,17 +177,28 @@ pub async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             .collect(),
     );
     info.binary = params.get(binary::HANDSHAKE_ARG) == Some(binary::HANDSHAKE_VERSION);
+    Ok((info, params))
+}
 
-    writer.push(
-        &InstructionBuilder::new("ready")
-            .str_arg(connection_id)
-            .finish(),
-    );
+/// Answers `ready` with `connection_id`, and `resumed` when the client got
+/// a held session back (`molcajete_protocol::resume`). With `binary`, the
+/// writer is switched to records for everything that follows.
+pub async fn send_ready<W: AsyncWrite + Unpin>(
+    writer: &mut GuacWriter<W>,
+    connection_id: &str,
+    resumed: bool,
+    binary: bool,
+) -> Result<(), HandshakeError> {
+    let mut ready = InstructionBuilder::new("ready").str_arg(connection_id);
+    if resumed {
+        ready = ready.str_arg(molcajete_protocol::resume::READY_RESUMED);
+    }
+    writer.push(&ready.finish());
     writer.flush().await?;
-    if info.binary {
+    if binary {
         writer.set_binary();
     }
-    Ok((info, params))
+    Ok(())
 }
 
 #[cfg(test)]

@@ -170,9 +170,17 @@ impl std::fmt::Display for Output {
 }
 
 /// Accumulates encoded instructions and writes them in one go.
+///
+/// The writer of a session that may outlive its client
+/// ([`crate::resume`]) can lose its socket and get another: while it has
+/// none, or once a write failed, everything is dropped instead of failing
+/// the session ([`GuacWriter::set_detachable`]).
 pub struct GuacWriter<W = OwnedWriteHalf> {
-    socket: W,
+    /// `None` while no client is attached.
+    socket: Option<W>,
     buf: Output,
+    /// A failed write detaches instead of returning the error.
+    detachable: bool,
     bytes: metrics::Counter,
     /// Time spent in `write_all`: grows when the gateway / browser cannot
     /// keep up (TCP backpressure).
@@ -182,8 +190,9 @@ pub struct GuacWriter<W = OwnedWriteHalf> {
 impl<W: AsyncWrite + Unpin> GuacWriter<W> {
     pub fn new(socket: W) -> Self {
         Self {
-            socket,
+            socket: Some(socket),
             buf: Output::text(),
+            detachable: false,
             bytes: metrics::Counter::noop(),
             write_time: metrics::Histogram::noop(),
         }
@@ -193,7 +202,7 @@ impl<W: AsyncWrite + Unpin> GuacWriter<W> {
     /// Everything pushed must have been flushed.
     pub fn into_inner(self) -> W {
         debug_assert!(self.buf.is_empty());
-        self.socket
+        self.socket.expect("a writer that was never detached")
     }
 
     /// Starts recording output metrics labelled with `protocol`.
@@ -208,6 +217,36 @@ impl<W: AsyncWrite + Unpin> GuacWriter<W> {
     pub fn set_binary(&mut self) {
         debug_assert!(self.buf.is_empty());
         self.buf = Output::binary();
+    }
+
+    /// From now on a failed write drops the socket (the session goes on
+    /// without its client) instead of failing.
+    pub fn set_detachable(&mut self) {
+        self.detachable = true;
+    }
+
+    /// Whether a client is attached (the socket has not failed or been
+    /// taken away).
+    pub fn is_attached(&self) -> bool {
+        self.socket.is_some()
+    }
+
+    /// Drops the socket and whatever was waiting for it; output is
+    /// discarded until [`GuacWriter::attach`].
+    pub fn detach(&mut self) -> Option<W> {
+        self.buf.clear();
+        self.socket.take()
+    }
+
+    /// Writes to `socket` from now on, in the framing that client chose.
+    /// Output pending for the previous client is dropped.
+    pub fn attach(&mut self, socket: W, binary: bool) {
+        self.socket = Some(socket);
+        self.buf = if binary {
+            Output::binary()
+        } else {
+            Output::text()
+        };
     }
 
     pub fn push(&mut self, encoded: &str) {
@@ -225,14 +264,29 @@ impl<W: AsyncWrite + Unpin> GuacWriter<W> {
     }
 
     pub async fn flush(&mut self) -> std::io::Result<()> {
-        if !self.buf.is_empty() {
-            let started = std::time::Instant::now();
-            self.socket.write_all(self.buf.as_bytes()).await?;
-            self.write_time.record(started.elapsed());
-            self.bytes.increment(self.buf.len() as u64);
-            self.buf.clear();
+        if self.buf.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let Some(socket) = &mut self.socket else {
+            // Nobody to send it to.
+            self.buf.clear();
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        match socket.write_all(self.buf.as_bytes()).await {
+            Ok(()) => {
+                self.write_time.record(started.elapsed());
+                self.bytes.increment(self.buf.len() as u64);
+                self.buf.clear();
+                Ok(())
+            }
+            Err(err) if self.detachable => {
+                tracing::debug!(error = %err, "writing to the client failed; detaching it");
+                self.detach();
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -323,5 +377,39 @@ mod tests {
             total += data.len();
         }
         assert_eq!(total, pcm.len());
+    }
+
+    #[tokio::test]
+    async fn a_detachable_writer_survives_its_socket() {
+        let (client, server) = tokio::io::duplex(1024);
+        let mut writer = GuacWriter::new(server);
+        writer.set_detachable();
+        drop(client);
+        writer.push("3.nop;");
+        writer.flush().await.unwrap();
+        assert!(!writer.is_attached());
+        // Dropped while detached.
+        writer.push("3.nop;");
+        writer.flush().await.unwrap();
+        assert_eq!(writer.pending(), 0);
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        writer.attach(server, false);
+        writer.push("4.sync,1.1;");
+        writer.flush().await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::io::AsyncReadExt::read(&mut client, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..n], b"4.sync,1.1;");
+    }
+
+    #[tokio::test]
+    async fn a_plain_writer_reports_a_failed_write() {
+        let (client, server) = tokio::io::duplex(1024);
+        let mut writer = GuacWriter::new(server);
+        drop(client);
+        writer.push("3.nop;");
+        assert!(writer.flush().await.is_err());
     }
 }

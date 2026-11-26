@@ -220,6 +220,7 @@ impl<'a> Session<'a> {
             graphics_pipeline_offered = self.settings.gfx,
             "RDP session active"
         );
+        crate::resume::establish(self.writer);
         session::send_name(self.writer.buffer(), &self.settings.hostname);
         self.display.resize(
             u32::from(self.image.width()),
@@ -731,9 +732,65 @@ impl<'a> Session<'a> {
                 }
             }
             ClientEvent::Disconnect => return Ok(Flow::End),
+            ClientEvent::Detached => self.client_detached().await?,
+            ClientEvent::Attached(attach) => self.client_attached(&attach).await,
             _ => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// The client went away and the session is held for another
+    /// ([`crate::resume`]): what it held down is let go of, and nothing
+    /// more is encoded for it.
+    async fn client_detached(&mut self) -> anyhow::Result<()> {
+        if !self.settings.read_only {
+            let mut events: Vec<FastPathInputEvent> = self.keyboard.release_all();
+            events.extend(
+                self.mouse
+                    .release_all()
+                    .into_iter()
+                    .map(FastPathInputEvent::MouseEvent),
+            );
+            self.send_input(events).await?;
+        }
+        self.display.detach();
+        if let Some(audio) = &mut self.audio {
+            audio.detach();
+        }
+        if let Some(files) = &mut self.files {
+            files.detach();
+        }
+        self.resize = None;
+        Ok(())
+    }
+
+    /// A client attached: it gets everything a new one would, then the
+    /// whole screen, and the desktop follows its size and DPI.
+    async fn client_attached(&mut self, attach: &crate::resume::Attach) {
+        if !crate::resume::take_over(self.writer, attach).await {
+            return;
+        }
+        let info = attach.info();
+        let out = self.writer.buffer();
+        session::send_name(out, &self.settings.hostname);
+        session::attach_display(&mut self.display, info, out);
+        if let Some(available) = self.display_control.reported() {
+            out.push_str(&display_control::instruction(available));
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.attach(&info.audio);
+        }
+        if let Some(files) = &mut self.files {
+            files.attach(out);
+        }
+        self.pacer.mark_dirty(Instant::now());
+        // Follow the client's DPI unless the connection fixed one.
+        let follows_client = self.dpi == self.client_dpi;
+        self.client_dpi = info.dpi;
+        if follows_client && info.dpi != self.dpi {
+            self.request_scale(info.dpi);
+        }
+        self.request_resize(info.width, info.height);
     }
 
     async fn send_input(&mut self, events: Vec<FastPathInputEvent>) -> anyhow::Result<()> {

@@ -280,6 +280,9 @@ pub struct Display {
     /// The connection others may join, when this is its display
     /// ([`crate::share`]).
     share: Option<Arc<Shared>>,
+    /// No client is attached ([`Display::detach`]): the framebuffer is kept
+    /// up to date, but nothing is encoded.
+    detached: bool,
 }
 
 impl Drop for Display {
@@ -654,6 +657,7 @@ impl Display {
             video: None,
             metrics: DisplayMetrics::disabled(),
             share: None,
+            detached: false,
         }
     }
 
@@ -957,6 +961,11 @@ impl Display {
         let mut stats = FlushStats::default();
         // While the touched tiles are still marked.
         self.share_frame();
+        if self.detached {
+            // Whatever the next client gets is compared afresh.
+            self.dirty.iter_mut().for_each(|d| *d = false);
+            return stats;
+        }
         self.decay();
         self.last_flush = started;
         self.clock.frame_started(started);
@@ -1927,6 +1936,10 @@ impl Display {
         if let Some(share) = &self.share {
             share.set_cursor(self.last_cursor.as_ref());
         }
+        if self.detached {
+            // Sent on attach.
+            return;
+        }
         let region = Region {
             width,
             height,
@@ -1954,6 +1967,9 @@ impl Display {
 
     /// Ends a frame.
     pub fn sync(&mut self, out: &mut Output) {
+        if self.detached {
+            return;
+        }
         let mut ts = now_ms();
         if let Some(last) = self.last_sync
             && ts <= last
@@ -2014,6 +2030,55 @@ impl Display {
         self.reading_since = Instant::now();
     }
 
+    /// The client went away ([`crate::resume`]): changes from the remote
+    /// side still go into the framebuffer, but no frame is encoded or
+    /// counted until [`Display::attach`]. The video stream ends (silently:
+    /// nobody plays it).
+    pub fn detach(&mut self) {
+        if self.detached {
+            return;
+        }
+        self.detached = true;
+        self.stop_video(&mut Output::text());
+        self.clock = FrameClock::new(self.clock.pacing());
+        self.frame_bytes = 0;
+        self.frame_images = 0;
+    }
+
+    #[cfg(test)]
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
+
+    /// A client attached that has nothing on its screen yet: what it
+    /// accepts replaces what the previous one did, the pacing starts over,
+    /// and the next flush sends the whole framebuffer. The size of the
+    /// default layer and the cursor go to `out` now. Video has to be
+    /// enabled again for this client (`session::enable_video`).
+    pub fn attach(&mut self, formats: ImageFormats, out: &mut Output) {
+        self.detach();
+        self.detached = false;
+        self.formats = formats;
+        self.zstd = formats.zstd;
+        self.video_support = None;
+        self.clock = FrameClock::new(self.clock.pacing());
+        self.last_sync = None;
+        // A new layer is transparent black, as the mirror of a new display.
+        self.sent.iter_mut().for_each(|b| *b = 0);
+        self.dirty.iter_mut().for_each(|d| *d = true);
+        self.lossy.iter_mut().for_each(|l| *l = false);
+        self.heat.iter_mut().for_each(|h| *h = 0.0);
+        self.motion.iter_mut().for_each(|m| *m = 0.0);
+        *out += &InstructionBuilder::new("size")
+            .arg(0)
+            .arg(self.width)
+            .arg(self.height)
+            .finish();
+        if let Some((hx, hy, w, h, rgba)) = self.last_cursor.take() {
+            self.set_cursor(hx, hy, w, h, &rgba, out);
+        }
+    }
+
     /// Frames sent but not yet acknowledged by the client.
     pub fn unacked_frames(&self) -> u32 {
         self.clock.unacked() as u32
@@ -2027,6 +2092,9 @@ impl Display {
     /// When a frame should be flushed even if nothing changes: to end an
     /// idle video, or to refine lossy areas once they cooled down.
     pub fn idle_deadline(&self) -> Option<Instant> {
+        if self.detached {
+            return None;
+        }
         let hottest = (0..self.tile_rows)
             .flat_map(|ty| (0..self.tile_cols).map(move |tx| (tx, ty)))
             .filter(|&(tx, ty)| {

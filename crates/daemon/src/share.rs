@@ -324,6 +324,7 @@ impl Shared {
                 instruction: Instruction::new("sync", ["0"]),
                 received: std::time::Instant::now(),
                 from_viewer: true,
+                control: None,
             });
         }
         Viewer {
@@ -446,6 +447,7 @@ impl Viewer {
                     instruction,
                     received: std::time::Instant::now(),
                     from_viewer: true,
+                    control: None,
                 })
                 .await;
         }
