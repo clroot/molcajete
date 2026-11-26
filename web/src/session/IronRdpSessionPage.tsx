@@ -17,12 +17,20 @@ import SessionMenuButton from './SessionMenuButton';
 import {useMenuShortcut} from './useMenuShortcut';
 import type {ConnectionStatus} from './useSessionEvents';
 import {describeIronRdpError, ironRdpTunnelUrl} from './ironrdp';
+import {installIronRdpTouch} from './ironrdpTouch';
 
 type RdpModule = typeof import('@devolutions/iron-remote-desktop-rdp');
 
 const styles = stylex.create({
-  frame: {position: 'fixed', inset: 0, backgroundColor: 'black'},
-  display: {display: 'block', width: '100%', height: '100%'},
+  // Touches belong to the remote screen, not to page scrolling or zooming.
+  frame: {
+    position: 'fixed',
+    inset: 0,
+    backgroundColor: 'black',
+    touchAction: 'none',
+    overscrollBehavior: 'none',
+  },
+  display: {display: 'block', width: '100%', height: '100%', touchAction: 'none'},
 });
 
 /** IronRDP's packages, loaded once and only for these sessions (several MB). */
@@ -104,9 +112,11 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
       clearTimeout(timer);
       setUi((event as CustomEvent<{irgUserInteraction: UserInteraction}>).detail.irgUserInteraction);
     });
+    const removeTouch = installIronRdpTouch(element);
     frame.append(element);
     return () => {
       clearTimeout(timer);
+      removeTouch();
       element.remove();
       setUi(null);
     };
