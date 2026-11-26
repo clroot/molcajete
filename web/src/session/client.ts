@@ -23,6 +23,10 @@ export type SessionStats = {
   framePresentMsMax?: number;
   rttMs: number | null;
   queuedOps: number;
+  /** The codec of the open video streams (`av1`, `h265`, `h264`); null without one. */
+  videoCodec?: string | null;
+  /** The formats of the images that arrived in this second, such as `jpeg` and `png`. */
+  imageFormats?: string[];
 };
 
 /** How a modifier is held from the page: for the next key, or until it is turned off. */
@@ -204,6 +208,8 @@ export function formatStats(s: SessionStats, mode: string): string {
   return [
     `renderer  WebGL2 (${mode} thread)`,
     `display   ${s.displayWidth}×${s.displayHeight}`,
+    `video     ${s.videoCodec ?? '-'}`,
+    `images    ${s.imageFormats?.length ? s.imageFormats.join(', ') : '-'}`,
     `frames    ${s.framesPerSecond.toFixed(1)}/s`,
     `paints    ${s.compositesPerSecond.toFixed(1)}/s`,
     `draws     ${s.drawCallsPerSecond.toFixed(0)}/s`,
