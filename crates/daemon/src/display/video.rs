@@ -74,9 +74,12 @@ const SETTLE_FRAMES: u32 = 10;
 const MAX_OUTGROWN_FRAMES: u32 = 60;
 /// Encoder errors after which video mode is given up for the session.
 const MAX_FAILURES: u32 = 3;
-/// Nominal frame rate given to rate control (frames are sent at most this
-/// often by the frame pacing while a video is active; slower content simply
-/// uses fewer bits).
+/// Nominal frame rate given to rate control, which spends the bitrate per
+/// frame: slower content uses fewer bits per second, and content the remote
+/// server updates faster uses more. Frames are not held to this rate. They
+/// follow the remote server's own, and a limit at about the rate of the
+/// content merged a frame whenever two of the server's fell into one
+/// interval, which showed as stutter (GH-116).
 pub(super) const FPS: u32 = 30;
 /// Target bits per pixel and frame for H.264; the other codecs reach the
 /// same quality with fewer bits.
@@ -707,7 +710,7 @@ fn legacy_regrow(active: &mut ActiveVideo, candidate: Option<Rect>) -> Option<Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::ImageFormats;
+    use crate::display::{ImageFormats, Pacing};
     use crate::video::EncodedFrame;
     use std::sync::{Arc, Mutex};
 
@@ -878,6 +881,26 @@ mod tests {
                 [r, g, b, 255]
             })
             .collect()
+    }
+
+    #[test]
+    fn video_frames_are_paced_like_any_other_frame() {
+        let (display, _log) = display_with_video();
+        let mut display = display.with_pacing(Pacing::DESKTOP);
+        let mut sent = Instant::now();
+        for frame in 0..40u32 {
+            let mut out = Output::text();
+            display.put(100, 70, 300, 200, &noise(frame, 300, 200));
+            display.flush(&mut out);
+            display.sync(&mut out);
+            sent = Instant::now();
+            // The client keeps up: no frame waits for an acknowledgement.
+            display.ack(display.last_sync.unwrap(), sent);
+        }
+        assert!(display.video.is_some());
+        // The profile's interval (60 frames per second), not the encoder's
+        // nominal rate.
+        assert!(display.next_frame_at() <= sent + Duration::from_millis(16));
     }
 
     #[test]

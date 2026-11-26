@@ -80,6 +80,10 @@ impl Timing {
     }
 }
 
+/// Frames further apart than this do not belong to one run of frames (the
+/// screen stood still in between), and their interval is not recorded.
+const FRAME_RUN_GAP: Duration = Duration::from_secs(1);
+
 /// Totals over the life of one display (one session).
 #[derive(Default)]
 struct Totals {
@@ -113,6 +117,7 @@ pub(super) struct DisplayMetrics {
     frames: Counter,
     frame_bytes: Histogram,
     frame_images: Histogram,
+    frame_interval: Histogram,
     client_ack: Histogram,
     client_apply: Histogram,
     ack_wait: Histogram,
@@ -143,6 +148,7 @@ impl DisplayMetrics {
             frames: Counter::noop(),
             frame_bytes: Histogram::noop(),
             frame_images: Histogram::noop(),
+            frame_interval: Histogram::noop(),
             client_ack: Histogram::noop(),
             client_apply: Histogram::noop(),
             ack_wait: Histogram::noop(),
@@ -186,6 +192,7 @@ impl DisplayMetrics {
             frames: counter!("molcajeted_frames_total", &labels),
             frame_bytes: histogram!("molcajeted_frame_encoded_bytes", &labels),
             frame_images: histogram!("molcajeted_frame_images", &labels),
+            frame_interval: histogram!("molcajeted_frame_interval_seconds", &labels),
             client_ack: histogram!("molcajeted_client_ack_seconds", &labels),
             client_apply: histogram!("molcajeted_client_apply_seconds", &labels),
             ack_wait: histogram!("molcajeted_client_ack_wait_seconds", &labels),
@@ -245,9 +252,21 @@ impl DisplayMetrics {
         self.totals.flush.add(elapsed);
     }
 
-    /// A frame of `images` images was closed with `sync`.
-    pub(super) fn frame(&mut self, encoded_bytes: usize, images: u32, unacked: usize) {
+    /// A frame of `images` images was closed with `sync`, `interval` after
+    /// the frame before it.
+    pub(super) fn frame(
+        &mut self,
+        encoded_bytes: usize,
+        images: u32,
+        unacked: usize,
+        interval: Option<Duration>,
+    ) {
         self.frames.increment(1);
+        // Within a run of frames only: how evenly they follow each other.
+        // A longer gap is the screen standing still.
+        if let Some(interval) = interval.filter(|&i| i < FRAME_RUN_GAP) {
+            self.frame_interval.record(interval);
+        }
         self.frame_bytes.record(encoded_bytes as f64);
         self.frame_images.record(images as f64);
         self.totals.frame_images_max = self.totals.frame_images_max.max(images);
