@@ -35,7 +35,8 @@ const PASSWORD = process.env.GATEWAY_PASSWORD ?? "change-me";
 const CONNECTION = process.env.CONNECTION ?? "rdp-drive";
 const RDP_CONTAINER = process.env.RDP_CONTAINER ?? "gh98-rdp-fuse";
 const DRIVE_NAME = process.env.DRIVE_NAME ?? "molcajete";
-// When the browser runs on Windows and docker in WSL, `wsl.exe docker`.
+// When the browser runs on Windows and docker in WSL, `wsl.exe -e docker`
+// (`-e`: no shell in between, which would expand `$HOME` and split the script).
 const DOCKER = (process.env.DOCKER ?? "docker").split(" ");
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -51,7 +52,14 @@ const profile = await mkdtemp(path.join(os.tmpdir(), "molcajete-e2e-profile-"));
 const context = await chromium.launchPersistentContext(profile, {
   executablePath: process.env.CHROME,
   acceptDownloads: true,
-  args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
+  // CHROME_ARGS adds flags, e.g. --unsafely-treat-insecure-origin-as-secure=<GATEWAY>
+  // for a gateway on another host, where the page is not a secure context.
+  args: [
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
+    ...(process.env.CHROME_ARGS ?? "").split(" ").filter(Boolean),
+  ],
 });
 const page = context.pages()[0] ?? (await context.newPage());
 page.on("pageerror", (err) => console.error("page error:", err));
