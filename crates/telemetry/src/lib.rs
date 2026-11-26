@@ -31,6 +31,13 @@ const LATENCY_BUCKETS: &[f64] = &[
     0.000_25, 0.0005, 0.001, 0.002, 0.004, 0.008, 0.016, 0.033, 0.066, 0.1, 0.25, 0.5, 1.0, 2.5,
     5.0, 10.0,
 ];
+/// Buckets for the time between frames (`*_interval_seconds`). Their bounds
+/// lie between the intervals of the common frame rates (16.7, 33.3 and
+/// 66.7 ms for 60, 30 and 15 frames per second), which the latency buckets
+/// have theirs right next to (33 and 66 ms).
+const INTERVAL_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.014, 0.02, 0.025, 0.03, 0.04, 0.05, 0.06, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0,
+];
 /// Buckets for whole-session durations (`*_duration_seconds`).
 const DURATION_BUCKETS: &[f64] = &[
     1.0, 10.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0, 28800.0,
@@ -157,6 +164,10 @@ fn builder() -> anyhow::Result<PrometheusBuilder> {
         .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".into()),
             DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Suffix("_interval_seconds".into()),
+            INTERVAL_BUCKETS,
         )?
         .set_buckets_for_metric(Matcher::Suffix("_bytes".into()), SIZE_BUCKETS)?
         .set_buckets_for_metric(Matcher::Suffix("_fps".into()), FPS_BUCKETS)?
@@ -338,6 +349,22 @@ mod tests {
                 "{out}"
             );
         }
+    }
+
+    #[test]
+    fn frame_intervals_get_buckets_between_the_frame_rates() {
+        let name = "molcajeted_frame_interval_seconds";
+        let out = render(&[name]);
+        for bound in ["0.02", "0.04", "0.075"] {
+            assert!(
+                out.contains(&format!("{name}_bucket{{le=\"{bound}\"}} 0")),
+                "{out}"
+            );
+        }
+        assert!(
+            !out.contains(&format!("{name}_bucket{{le=\"0.033\"}}")),
+            "{out}"
+        );
     }
 
     #[test]

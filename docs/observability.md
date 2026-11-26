@@ -49,7 +49,7 @@ remote server -> molcajeted: receive and decode / diff / scroll and move detecti
               -> gateway relay -> WebSocket -> browser: receive and parse / decode / apply / draw -> sync ack
 ```
 
-Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duration_seconds` use buckets up to 8 hours, `_bytes` up to 16 MiB, `_fps` up to 144, and `_ops`, `_frames` and `_images` small counts up to 1024. Both processes also export `molcajete_build_info{service, version}` (always 1), to tell which version produced a series.
+Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duration_seconds` use buckets up to 8 hours, `_interval_seconds` buckets from 5 ms to 1 s with bounds between the intervals of 60, 30 and 15 frames per second, `_bytes` up to 16 MiB, `_fps` up to 144, and `_ops`, `_frames` and `_images` small counts up to 1024. Both processes also export `molcajete_build_info{service, version}` (always 1), to tell which version produced a series.
 
 ### molcajeted
 
@@ -77,6 +77,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajeted_video_encode_seconds` | histogram | codec, key | Encoding one video frame, including the round trip to ffmpeg |
 | `molcajeted_video_frame_bytes` | histogram | codec, key | Video frame size |
 | `molcajeted_frames_total` | counter | protocol | Frames (`sync`) sent |
+| `molcajeted_frame_interval_seconds` | histogram | protocol | Time between a frame and the one before it, within a run of frames (intervals of a second or more, when the screen stood still, are left out). Shows how evenly frames follow each other: during a 30 fps video nearly all intervals should be within 40 ms, and a share of longer ones means frames are being merged or held back |
 | `molcajeted_frame_encoded_bytes` | histogram | protocol | Encoded image bytes per frame |
 | `molcajeted_frame_images` | histogram | protocol | Images per frame (fills and copies not counted): the client decodes each, and the daemon encodes them side by side |
 | `molcajeted_client_ack_seconds` | histogram | protocol | From sending a frame to the client's ack arriving: network round trip, plus the time the frame's data takes to arrive (`molcajete_client_frame_receive_seconds`), plus browser processing |
@@ -226,6 +227,13 @@ histogram_quantile(0.95, sum by (le) (rate(molcajete_client_frame_lag_seconds_bu
 # the same per kind of client: a slow tablet and a fast desktop separately
 histogram_quantile(0.95, sum by (le, browser, device) (rate(molcajete_client_frame_lag_seconds_bucket[5m])))
 
+# share of frames that came more than 40 ms after the one before (stutter
+# during video), next to the frames per second from the server and to the client
+1 - sum(rate(molcajeted_frame_interval_seconds_bucket{protocol="rdp", le="0.04"}[1m]))
+  / sum(rate(molcajeted_frame_interval_seconds_count{protocol="rdp"}[1m]))
+sum(rate(molcajeted_rdp_gfx_frames_total[1m]))
+sum(rate(molcajeted_frames_total{protocol="rdp"}[1m]))
+
 # what taking pixels in costs: bytes received from the remote server,
 # and decoding time as a fraction of one core
 sum by (protocol) (rate(molcajeted_remote_received_bytes_total[5m]))
@@ -278,7 +286,7 @@ For molcajeted running natively on a Mac, add a static target for `host.orb.inte
 `deploy/observability/grafana-dashboard.json` (*Molcajete Performance*) expects datasources with the uids `prometheus`, `loki` and `pyroscope`. It narrows a bottleneck down in order, one row each:
 
 1. **Overview**: open tunnels, active sessions, frames sent, frame build p95, ack p95, browser lag p95.
-2. **Server frame pipeline (molcajeted)**: frame build time, CPU per flush phase, image and video encode times, encoding throughput and compression, bytes and images per frame, socket write waits, bytes received from the remote server and their decoding time, and the copies scroll and move detection found.
+2. **Server frame pipeline (molcajeted)**: frame build time, CPU per flush phase, image and video encode times, encoding throughput and compression, bytes and images per frame, socket write waits, bytes received from the remote server and their decoding time, the copies scroll and move detection found, and the frame cadence: frames per second from the remote server against frames sent, the time between frames, and the share of frames more than 40 ms apart.
 3. **Client and network**: the server's ack against round trip, frame arrival and browser lag; browser fps and backlog; browser lag and frame arrival by kind of client; the apply times clients report to molcajeted; and *Clients over the time range*.
 4. **Gateway**: relayed traffic, handshake time, closed tunnels by status.
 5. **CPU profiles (Pyroscope)**: molcajeted and gateway flamegraphs.
