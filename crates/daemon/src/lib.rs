@@ -79,6 +79,11 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr) {
     }
 
     let connection_id = format!("${}", uuid::Uuid::new_v4());
+    if selected == RELAY {
+        let span = info_span!("connection", id = %connection_id, protocol = RELAY, %peer);
+        relay(reader, writer, connection_id).instrument(span).await;
+        return;
+    }
     let (protocol, args, file_args) = match selected.as_str() {
         "vnc" => ("vnc", vnc::ARGS, &[][..]),
         "ssh" => ("ssh", ssh::ARGS, files::SSH_ARGS),
@@ -108,6 +113,41 @@ pub async fn handle(stream: TcpStream, peer: SocketAddr) {
     session(reader, writer, protocol, &args, connection_id)
         .instrument(span)
         .await;
+}
+
+/// `select` value of an RDP connection relayed to a client that runs RDP
+/// itself (`rdp::relay`). Only a molcajete gateway asks for it.
+const RELAY: &str = "rdp-relay";
+
+/// Serves a relayed RDP connection: the handshake, `ready`, and then raw
+/// RDCleanPath and RDP bytes instead of Guacamole instructions.
+async fn relay(mut reader: GuacReader, mut writer: GuacWriter, connection_id: String) {
+    let args: Vec<&'static str> = rdp::ARGS
+        .iter()
+        .chain(jump::ARGS)
+        .chain(rdp::relay::ARGS)
+        .copied()
+        .collect();
+    let (info, params) =
+        match handshake::negotiate(&mut reader, &mut writer, &args, &connection_id).await {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, "handshake failed");
+                connection_done(RELAY, "handshake_failed");
+                return;
+            }
+        };
+    info!("relay established");
+    let active = metrics::gauge!("molcajeted_connections_active", "protocol" => RELAY);
+    active.increment(1.0);
+    let started = Instant::now();
+    rdp::relay::run(reader, writer, info, params).await;
+    active.decrement(1.0);
+    let duration = started.elapsed();
+    metrics::histogram!("molcajeted_session_duration_seconds", "protocol" => RELAY)
+        .record(duration);
+    connection_done(RELAY, "ok");
+    info!(duration_s = duration.as_secs_f64(), "connection closed");
 }
 
 async fn session(

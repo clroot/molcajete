@@ -85,7 +85,7 @@ impl ConnectError {
 }
 
 /// Formats an error with its chain of sources.
-fn report(error: &dyn std::error::Error) -> String {
+pub(super) fn report(error: &dyn std::error::Error) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(err) = source {
@@ -100,7 +100,7 @@ fn report(error: &dyn std::error::Error) -> String {
 }
 
 /// Kerberos is not supported, so CredSSP never needs to reach a KDC.
-struct NoNetwork;
+pub(super) struct NoNetwork;
 
 impl NetworkClient for NoNetwork {
     async fn send(
