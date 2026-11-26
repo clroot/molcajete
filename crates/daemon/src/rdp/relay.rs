@@ -52,7 +52,7 @@ use ironrdp_pdu::{Action, PduHint};
 use ironrdp_rdcleanpath::{DetectionResult, RDCleanPath, RDCleanPathPdu};
 use ironrdp_tokio::{FramedWrite as _, TokioFramed};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::connect::RdpStream;
 use super::settings::{Security, Settings};
@@ -472,7 +472,8 @@ where
     let to_browser = async move {
         browser_write.write_all(&server_leftover).await?;
         let mut server_read = server_read;
-        tokio::io::copy(&mut server_read, &mut browser_write).await?;
+        let copied = tokio::io::copy(&mut server_read, &mut browser_write).await;
+        debug!(?copied, "server closed the relay");
         browser_write.shutdown().await
     };
     let to_server = async move {
@@ -483,13 +484,18 @@ where
                 && let Some(rewritten) = rewrite_client_info(&pdu, settings, relay)?
             {
                 server_write.write_all(&rewritten).await?;
+                server_write.flush().await?;
+                debug!("Client Info PDU sent with the stored credentials");
                 break;
             }
             server_write.write_all(&pdu).await?;
+            server_write.flush().await?;
         }
         let (mut browser_read, rest) = framed.into_inner();
         server_write.write_all(&rest).await?;
-        tokio::io::copy(&mut browser_read, &mut server_write).await?;
+        server_write.flush().await?;
+        let copied = tokio::io::copy(&mut browser_read, &mut server_write).await;
+        debug!(?copied, "browser closed the relay");
         server_write.shutdown().await
     };
     // Either side closing ends the relay.
