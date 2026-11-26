@@ -20,7 +20,7 @@ use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_rdpdr::Rdpdr;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
-use ironrdp_svc::SvcProcessorMessages;
+use ironrdp_svc::{ChannelFlags, SvcProcessorMessages};
 use ironrdp_tokio::{FramedWrite as _, TokioFramed, single_sequence_step_read, split_tokio_framed};
 use molcajete_protocol::Status;
 use tokio::io::{ReadHalf, WriteHalf};
@@ -33,7 +33,7 @@ use super::clipboard::{self, GuacClipboard};
 use super::connect::{RdpFramed, RdpStream};
 use super::display_control::{self, DisplayControlStatus};
 use super::drive::DriveBackend;
-use super::gfx::GraphicsChannel;
+use super::gfx::{Decoded, Frames, GraphicsChannel};
 use super::graphics::{self, Area, Cursor};
 use super::keyboard::Keyboard;
 use super::mouse::Mouse;
@@ -108,6 +108,9 @@ pub struct Session<'a> {
     files: Option<Transfers>,
     /// Whether the drive's backend has completions to collect.
     poll_drive: bool,
+    /// What the graphics pipeline's decoding thread produces, while the
+    /// server has the channel open.
+    pipeline: Option<mpsc::UnboundedReceiver<Decoded>>,
     decode_time: DecodeTime,
     /// Frames the server marked the end of.
     server_frames: metrics::Counter,
@@ -185,6 +188,7 @@ impl<'a> Session<'a> {
             decode_time: DecodeTime::new("rdp"),
             server_frames: crate::remote::frames("rdp"),
             writes: Writes::new("rdp"),
+            pipeline: None,
             copy_time: Duration::ZERO,
         }
     }
@@ -255,6 +259,15 @@ impl<'a> Session<'a> {
                     None => {
                         debug!("client disconnected");
                         Flow::End
+                    }
+                },
+                decoded = next_decoded(&mut self.pipeline) => match decoded {
+                    Some(decoded) => self.pipeline_decoded(decoded).await?,
+                    None => {
+                        // The channel is gone. One the server opens again
+                        // is picked up with its first PDU.
+                        self.pipeline = None;
+                        Flow::Continue
                     }
                 },
                 pdu = self.rdp_reader.read_pdu() => match pdu {
@@ -368,7 +381,7 @@ impl<'a> Session<'a> {
         let decoded = started.elapsed();
         let frame_ended = ends_server_frame(action, &outputs);
         let flow = self.stage_outputs(outputs, WriteCause::Response).await?;
-        let pipeline_frame_ended = self.pipeline_frames();
+        self.attach_pipeline();
         if frame_ended {
             if !self.pacer.marks_frames() {
                 info!("the RDP server marks its frames; frames follow its boundaries");
@@ -393,10 +406,9 @@ impl<'a> Session<'a> {
         let due = self.display.next_frame_at();
         // Where the server ended a frame, what is pending is whole and goes
         // out at once: its next frame may already be arriving, and the loop
-        // reads what is ready before it sends a frame.
-        let server_frame_ended = frame_ended || pipeline_frame_ended;
-        if ((server_frame_ended && self.pacer.due_at_frame_end(now, due))
-            || self.pacer.overdue(now, due))
+        // reads what is ready before it sends a frame. (Frames of the
+        // graphics pipeline end in `pipeline_decoded`.)
+        if ((frame_ended && self.pacer.due_at_frame_end(now, due)) || self.pacer.overdue(now, due))
             && self.display.unacked_frames() <= MAX_UNACKED_FRAMES
         {
             self.send_frame().await?;
@@ -466,18 +478,70 @@ impl<'a> Session<'a> {
         Ok(Flow::Continue)
     }
 
-    /// Moves the frames the graphics pipeline completed with this PDU into
-    /// the display. The pipeline hands over nothing of a frame before the
-    /// server ended it, so what arrives here is always whole frames.
-    /// Returns whether there were any.
-    fn pipeline_frames(&mut self) -> bool {
-        let Some(frames) = self
+    /// Starts listening to the graphics pipeline's decoding thread once the
+    /// server has opened the channel. A channel it opens again is a new one
+    /// with a thread of its own, which replaces the one listened to: what
+    /// that still had to say belonged to the closed channel.
+    fn attach_pipeline(&mut self) {
+        if let Some(decoded) = self
             .stage
             .get_dvc_mut::<GraphicsChannel>()
-            .and_then(|mut channel| channel.processor_mut().take_frames())
-        else {
-            return false;
-        };
+            .and_then(|mut channel| channel.processor_mut().take_decoded())
+        {
+            self.pipeline = Some(decoded);
+        }
+    }
+
+    /// Acts on what the decoding thread made of the channel's messages:
+    /// `first` and whatever else is ready. The replies go to the server
+    /// (the acknowledgement of a frame lets it send the next one) and the
+    /// frames into the display. The pipeline hands over nothing of a frame
+    /// before the server ended it, so what arrives here is always whole
+    /// frames, and several that are ready go out as one.
+    async fn pipeline_decoded(&mut self, first: Decoded) -> anyhow::Result<Flow> {
+        let mut next = Some(first);
+        let mut frame_ended = false;
+        while let Some(decoded) = next {
+            let replies = match decoded.replies {
+                Ok(replies) => replies,
+                Err(error) => {
+                    warn!(%error, "failed to process RDP graphics pipeline data");
+                    send_error(self.writer, "RDP protocol error", Status::UPSTREAM_ERROR).await;
+                    return Ok(Flow::End);
+                }
+            };
+            if !replies.is_empty() {
+                let messages = ironrdp_dvc::encode_dvc_messages(
+                    decoded.channel_id,
+                    replies,
+                    ChannelFlags::empty(),
+                )?;
+                let frame = self.stage.encode_dvc_messages(messages)?;
+                self.write_rdp(&frame, WriteCause::Response).await?;
+            }
+            if let Some(frames) = decoded.frames {
+                self.draw_pipeline_frames(&frames);
+                frame_ended = true;
+            }
+            next = self
+                .pipeline
+                .as_mut()
+                .and_then(|pipeline| pipeline.try_recv().ok());
+        }
+        let now = Instant::now();
+        if frame_ended
+            && self
+                .pacer
+                .due_at_frame_end(now, self.display.next_frame_at())
+            && self.display.unacked_frames() <= MAX_UNACKED_FRAMES
+        {
+            self.send_frame().await?;
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Moves frames the graphics pipeline completed into the display.
+    fn draw_pipeline_frames(&mut self, frames: &Frames) {
         let started = Instant::now();
         // The server announces the output size of the pipeline separately
         // from the desktop size of the reactivation; they are the same
@@ -492,10 +556,9 @@ impl<'a> Session<'a> {
         }
         frames.draw(&mut self.display);
         let now = Instant::now();
-        self.copy_time += now - started;
+        self.decode_time.record(now - started);
         // A frame of the server ended here.
         self.pacer.mark_dirty(now);
-        true
     }
 
     /// Runs the Deactivation-Reactivation Sequence (e.g. after a resize).
@@ -844,6 +907,16 @@ fn ends_server_frame(action: Action, outputs: &[ActiveStageOutput]) -> bool {
         && outputs
             .iter()
             .any(|o| matches!(o, ActiveStageOutput::ResponseFrame(frame) if !frame.is_empty()))
+}
+
+/// The next result of the graphics pipeline's decoding thread; `None` when
+/// the channel it belongs to is gone. For `select!` in the session loop
+/// (never ready while the server has no channel open).
+async fn next_decoded(pipeline: &mut Option<mpsc::UnboundedReceiver<Decoded>>) -> Option<Decoded> {
+    match pipeline {
+        Some(pipeline) => pipeline.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn supports_fastpath(flags: InputFlags) -> bool {

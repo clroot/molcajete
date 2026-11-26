@@ -15,15 +15,25 @@
 //! wrapping matters: IronRDP's active stage looks for a channel of the
 //! client's own type and, if it finds one, copies every frame into its
 //! decoded image first, from where the session would copy it again. With the
-//! wrapper the session loop takes the changed output regions itself
-//! ([`GraphicsChannel::take_frames`]) and writes them straight into the
-//! display. The regions only become available when the server ends a frame,
-//! so the display never holds half of one.
+//! wrapper the session takes the changed output regions itself ([`Frames`])
+//! and writes them straight into the display. The regions only become
+//! available when the server ends a frame, so the display never holds half
+//! of one.
+//!
+//! Decoding does not run on the session loop. A full-screen AVC444 frame
+//! takes 17 ms to decode at 3840×1919, and the loop also encodes the frame
+//! for the browser (16 ms as video) and reads the client's input; one after
+//! the other they held it for the whole time between two frames of the
+//! server. The channel hands every message to a thread of its own, which
+//! runs the client ([`Pipeline`]) and sends back what the session has to do
+//! with the result ([`Decoded`]): write the replies to the server and draw
+//! the frames. Replies and frames keep the order of the messages.
 //!
 //! The client reports what it does to a handler ([`PipelineEvents`]), which
 //! counts the decoded pixels per codec.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use ironrdp_core::impl_as_any;
@@ -36,7 +46,8 @@ use ironrdp_egfx::pdu::{
 };
 use ironrdp_pdu::PduResult;
 use metrics::{Counter, Histogram, counter, histogram};
-use tracing::info;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tracing::{info, warn};
 
 use crate::display::Display;
 use crate::video::PipelineDecoder;
@@ -170,8 +181,9 @@ impl Frames {
     }
 }
 
-/// The graphics pipeline's dynamic channel.
-pub struct GraphicsChannel {
+/// The pipeline's client with its bookkeeping: what the decoding thread
+/// runs for every message of the channel.
+struct Pipeline {
     client: GraphicsPipelineClient,
     tally: Arc<Mutex<Tally>>,
     /// Name of the H.264 decoder, if there is one.
@@ -188,8 +200,8 @@ pub struct GraphicsChannel {
     longest: Duration,
 }
 
-impl GraphicsChannel {
-    pub fn new(decoder: Option<PipelineDecoder>) -> Self {
+impl Pipeline {
+    fn new(decoder: Option<PipelineDecoder>) -> Self {
         let tally = Arc::new(Mutex::new(Tally::default()));
         let events = PipelineEvents {
             tally: Arc::clone(&tally),
@@ -217,7 +229,7 @@ impl GraphicsChannel {
 
     /// What changed on the output in the frames completed since the last
     /// call, if anything.
-    pub fn take_frames(&mut self) -> Option<Frames> {
+    fn take_frames(&mut self) -> Option<Frames> {
         let frames = Frames {
             resized: self.client.take_output_reset(),
             updates: self.client.drain_output(),
@@ -268,9 +280,7 @@ impl GraphicsChannel {
     }
 }
 
-impl_as_any!(GraphicsChannel);
-
-impl DvcProcessor for GraphicsChannel {
+impl Pipeline {
     fn channel_name(&self) -> &str {
         self.client.channel_name()
     }
@@ -293,9 +303,7 @@ impl DvcProcessor for GraphicsChannel {
     }
 }
 
-impl DvcClientProcessor for GraphicsChannel {}
-
-impl Drop for GraphicsChannel {
+impl Drop for Pipeline {
     /// Logs the session's totals, like the display does for its own.
     fn drop(&mut self) {
         if self.total_frames == 0 {
@@ -324,6 +332,149 @@ impl Drop for GraphicsChannel {
     }
 }
 
+/// What the decoding thread made of one message of the channel, for the
+/// session to act on.
+pub struct Decoded {
+    /// The channel the replies go to.
+    pub channel_id: u32,
+    /// The client's replies for the server (the acknowledgement of a frame
+    /// among them), or why the message could not be processed.
+    pub replies: Result<Vec<DvcMessage>, String>,
+    /// The frames the message completed.
+    pub frames: Option<Frames>,
+}
+
+/// A message of the channel, for the decoding thread.
+struct Job {
+    channel_id: u32,
+    payload: Vec<u8>,
+}
+
+/// The graphics pipeline's dynamic channel.
+///
+/// The server may close the channel and open it again, each time as a new
+/// one of these with a thread of its own.
+pub struct GraphicsChannel {
+    name: String,
+    pipeline: Arc<Mutex<Pipeline>>,
+    /// Messages for the decoding thread, which ends when this is dropped.
+    jobs: mpsc::Sender<Job>,
+    /// What the thread made of them, until the session takes it.
+    decoded: Option<UnboundedReceiver<Decoded>>,
+    /// The server closed the channel: what is still queued is void.
+    closed: Arc<AtomicBool>,
+}
+
+impl GraphicsChannel {
+    pub fn new(decoder: Option<PipelineDecoder>) -> Self {
+        let pipeline = Pipeline::new(decoder);
+        let name = pipeline.channel_name().to_owned();
+        let pipeline = Arc::new(Mutex::new(pipeline));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (jobs, queue) = mpsc::channel();
+        let (results, decoded) = unbounded_channel();
+        let worker = {
+            let (pipeline, closed) = (Arc::clone(&pipeline), Arc::clone(&closed));
+            // What the thread logs belongs to the connection it works for.
+            let span = tracing::Span::current();
+            move || span.in_scope(|| decode_messages(&queue, &pipeline, &closed, &results))
+        };
+        if let Err(err) = std::thread::Builder::new()
+            .name("rdp-gfx".into())
+            .spawn(worker)
+        {
+            // Without the thread no message is answered and the server
+            // stops sending; the session then ends on its own timeouts.
+            warn!(error = %err, "cannot start the graphics pipeline's decoding thread");
+        }
+        Self {
+            name,
+            pipeline,
+            jobs,
+            decoded: Some(decoded),
+            closed,
+        }
+    }
+
+    /// What the decoding thread produces, for the session to receive. Given
+    /// out once.
+    pub fn take_decoded(&mut self) -> Option<UnboundedReceiver<Decoded>> {
+        self.decoded.take()
+    }
+
+    fn pipeline(&self) -> std::sync::MutexGuard<'_, Pipeline> {
+        self.pipeline.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The decoding thread: runs the client for every message, in order, until
+/// the channel is dropped or the session no longer listens.
+fn decode_messages(
+    queue: &mpsc::Receiver<Job>,
+    pipeline: &Mutex<Pipeline>,
+    closed: &AtomicBool,
+    results: &UnboundedSender<Decoded>,
+) {
+    for Job {
+        channel_id,
+        payload,
+    } in queue
+    {
+        if closed.load(Ordering::Acquire) {
+            continue;
+        }
+        let mut pipeline = pipeline.lock().unwrap_or_else(PoisonError::into_inner);
+        let replies = pipeline
+            .process(channel_id, &payload)
+            .map_err(|err| format!("{err:#}"));
+        let frames = pipeline.take_frames();
+        drop(pipeline);
+        // A channel closed meanwhile takes no replies any more.
+        if closed.load(Ordering::Acquire) {
+            continue;
+        }
+        let decoded = Decoded {
+            channel_id,
+            replies,
+            frames,
+        };
+        if results.send(decoded).is_err() {
+            return;
+        }
+    }
+}
+
+impl_as_any!(GraphicsChannel);
+
+impl DvcProcessor for GraphicsChannel {
+    fn channel_name(&self) -> &str {
+        &self.name
+    }
+
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        self.pipeline().start(channel_id)
+    }
+
+    /// Queues the message for the decoding thread. Its replies reach the
+    /// server through [`Decoded`], not from here.
+    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        let job = Job {
+            channel_id,
+            payload: payload.to_vec(),
+        };
+        // The thread only ends early when the session is gone.
+        let _ = self.jobs.send(job);
+        Ok(Vec::new())
+    }
+
+    fn close(&mut self, channel_id: u32) {
+        self.closed.store(true, Ordering::Release);
+        self.pipeline().close(channel_id);
+    }
+}
+
+impl DvcClientProcessor for GraphicsChannel {}
+
 #[cfg(test)]
 mod tests {
     use ironrdp_core::{Decode as _, ReadCursor, encode_vec};
@@ -345,7 +496,7 @@ mod tests {
 
     /// Sends the server's commands as one channel message and returns the
     /// client's replies.
-    fn send(channel: &mut GraphicsChannel, pdus: &[GfxPdu]) -> Vec<GfxPdu> {
+    fn send(channel: &mut Pipeline, pdus: &[GfxPdu]) -> Vec<GfxPdu> {
         let bytes: Vec<u8> = pdus
             .iter()
             .flat_map(|pdu| encode_vec(pdu).expect("encode"))
@@ -383,8 +534,8 @@ mod tests {
         (width, height): (u32, u32),
         surface: (u16, u16),
         origin: (u32, u32),
-    ) -> GraphicsChannel {
-        let mut channel = GraphicsChannel::new(decoder);
+    ) -> Pipeline {
+        let mut channel = Pipeline::new(decoder);
         channel.start(CHANNEL).expect("start");
         let confirmed = CapabilitySet::V10_7 {
             flags: CapabilitiesV107Flags::SMALL_CACHE,
@@ -451,7 +602,7 @@ mod tests {
         [px[0], px[1], px[2]]
     }
 
-    fn advertised(channel: &mut GraphicsChannel) -> Vec<CapabilitySet> {
+    fn advertised(channel: &mut Pipeline) -> Vec<CapabilitySet> {
         let replies = decode(channel.start(CHANNEL).expect("start"));
         let [GfxPdu::CapabilitiesAdvertise(advertise)] = replies.as_slice() else {
             panic!("expected a capability advertisement, got {replies:?}");
@@ -463,9 +614,81 @@ mod tests {
             .collect()
     }
 
+    /// The channel's messages are decoded on its thread: `process` answers
+    /// nothing itself, and the replies and frames arrive for the session in
+    /// the order of the messages.
+    #[test]
+    fn the_channel_decodes_on_its_own_thread() {
+        let mut channel = GraphicsChannel::new(None);
+        assert_eq!(channel.channel_name(), ironrdp_egfx::CHANNEL_NAME);
+        let mut decoded = channel.take_decoded().expect("results");
+        assert!(channel.take_decoded().is_none(), "given out once");
+        channel.start(CHANNEL).expect("start");
+        let confirmed = CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::SMALL_CACHE,
+        };
+        let messages: [&[GfxPdu]; 3] = [
+            &[
+                GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&confirmed)),
+                GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                    width: 64,
+                    height: 64,
+                    monitors: Vec::new(),
+                }),
+                GfxPdu::CreateSurface(CreateSurfacePdu {
+                    surface_id: SURFACE,
+                    width: 64,
+                    height: 64,
+                    pixel_format: PixelFormat::XRgb,
+                }),
+                GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                    surface_id: SURFACE,
+                    output_origin_x: 0,
+                    output_origin_y: 0,
+                }),
+            ],
+            &[start_frame(1), paint(rect(0, 0, 8, 8), [200, 10, 20])],
+            &[GfxPdu::EndFrame(EndFramePdu { frame_id: 1 })],
+        ];
+        for pdus in messages {
+            let bytes: Vec<u8> = pdus
+                .iter()
+                .flat_map(|pdu| encode_vec(pdu).expect("encode"))
+                .collect();
+            let replies = channel
+                .process(CHANNEL, &zgfx::wrap_uncompressed(&bytes))
+                .expect("process");
+            assert!(replies.is_empty(), "replies come from the thread");
+        }
+        let mut display = display(64, 64);
+        let mut acknowledged = Vec::new();
+        for _ in 0..messages.len() {
+            let result = decoded.blocking_recv().expect("a result per message");
+            assert_eq!(result.channel_id, CHANNEL);
+            for reply in decode(result.replies.expect("replies")) {
+                if let GfxPdu::FrameAcknowledge(ack) = reply {
+                    acknowledged.push(ack.frame_id);
+                }
+            }
+            if let Some(frames) = result.frames {
+                // Nothing of the frame before the server ended it. (The
+                // output size comes on its own, with the first message.)
+                if !frames.updates.is_empty() {
+                    assert_eq!(acknowledged, [1]);
+                }
+                frames.draw(&mut display);
+            }
+        }
+        assert_eq!(acknowledged, [1]);
+        assert_eq!(pixel(&display, 4, 4), [200, 10, 20]);
+        // The thread ends with the channel, and the session is told.
+        drop(channel);
+        assert!(decoded.blocking_recv().is_none());
+    }
+
     #[test]
     fn without_a_decoder_no_h264_is_advertised() {
-        let mut channel = GraphicsChannel::new(None);
+        let mut channel = Pipeline::new(None);
         assert_eq!(channel.channel_name(), ironrdp_egfx::CHANNEL_NAME);
         assert_eq!(
             advertised(&mut channel),
@@ -480,7 +703,7 @@ mod tests {
         let Some(decoder) = crate::video::h264_decoder() else {
             return;
         };
-        let mut channel = GraphicsChannel::new(Some(decoder));
+        let mut channel = Pipeline::new(Some(decoder));
         let sets = advertised(&mut channel);
         // The server takes the newest it knows; all of 10.x imply AVC444.
         assert_eq!(sets.first().map(version), Some("10.7"));
