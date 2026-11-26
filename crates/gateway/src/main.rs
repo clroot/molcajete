@@ -487,6 +487,8 @@ mod tests {
 
     use super::*;
 
+    /// IronRDP's web client and the RDP relay (src/tests/ironrdp.rs).
+    mod ironrdp;
     /// Live sessions and the connection history (src/tests/live_sessions.rs).
     mod live_sessions;
     /// Recording sessions from the session menu (src/tests/on_demand_recording.rs).

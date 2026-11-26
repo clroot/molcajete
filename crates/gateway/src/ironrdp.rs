@@ -368,3 +368,73 @@ async fn relay(
     }
     status
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_grant_opens_one_tunnel_of_its_user_and_connection() {
+        let grants = Grants::default();
+        let (token, credential) = grants.issue("alice", "rdp-1");
+        assert!(credential.username.starts_with("molcajete-"));
+        assert_ne!(credential.password, token);
+        assert_eq!(grants.take(&token, "alice", "rdp-1"), Some(credential));
+        assert_eq!(grants.take(&token, "alice", "rdp-1"), None);
+    }
+
+    #[test]
+    fn a_grant_is_spent_by_a_wrong_use() {
+        let grants = Grants::default();
+        let (token, _) = grants.issue("alice", "rdp-1");
+        assert_eq!(grants.take(&token, "bob", "rdp-1"), None);
+        assert_eq!(grants.take(&token, "alice", "rdp-1"), None);
+        let (token, _) = grants.issue("alice", "rdp-1");
+        assert_eq!(grants.take(&token, "alice", "rdp-2"), None);
+        assert_eq!(grants.take("unknown", "alice", "rdp-1"), None);
+    }
+
+    #[test]
+    fn an_expired_grant_is_refused() {
+        let grants = Grants::default();
+        let (token, _) = grants.issue("alice", "rdp-1");
+        grants.0.lock().unwrap().get_mut(&token).unwrap().expires = Instant::now();
+        assert_eq!(grants.take(&token, "alice", "rdp-1"), None);
+    }
+
+    fn connection(protocol: &str, attributes: &[&str]) -> ConnectionRecord {
+        let attributes: serde_json::Map<String, serde_json::Value> = attributes
+            .iter()
+            .map(|name| ((*name).to_owned(), "true".into()))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": "c",
+            "name": "c",
+            "protocol": protocol,
+            "attributes": attributes,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_unrecorded_rdp_connections_that_opted_in_are_allowed() {
+        let recordings = RecordingsConfig::default();
+        assert!(!allowed(&connection("rdp", &[]), &recordings));
+        assert!(allowed(
+            &connection("rdp", &[attributes::IRONRDP_DEFAULT]),
+            &recordings
+        ));
+        assert!(allowed(
+            &connection("rdp", &[attributes::IRONRDP_SWITCH]),
+            &recordings
+        ));
+        assert!(!allowed(
+            &connection("vnc", &[attributes::IRONRDP_DEFAULT]),
+            &recordings
+        ));
+        assert!(!allowed(
+            &connection("rdp", &[attributes::IRONRDP_DEFAULT, attributes::RECORD]),
+            &recordings
+        ));
+    }
+}
