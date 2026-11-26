@@ -1921,7 +1921,8 @@ impl Display {
         self.last_sync = Some(ts);
         let bytes = std::mem::take(&mut self.frame_bytes);
         let images = std::mem::take(&mut self.frame_images);
-        self.clock.frame_sent(ts, now, bytes);
+        self.clock
+            .frame_sent_spaced(ts, now, bytes, self.content_interval());
         self.metrics.frame(bytes, images, self.clock.unacked());
         // Asks a molcajete client how long it takes to apply the frame;
         // stock clients ignore the extra argument.
@@ -2002,15 +2003,20 @@ impl Display {
     /// An acknowledgement can move this earlier (see [`Pacing`]), so a
     /// session waiting for it asks again after every [`Display::ack`].
     pub fn next_frame_at(&self) -> Instant {
+        self.clock
+            .next_frame_at(self.content_interval())
+            .unwrap_or_else(Instant::now)
+    }
+
+    /// How far apart the frames of what is on the screen must stay, on
+    /// average, whatever the client could take.
+    fn content_interval(&self) -> Duration {
         // Rate control spends the video's bitrate per frame: more frames
         // than it was told to expect would be more bits per second.
-        let slowest = match self.video {
+        match self.video {
             Some(_) => Duration::from_secs(1) / video::FPS,
             None => Duration::ZERO,
-        };
-        self.clock
-            .next_frame_at(slowest)
-            .unwrap_or_else(Instant::now)
+        }
     }
 }
 
