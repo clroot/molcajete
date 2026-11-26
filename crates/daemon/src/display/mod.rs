@@ -917,6 +917,7 @@ impl Display {
         self.share_frame();
         self.decay();
         self.last_flush = started;
+        self.clock.frame_started(started);
         // Busy areas may be covered by a video stream instead of images.
         stats.add(self.update_video(out));
         let mut mark = Instant::now();
@@ -1952,6 +1953,13 @@ impl Display {
             // Only the time the session could have read the reply.
             let waited = received.at.max(self.reading_since).elapsed();
             self.metrics.acked(elapsed, waited, received.apply);
+            tracing::debug!(
+                ack_ms = elapsed.as_secs_f64() * 1000.0,
+                waited_ms = waited.as_secs_f64() * 1000.0,
+                apply_ms = received.apply.map(|apply| apply.as_secs_f64() * 1000.0),
+                unacked = self.clock.unacked(),
+                "frame acknowledged"
+            );
         }
     }
 

@@ -270,6 +270,14 @@ impl<'a> Session<'a> {
                         Flow::Continue
                     }
                 },
+                // A frame that came whole goes out when it is due, whatever
+                // the server is sending meanwhile: on a large desktop PDUs
+                // are almost always ready, and the frame would wait for the
+                // server's next one and go out merged with it.
+                _ = sleep_until(flush_at), if can_flush && self.pacer.pending_is_whole() => {
+                    self.send_frame().await?;
+                    Flow::Continue
+                }
                 pdu = self.rdp_reader.read_pdu() => match pdu {
                     Ok((action, payload)) => self.server_pdu(action, &payload).await?,
                     Err(err) => {
@@ -326,18 +334,22 @@ impl<'a> Session<'a> {
 
     /// Encodes pending display changes and ends the frame.
     async fn send_frame(&mut self) -> std::io::Result<()> {
+        let started = Instant::now();
         let display = &mut self.display;
         let out = self.writer.buffer();
         let stats = tokio::task::block_in_place(|| display.flush(out));
         if !out.is_empty() {
             display.sync(out);
         }
+        let flushed = Instant::now();
         self.writer.flush().await?;
-        self.pacer.frame_sent(Instant::now());
+        self.pacer.frame_sent(started);
         debug!(
             images = stats.images,
             fills = stats.fills,
             bytes = stats.bytes,
+            flush_ms = millis(flushed - started),
+            write_ms = millis(flushed.elapsed()),
             "frame sent"
         );
         Ok(())
@@ -499,9 +511,13 @@ impl<'a> Session<'a> {
     /// before the server ended it, so what arrives here is always whole
     /// frames, and several that are ready go out as one.
     async fn pipeline_decoded(&mut self, first: Decoded) -> anyhow::Result<Flow> {
+        let arrived = Instant::now();
+        let waited = arrived.saturating_duration_since(first.decoded_at);
         let mut next = Some(first);
         let mut frame_ended = false;
+        let (mut results, mut frames_drawn) = (0u32, 0u32);
         while let Some(decoded) = next {
+            results += 1;
             let replies = match decoded.replies {
                 Ok(replies) => replies,
                 Err(error) => {
@@ -522,6 +538,7 @@ impl<'a> Session<'a> {
             if let Some(frames) = decoded.frames {
                 self.draw_pipeline_frames(&frames);
                 frame_ended = true;
+                frames_drawn += 1;
             }
             next = self
                 .pipeline
@@ -529,12 +546,27 @@ impl<'a> Session<'a> {
                 .and_then(|pipeline| pipeline.try_recv().ok());
         }
         let now = Instant::now();
-        if frame_ended
+        let due = self.pacer.earliest(self.display.next_frame_at());
+        let unacked = self.display.unacked_frames();
+        let send = frame_ended
             && self
                 .pacer
                 .due_at_frame_end(now, self.display.next_frame_at())
-            && self.display.unacked_frames() <= MAX_UNACKED_FRAMES
-        {
+            && unacked <= MAX_UNACKED_FRAMES;
+        if frame_ended {
+            debug!(
+                results,
+                frames = frames_drawn,
+                // The first result waited this long for the session loop.
+                waited_ms = millis(waited),
+                handle_ms = millis(now - arrived),
+                due_in_ms = millis(due.saturating_duration_since(now)),
+                unacked,
+                send,
+                "pipeline frames drawn"
+            );
+        }
+        if send {
             self.send_frame().await?;
         }
         Ok(Flow::Continue)
@@ -907,6 +939,10 @@ fn ends_server_frame(action: Action, outputs: &[ActiveStageOutput]) -> bool {
         && outputs
             .iter()
             .any(|o| matches!(o, ActiveStageOutput::ResponseFrame(frame) if !frame.is_empty()))
+}
+
+fn millis(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 10_000.0).round() / 10.0
 }
 
 /// The next result of the graphics pipeline's decoding thread; `None` when
