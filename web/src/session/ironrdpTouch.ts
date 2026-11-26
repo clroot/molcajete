@@ -234,3 +234,25 @@ export function installIronRdpTouch(component: HTMLElement): () => void {
     component.removeEventListener('touchcancel', onCancel);
   };
 }
+
+/**
+ * Keeps the page from scrolling, bouncing or being pulled down to reload
+ * while an IronRDP session is open, wherever a finger starts: on the
+ * remote screen, at its edges or on an overlay. Only dialogs (the session
+ * menu) still scroll. Taps are not affected. Returns a function that
+ * undoes it.
+ */
+export function blockPageScroll(doc: Document = document): () => void {
+  const roots = [doc.documentElement, doc.body];
+  const before = roots.map(el => el.style.overscrollBehavior);
+  for (const el of roots) el.style.overscrollBehavior = 'none';
+  const onMove = (event: TouchEvent) => {
+    const inDialog = event.composedPath().some(node => node instanceof HTMLDialogElement);
+    if (!inDialog && event.cancelable) event.preventDefault();
+  };
+  doc.addEventListener('touchmove', onMove, {passive: false, capture: true});
+  return () => {
+    doc.removeEventListener('touchmove', onMove, {capture: true});
+    roots.forEach((el, i) => (el.style.overscrollBehavior = before[i]));
+  };
+}

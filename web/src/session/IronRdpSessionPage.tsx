@@ -17,7 +17,7 @@ import SessionMenuButton from './SessionMenuButton';
 import {useMenuShortcut} from './useMenuShortcut';
 import type {ConnectionStatus} from './useSessionEvents';
 import {describeIronRdpError, ironRdpTunnelUrl} from './ironrdp';
-import {installIronRdpTouch} from './ironrdpTouch';
+import {blockPageScroll, installIronRdpTouch} from './ironrdpTouch';
 
 type RdpModule = typeof import('@devolutions/iron-remote-desktop-rdp');
 
@@ -68,6 +68,9 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
   const [attempt, setAttempt] = useState(0);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const frameRef = useRef<HTMLDivElement>(null);
+
+  // No scrolling or pull to reload of the page while the session is open.
+  useEffect(() => blockPageScroll(), []);
 
   useEffect(() => {
     let isCurrent = true;
