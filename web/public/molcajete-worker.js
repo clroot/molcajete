@@ -4,7 +4,7 @@
 //
 // Messages in:  {type: "init", canvas, width, height, dpr}
 //               {type: "call", method, args, id?}  (files_* for molcajete-files.js)
-// Messages out: {type: "ready", zstd}
+// Messages out: {type: "ready", zstd, visibility}
 //               {type: "event", event, detail}
 //               {type: "result", id, result, error?}
 import init, { MolcajeteClient } from "./pkg/molcajete_client.js";
@@ -72,7 +72,11 @@ self.onmessage = async ({ data }) => {
     client.set_viewport(data.width, data.height, data.dpr);
     // Web Audio only exists on the page: let the page play audio streams.
     client.set_audio_forwarding(data.audio === true);
-    self.postMessage({ type: "ready", zstd: typeof client.set_zstd_images === "function" });
+    self.postMessage({
+      type: "ready",
+      zstd: typeof client.set_zstd_images === "function",
+      visibility: typeof client.set_page_visible === "function",
+    });
     for (const message of pending.splice(0)) dispatch(message);
     return;
   }

@@ -233,6 +233,7 @@ export class MolcajeteSession {
       this.#handler?.(type, detail);
     });
     this.#installAudioUnlock();
+    if (typeof this.#client.set_page_visible === "function") this.#watchVisibility();
   }
 
   async #startWorker() {
@@ -254,6 +255,7 @@ export class MolcajeteSession {
 
     const worker = new Worker(new URL("./molcajete-worker.js", import.meta.url), { type: "module" });
     this.#worker = worker;
+    let visibility = false;
     const ready = new Promise((resolve) => {
       worker.onmessage = ({ data }) => {
         if (data.type === "ready") {
@@ -261,6 +263,8 @@ export class MolcajeteSession {
           // worker of an earlier version does not say, and must not be
           // sent a type it would drop.
           if (data.zstd !== true) this.#zstd = false;
+          // Likewise whether it can be told that the page is hidden.
+          visibility = data.visibility === true;
           resolve();
         }
         else if (data.type === "event") this.#onEvent(data.event, data.detail);
@@ -288,6 +292,7 @@ export class MolcajeteSession {
     this.#installInput();
     this.#installAudioUnlock();
     await ready;
+    if (visibility) this.#watchVisibility();
   }
 
   #onEvent(type, detail) {
@@ -500,6 +505,16 @@ export class MolcajeteSession {
       if (e.inputType !== "insertCompositionText") sink.value = "";
     });
     this.#listen(sink, "blur", () => this.#post("release_keys"));
+  }
+
+  /**
+   * Tells the client while the page is hidden: the browser may suspend it
+   * then, and that time is not the client's frame lag.
+   */
+  #watchVisibility() {
+    const report = () => this.call("set_page_visible", document.visibilityState !== "hidden");
+    this.#listen(document, "visibilitychange", report);
+    if (document.visibilityState === "hidden") report();
   }
 
   #observeSize() {

@@ -1438,6 +1438,10 @@ impl Inner {
         }
     }
 
+    pub fn set_page_visible(&mut self, visible: bool) {
+        self.display.set_page_visible(visible);
+    }
+
     /// Lets the page play audio for a client that cannot (worker mode).
     pub fn set_audio_forwarding(&mut self, enabled: bool) {
         self.audio_forward = enabled;
