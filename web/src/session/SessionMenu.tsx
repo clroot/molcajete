@@ -37,6 +37,8 @@ type Props = {
   connectionName: string;
   /** Terminals copy and paste with shortcuts, shown under the clipboard. */
   isTerminal: boolean;
+  /** False on a device used by finger: shortcuts are not shown there. */
+  hasKeyboard: boolean;
   /** What the connection turns off. */
   restrictions: Restrictions;
   clipboard: string;
@@ -78,7 +80,7 @@ const CLIPBOARD_HELP = {
  * The clipboard text and, in terminals, the copy and paste shortcuts, as far
  * as the connection allows them.
  */
-function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Props) {
+function Clipboard({restrictions, isTerminal, hasKeyboard, keyBar, clipboard, onClipboardChange}: Props) {
   const canCopy = !restrictions.disableCopy;
   // A read-only connection takes nothing from the browser, the clipboard
   // included.
@@ -103,7 +105,13 @@ function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Pro
         rows={5}
         hasSpellCheck={false}
       />
-      {isTerminal && (canCopy || canPaste) && (
+      {isTerminal && !hasKeyboard && keyBar && canPaste && (
+        <Text type="supporting" color="secondary">
+          Paste, in the bar under the terminal, pastes from this device, or this text where the browser does
+          not share its clipboard.
+        </Text>
+      )}
+      {isTerminal && hasKeyboard && (canCopy || canPaste) && (
         <VStack gap={2}>
           {canCopy && (
             <HStack gap={2} vAlign="center">
@@ -136,10 +144,12 @@ export default function SessionMenu(props: Props) {
           <DrawerHeader
             title={connectionName}
             subtitle={
-              <HStack gap={1} vAlign="center">
-                <Kbd keys="ctrl+alt+shift" />
-                <Text color="secondary">to close</Text>
-              </HStack>
+              props.hasKeyboard ? (
+                <HStack gap={1} vAlign="center">
+                  <Kbd keys="ctrl+alt+shift" />
+                  <Text color="secondary">to close</Text>
+                </HStack>
+              ) : undefined
             }
             onOpenChange={onOpenChange}
           />

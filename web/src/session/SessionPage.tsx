@@ -105,9 +105,9 @@ export default function SessionPage({connectionId, ticket}: Props) {
     readPreference('terminalGuideSeen', false),
   );
   const terminal = isTerminal(protocol);
-  const onCopyEvent = useCopyFeedback(terminal);
-  // The key bar: this browser's choice, else on devices used by finger.
+  // A device used by finger: no shortcuts, and the key bar unless this browser chose otherwise.
   const isCoarsePointer = useMediaQuery('(pointer: coarse)');
+  const onCopyEvent = useCopyFeedback(terminal, !isCoarsePointer);
   const [keyBarChoice, setKeyBarChoice] = useState(() =>
     readPreference<boolean | null>('terminalKeys', null),
   );
@@ -287,6 +287,7 @@ export default function SessionPage({connectionId, ticket}: Props) {
             onKey={keysym => client()?.press_key(keysym)}
             onPaste={canPaste ? paste : null}
             onOpenMenu={() => setMenuOpen(true)}
+            link={session.link}
           />
         )}
       </div>
@@ -301,7 +302,7 @@ export default function SessionPage({connectionId, ticket}: Props) {
       )}
       {status.kind === 'connected' && session.isUnstable && <UnstableNotice />}
       {showStats && session.stats && <StatsPanel stats={session.stats} mode={mode ?? '?'} />}
-      {isConnected && terminal && session.link && <LinkStatus url={session.link} />}
+      {isConnected && terminal && session.link && !hasKeyBar && <LinkStatus url={session.link} />}
       {isConnected && session.isAudioBlocked && <AudioHint />}
       <CornerBadges>
         {isConnected && restrictions.readOnly && <ReadOnlyBadge />}
@@ -320,7 +321,10 @@ export default function SessionPage({connectionId, ticket}: Props) {
       {/* The key bar has the menu button itself. */}
       {isConnected && !hasKeyBar && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
       {isConnected && isGuideDue && !session.required && !isMenuOpen && (
-        <SessionGuide terminal={terminal ? {hasLinks: hasLinks(protocol)} : null} onDismiss={dismissGuide} />
+        <SessionGuide
+          terminal={terminal ? {hasLinks: hasLinks(protocol), isTouch: hasKeyBar} : null}
+          onDismiss={dismissGuide}
+        />
       )}
 
       {session.required && (
@@ -341,6 +345,7 @@ export default function SessionPage({connectionId, ticket}: Props) {
         onOpenChange={setMenuOpen}
         connectionName={connectionName}
         isTerminal={terminal}
+        hasKeyboard={!isCoarsePointer}
         restrictions={restrictions}
         clipboard={session.clipboard}
         onClipboardChange={text => {
