@@ -40,7 +40,11 @@ export function useConnection(connectionId: string, known?: ConnectionInfo) {
             name: found.name,
             protocol: found.protocol,
             // Older gateways do not send them.
-            display: {dpi: found.dpi ?? null, resizeMethod: found.resizeMethod ?? null},
+            display: {
+              dpi: found.dpi ?? null,
+              resizeMethod: found.resizeMethod ?? null,
+              fontSize: found.fontSize ?? null,
+            },
             restrictions: {
               readOnly: found.readOnly ?? false,
               disableCopy: found.disableCopy ?? false,

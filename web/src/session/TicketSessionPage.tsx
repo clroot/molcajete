@@ -24,7 +24,7 @@ export default function TicketSessionPage({ticket}: {ticket: string}) {
         />
       );
     case 'ready': {
-      const {connectionId, name, protocol, dpi, resizeMethod, readOnly, disableCopy, disablePaste} =
+      const {connectionId, name, protocol, dpi, resizeMethod, fontSize, readOnly, disableCopy, disablePaste} =
         info.data;
       return (
         <SessionPage
@@ -34,7 +34,7 @@ export default function TicketSessionPage({ticket}: {ticket: string}) {
             connection: {
               name,
               protocol,
-              display: {dpi, resizeMethod},
+              display: {dpi, resizeMethod, fontSize},
               restrictions: {readOnly, disableCopy, disablePaste},
             },
           }}

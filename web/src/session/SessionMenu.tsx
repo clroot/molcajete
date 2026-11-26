@@ -5,12 +5,13 @@ import {HStack, VStack} from '@astryxdesign/core/Stack';
 import {TextArea} from '@astryxdesign/core/TextArea';
 import {Selector} from '@astryxdesign/core/Selector';
 import {Switch} from '@astryxdesign/core/Switch';
+import {Slider} from '@astryxdesign/core/Slider';
 import {Button} from '@astryxdesign/core/Button';
 import {Kbd} from '@astryxdesign/core/Kbd';
 import {Text} from '@astryxdesign/core/Text';
 import {Heading} from '@astryxdesign/core/Heading';
 import {AUTOMATIC_SCALE_LABEL, scaleOptionsWith} from './displayScale';
-import type {RemoteScale} from './displaySettings';
+import {TEXT_SIZE, clampTextSize, type RemoteScale} from './displaySettings';
 import {terminalKeys} from './terminal';
 import type {Restrictions} from './useConnection';
 import {FolderIcon} from '@heroicons/react/24/outline';
@@ -46,6 +47,9 @@ type Props = {
   remoteDisplay: RemoteDisplay | null;
   onRemoteScaleChange: (scale: RemoteScale) => void;
   onResizeToWindowChange: (resize: boolean) => void;
+  /** The text size of a terminal, in points; `null` for a desktop. */
+  textSize: number | null;
+  onTextSizeChange: (size: number) => void;
   /** Whether the terminal key bar shows; `null` when the session has none to show. */
   keyBar: boolean | null;
   onKeyBarChange: (shows: boolean) => void;
@@ -151,56 +155,73 @@ export default function SessionMenu(props: Props) {
                 />
               )}
               <Clipboard {...props} />
-              {props.keyBar !== null && (
+              {props.textSize !== null && (
                 <VStack gap={4}>
                   <Heading level={3}>Terminal</Heading>
-                  <Switch
-                    label="Show terminal keys"
-                    description="Esc, Tab, Ctrl, Alt and the arrow keys in a bar under the terminal, for typing on an on-screen keyboard."
-                    value={props.keyBar}
-                    onChange={props.onKeyBarChange}
+                  <Slider
+                    label="Text size"
+                    description="Kept for this connection in this browser. On a touch screen, pinching the terminal changes it too."
+                    value={clampTextSize(props.textSize)}
+                    onChange={(size: number | [number, number]) => props.onTextSizeChange(size as number)}
+                    min={TEXT_SIZE.min}
+                    max={TEXT_SIZE.max}
+                    step={1}
+                    valueDisplay="text"
+                    formatValue={size => `${size} pt`}
+                    marks={[6, 9, 12, 15, 18].map(value => ({value}))}
+                  />
+                  {props.keyBar !== null && (
+                    <Switch
+                      label="Show terminal keys"
+                      description="Esc, Tab, Ctrl, Alt and the arrow keys in a bar under the terminal, for typing on an on-screen keyboard."
+                      value={props.keyBar}
+                      onChange={props.onKeyBarChange}
+                    />
+                  )}
+                </VStack>
+              )}
+              {/* A terminal follows the window, so there is nothing to fit. */}
+              {!props.isTerminal && (
+                <VStack gap={4}>
+                  <Heading level={3}>Display</Heading>
+                  {remoteDisplay && (
+                    <>
+                      <Selector
+                        label="Remote scale"
+                        description="Text and apps on the remote desktop. Some apps only adjust after they restart or after you sign out."
+                        value={scaleValue}
+                        onChange={value => {
+                          if (value) props.onRemoteScaleChange(value === 'auto' ? 'auto' : Number(value));
+                        }}
+                        options={[
+                          {value: 'auto', label: AUTOMATIC_SCALE_LABEL},
+                          ...scaleOptionsWith(scaleValue),
+                        ]}
+                        isDisabled={isDisplayFixed}
+                        disabledMessage={CANNOT_CHANGE}
+                      />
+                      <Switch
+                        label="Resize to window"
+                        description="The remote desktop takes the size of this window."
+                        value={remoteDisplay.resize}
+                        onChange={props.onResizeToWindowChange}
+                        isDisabled={isDisplayFixed}
+                        disabledMessage={CANNOT_CHANGE}
+                      />
+                    </>
+                  )}
+                  <Selector
+                    label="Fit"
+                    description="How the picture is shown when its size differs from this window."
+                    value={props.scaleMode}
+                    onChange={value => props.onScaleModeChange((value ?? 'fit') as ScaleMode)}
+                    options={[
+                      {value: 'fit', label: 'Fit to window'},
+                      {value: 'native', label: 'Native (1:1)'},
+                    ]}
                   />
                 </VStack>
               )}
-              <VStack gap={4}>
-                <Heading level={3}>Display</Heading>
-                {remoteDisplay && (
-                  <>
-                    <Selector
-                      label="Remote scale"
-                      description="Text and apps on the remote desktop. Some apps only adjust after they restart or after you sign out."
-                      value={scaleValue}
-                      onChange={value => {
-                        if (value) props.onRemoteScaleChange(value === 'auto' ? 'auto' : Number(value));
-                      }}
-                      options={[
-                        {value: 'auto', label: AUTOMATIC_SCALE_LABEL},
-                        ...scaleOptionsWith(scaleValue),
-                      ]}
-                      isDisabled={isDisplayFixed}
-                      disabledMessage={CANNOT_CHANGE}
-                    />
-                    <Switch
-                      label="Resize to window"
-                      description="The remote desktop takes the size of this window."
-                      value={remoteDisplay.resize}
-                      onChange={props.onResizeToWindowChange}
-                      isDisabled={isDisplayFixed}
-                      disabledMessage={CANNOT_CHANGE}
-                    />
-                  </>
-                )}
-                <Selector
-                  label="Fit"
-                  description="How the picture is shown when its size differs from this window."
-                  value={props.scaleMode}
-                  onChange={value => props.onScaleModeChange((value ?? 'fit') as ScaleMode)}
-                  options={[
-                    {value: 'fit', label: 'Fit to window'},
-                    {value: 'native', label: 'Native (1:1)'},
-                  ]}
-                />
-              </VStack>
               {props.remoteComposition !== null && (
                 <Switch
                   label="Compose Korean on the remote computer"

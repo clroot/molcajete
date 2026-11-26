@@ -11,7 +11,13 @@ import {useMolcajeteClient} from './useMolcajeteClient';
 import {useMenuShortcut} from './useMenuShortcut';
 import {useConnection, type ConnectionInfo} from './useConnection';
 import {useRemoteComposition} from './useRemoteComposition';
-import {effectiveDisplay, readDisplayChoices, tunnelOverrides, useDisplayChoices} from './displaySettings';
+import {
+  clampTextSize,
+  effectiveDisplay,
+  readDisplayChoices,
+  tunnelOverrides,
+  useDisplayChoices,
+} from './displaySettings';
 import {screenDpi} from './displayScale';
 import StatusOverlay from './StatusOverlay';
 import CredentialsDialog from './CredentialsDialog';
@@ -108,6 +114,9 @@ export default function SessionPage({connectionId, ticket}: Props) {
   // A read-only connection takes no keys.
   const offersKeyBar = terminal && !restrictions.readOnly;
   const wantsKeyBar = offersKeyBar && showsKeyBar(keyBarChoice, isCoarsePointer);
+  // Called for a pinch on the terminal; the client's events arrive in a
+  // handler that must not change, so it reaches the current one through this.
+  const onZoom = useRef((delta: number) => void delta);
 
   const onEvent = useCallback(
     (event: SessionEvent) => {
@@ -122,6 +131,7 @@ export default function SessionPage({connectionId, ticket}: Props) {
       }
       // Copies on the remote side land in the local clipboard as well.
       onCopyEvent(event);
+      if (event.type === 'zoom') onZoom.current(event.detail.delta);
     },
     [dispatch, dispatchFiles, onCopyEvent, showToast],
   );
@@ -165,6 +175,30 @@ export default function SessionPage({connectionId, ticket}: Props) {
   useEffect(() => {
     if (mode) client()?.set_terminal_shortcuts(terminal);
   }, [mode, client, terminal]);
+
+  // The text size of a terminal: sent now, and remembered for the next session.
+  const textSize = useRef(display.textSize);
+  useEffect(() => {
+    textSize.current = display.textSize;
+  }, [display.textSize]);
+  const setTextSize = (size: number) => {
+    const next = clampTextSize(size);
+    if (next === textSize.current) return false;
+    textSize.current = next;
+    displayChoices.setTextSize(next);
+    client()?.send_argv('font-size', String(next));
+    return true;
+  };
+  useEffect(() => {
+    onZoom.current = delta => {
+      if (setTextSize(textSize.current + delta))
+        showToast({
+          body: `Text size: ${textSize.current} pt`,
+          uniqueID: 'text-size',
+          autoHideDuration: 1500,
+        });
+    };
+  });
 
   const reconnect = () => {
     unlockAudio();
@@ -328,6 +362,8 @@ export default function SessionPage({connectionId, ticket}: Props) {
           // Before the size the effect sends, so that the server applies it.
           client()?.send_argv('resize-method', resize ? 'display-update' : '');
         }}
+        textSize={terminal ? display.textSize : null}
+        onTextSizeChange={setTextSize}
         keyBar={offersKeyBar ? showsKeyBar(keyBarChoice, isCoarsePointer) : null}
         onKeyBarChange={shows => {
           setKeyBarChoice(shows);
