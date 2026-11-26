@@ -2112,11 +2112,19 @@ mod tests {
         // The client is told: its menu shows the switch off again.
         assert!(out.contains("10.video-mode,4.auto;"), "{out}");
         assert!(display.video.is_none());
-        for i in 0..20u32 {
-            display.put(64, 64, 320, 256, &noise(i, 320, 256));
-            frame(&mut display, &log);
-        }
-        assert!(!display.video.as_ref().expect("busy area video").full_screen);
+        // A busy area still becomes a video of its own. Its tiles are made
+        // hot directly: their score halves every second of wall-clock time,
+        // so painting them in a loop made the test depend on how fast the
+        // machine encodes the frames. The decay starts over now, and the
+        // score is twice what is needed, so a slow machine still gets there.
+        let player = Rect::new(64, 64, 320, 256);
+        display.last_decay = Instant::now();
+        set_motion(&mut display, player, 2.0 * MOTION_HOT);
+        display.put(64, 64, 320, 256, &noise(21, 320, 256));
+        frame(&mut display, &log);
+        let video = display.video.as_ref().expect("busy area video");
+        assert!(!video.full_screen);
+        assert_eq!(video.rect, player);
         assert_eq!(display.video_mode(), Some(VideoMode::Auto));
     }
 
