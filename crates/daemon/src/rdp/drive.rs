@@ -384,4 +384,257 @@ mod tests {
         assert_eq!(decoded.device_io_reply.io_status, NtStatus::NO_MORE_FILES);
         assert!(decoded.buffer.is_none());
     }
+
+    // A server working in the drive, request by request, as `Rdpdr`
+    // hands them to the backend: xrdp's separators and directory class,
+    // a link out of the folder, and (Windows) a change notification.
+
+    fn header(file_id: u32, major_function: MajorFunction) -> DeviceIoRequest {
+        DeviceIoRequest {
+            device_id: 1,
+            file_id,
+            completion_id: 7,
+            major_function,
+            minor_function: MinorFunction::from(0),
+        }
+    }
+
+    fn status(messages: &[SvcMessage]) -> NtStatus {
+        let bytes = messages[0].encode_unframed_pdu().unwrap();
+        NtStatus::from(u32::from_le_bytes(bytes[12..16].try_into().unwrap()))
+    }
+
+    /// Opens `path`; the file id, or the failure.
+    fn open(
+        backend: &mut DriveBackend,
+        path: &str,
+        disposition: ironrdp_rdpdr::pdu::efs::CreateDisposition,
+        directory: bool,
+    ) -> Result<u32, NtStatus> {
+        use ironrdp_rdpdr::pdu::efs::{CreateOptions, DesiredAccess, SharedAccess};
+        let response = backend
+            .handle_drive_io_request(ServerDriveIoRequest::ServerCreateDriveRequest(
+                ironrdp_rdpdr::pdu::efs::DeviceCreateRequest {
+                    device_io_request: header(0, MajorFunction::Create),
+                    // Read, write, append, read attributes, synchronize.
+                    desired_access: DesiredAccess::from_bits_retain(0x0010_0087),
+                    allocation_size: 0,
+                    file_attributes: if directory {
+                        FileAttributes::FILE_ATTRIBUTE_DIRECTORY
+                    } else {
+                        FileAttributes::FILE_ATTRIBUTE_NORMAL
+                    },
+                    shared_access: SharedAccess::from_bits_retain(0x0000_0007),
+                    create_disposition: disposition,
+                    create_options: if directory {
+                        CreateOptions::FILE_DIRECTORY_FILE
+                    } else {
+                        CreateOptions::FILE_NON_DIRECTORY_FILE
+                    },
+                    path: path.to_owned(),
+                },
+            ))
+            .unwrap();
+        match status(&response) {
+            NtStatus::SUCCESS => {
+                let bytes = response[0].encode_unframed_pdu().unwrap();
+                Ok(u32::from_le_bytes(bytes[16..20].try_into().unwrap()))
+            }
+            failure => Err(failure),
+        }
+    }
+
+    fn close(backend: &mut DriveBackend, file_id: u32) {
+        let response = backend
+            .handle_drive_io_request(ServerDriveIoRequest::DeviceCloseRequest(
+                ironrdp_rdpdr::pdu::efs::DeviceCloseRequest {
+                    device_io_request: header(file_id, MajorFunction::Close),
+                },
+            ))
+            .unwrap();
+        assert_eq!(status(&response), NtStatus::SUCCESS);
+    }
+
+    /// The names in directory `file_id`, listed as xrdp asks.
+    fn list(backend: &mut DriveBackend, file_id: u32, pattern: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for initial_query in std::iter::once(1).chain(std::iter::repeat(0)) {
+            let mut request = header(file_id, MajorFunction::DirectoryControl);
+            request.minor_function = MinorFunction::IRP_MN_QUERY_DIRECTORY;
+            let response = backend
+                .handle_drive_io_request(ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+                    ironrdp_rdpdr::pdu::efs::ServerDriveQueryDirectoryRequest {
+                        device_io_request: request,
+                        file_info_class_lvl: FileInformationClassLevel::FILE_DIRECTORY_INFORMATION,
+                        initial_query,
+                        path: pattern.to_owned(),
+                    },
+                ))
+                .unwrap();
+            let decoded = decode(
+                &response[0],
+                FileInformationClassLevel::FILE_DIRECTORY_INFORMATION,
+            );
+            match decoded.buffer {
+                Some(FileInformationClass::Directory(entry)) => names.push(entry.file_name),
+                None => {
+                    assert_eq!(decoded.device_io_reply.io_status, NtStatus::NO_MORE_FILES);
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        names.retain(|name| name != "." && name != "..");
+        names.sort();
+        names
+    }
+
+    /// A link at `link` to the directory `target`: a symbolic link, or on
+    /// Windows a junction, which needs no privileges.
+    fn link_directory(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        assert!(
+            std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_works_in_the_drive_and_stays_inside_it() {
+        use ironrdp_rdpdr::pdu::efs::{CreateDisposition, DeviceWriteRequest};
+
+        let base = std::env::temp_dir().join(format!("molcajete-rdpdr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&base).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        // Opened as for a session.
+        let drive = crate::files::Drive::open(crate::files::DriveSettings {
+            path: base.join("drive"),
+            name: "Drive".into(),
+            create: true,
+            policy: crate::files::Policy {
+                download: true,
+                upload: true,
+                max_size: None,
+            },
+        })
+        .await
+        .unwrap();
+        let root = drive.root().to_owned();
+        let mut backend = DriveBackend::new(1, "Drive", &root).unwrap();
+        backend.restore_drive(1).unwrap();
+
+        // A folder and a file in it, with xrdp's `/` separators.
+        let folder = open(
+            &mut backend,
+            "/folder",
+            CreateDisposition::FILE_CREATE,
+            true,
+        )
+        .unwrap();
+        close(&mut backend, folder);
+        let file = open(
+            &mut backend,
+            "/folder/a.txt",
+            CreateDisposition::FILE_OVERWRITE_IF,
+            false,
+        )
+        .unwrap();
+        let written = backend
+            .handle_drive_io_request(ServerDriveIoRequest::DeviceWriteRequest(
+                DeviceWriteRequest {
+                    device_io_request: header(file, MajorFunction::Write),
+                    offset: 0,
+                    write_data: b"hello".to_vec(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(status(&written), NtStatus::SUCCESS);
+        close(&mut backend, file);
+        assert_eq!(
+            std::fs::read(root.join("folder").join("a.txt")).unwrap(),
+            b"hello"
+        );
+
+        // Listed in the class xrdp asks for.
+        let folder = open(&mut backend, "/folder", CreateDisposition::FILE_OPEN, true).unwrap();
+        assert_eq!(list(&mut backend, folder, "/folder/*"), ["a.txt"]);
+        close(&mut backend, folder);
+
+        // A link placed in the folder does not lead out of it.
+        link_directory(&outside, &root.join("link"));
+        assert!(
+            open(
+                &mut backend,
+                "/link/secret.txt",
+                CreateDisposition::FILE_OPEN,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            open(
+                &mut backend,
+                "/link/new.txt",
+                CreateDisposition::FILE_OVERWRITE_IF,
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+
+        // A file uploaded from the browser is announced to a server that
+        // watches the folder, through the deferred completions the
+        // session polls.
+        if DriveBackend::DEFERS_COMPLETIONS {
+            let watched =
+                open(&mut backend, "/folder", CreateDisposition::FILE_OPEN, true).unwrap();
+            let mut request = header(watched, MajorFunction::DirectoryControl);
+            request.minor_function = MinorFunction::IRP_MN_NOTIFY_CHANGE_DIRECTORY;
+            let scheduled = backend
+                .handle_drive_io_request(
+                    ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(
+                        ironrdp_rdpdr::pdu::efs::ServerDriveNotifyChangeDirectoryRequest {
+                            device_io_request: request,
+                            watch_tree: 0,
+                            // FILE_NOTIFY_CHANGE_FILE_NAME
+                            completion_filter: 1,
+                        },
+                    ),
+                )
+                .unwrap();
+            assert!(scheduled.is_empty());
+            assert!(backend.poll_deferred_messages().unwrap().is_empty());
+            std::fs::write(root.join("folder").join("uploaded.txt"), b"x").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let completed = loop {
+                let messages = backend.poll_deferred_messages().unwrap();
+                if !messages.is_empty() {
+                    break messages;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no change notification"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            assert_eq!(status(&completed), NtStatus::SUCCESS);
+            close(&mut backend, watched);
+        }
+
+        backend.reset().unwrap();
+        drop(backend);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }
