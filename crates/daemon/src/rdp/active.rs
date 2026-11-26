@@ -368,7 +368,7 @@ impl<'a> Session<'a> {
         let decoded = started.elapsed();
         let frame_ended = ends_server_frame(action, &outputs);
         let flow = self.stage_outputs(outputs, WriteCause::Response).await?;
-        self.pipeline_frames();
+        let pipeline_frame_ended = self.pipeline_frames();
         if frame_ended {
             if !self.pacer.marks_frames() {
                 info!("the RDP server marks its frames; frames follow its boundaries");
@@ -390,7 +390,13 @@ impl<'a> Session<'a> {
             audio.pump(self.writer.buffer());
         }
         let now = Instant::now();
-        if self.pacer.overdue(now, self.display.next_frame_at())
+        let due = self.display.next_frame_at();
+        // Where the server ended a frame, what is pending is whole and goes
+        // out at once: its next frame may already be arriving, and the loop
+        // reads what is ready before it sends a frame.
+        let server_frame_ended = frame_ended || pipeline_frame_ended;
+        if ((server_frame_ended && self.pacer.due_at_frame_end(now, due))
+            || self.pacer.overdue(now, due))
             && self.display.unacked_frames() <= MAX_UNACKED_FRAMES
         {
             self.send_frame().await?;
@@ -463,13 +469,14 @@ impl<'a> Session<'a> {
     /// Moves the frames the graphics pipeline completed with this PDU into
     /// the display. The pipeline hands over nothing of a frame before the
     /// server ended it, so what arrives here is always whole frames.
-    fn pipeline_frames(&mut self) {
+    /// Returns whether there were any.
+    fn pipeline_frames(&mut self) -> bool {
         let Some(frames) = self
             .stage
             .get_dvc_mut::<GraphicsChannel>()
             .and_then(|mut channel| channel.processor_mut().take_frames())
         else {
-            return;
+            return false;
         };
         let started = Instant::now();
         // The server announces the output size of the pipeline separately
@@ -488,6 +495,7 @@ impl<'a> Session<'a> {
         self.copy_time += now - started;
         // A frame of the server ended here.
         self.pacer.mark_dirty(now);
+        true
     }
 
     /// Runs the Deactivation-Reactivation Sequence (e.g. after a resize).
