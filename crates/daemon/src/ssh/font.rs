@@ -656,7 +656,12 @@ mod tests {
         let found = scan_paths(&[dir.clone(), PathBuf::from("/nonexistent")]);
         let names: Vec<_> = found
             .iter()
-            .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                p.strip_prefix(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
         assert_eq!(names, ["Font.ttf", "sub/Other.otf", "Font-Bold.ttf"]);
         std::fs::remove_dir_all(&dir).ok();

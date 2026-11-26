@@ -32,6 +32,7 @@ use tracing::{info, warn};
 
 use self::active::{EarlyInput, Session};
 use self::connect::ConnectError;
+use self::drive::DriveBackend;
 use self::settings::Settings;
 use crate::files;
 use crate::handshake::{ClientInfo, Params};
@@ -170,7 +171,7 @@ async fn connect_and_run(
         jump_hosts = jump.hops().len(),
         "connecting to RDP server"
     );
-    let drive = open_drive(settings).await;
+    let (drive, drive_channel) = open_drive(settings).await.unzip();
     let (sound, audio) = match settings.audio {
         Some(encoding) => {
             let (sink, output) = audio::output(encoding);
@@ -183,7 +184,7 @@ async fn connect_and_run(
             settings,
             jump,
             sound.as_ref(),
-            drive.as_ref().map(|(_, drive)| drive),
+            drive_channel,
         ))
         .await
     {
@@ -207,7 +208,7 @@ async fn connect_and_run(
     };
 
     let early = std::mem::take(&mut client.early);
-    let files = drive.map(|(directory, _)| {
+    let files = drive.map(|directory| {
         client.decoder.accept_files();
         files::Transfers::drive(directory, client.writer.buffer())
     });
@@ -222,9 +223,20 @@ async fn open_drive(settings: &Settings) -> Option<(files::Drive, connect::Drive
     let drive = settings.drive.as_ref()?;
     match files::Drive::open(drive.clone()).await {
         Ok(opened) => {
+            let backend = match DriveBackend::new(
+                connect::DRIVE_DEVICE_ID,
+                &drive.name,
+                opened.root(),
+            ) {
+                Ok(backend) => backend,
+                Err(err) => {
+                    warn!(path = %opened.root().display(), error = %err, "cannot redirect the drive directory");
+                    return None;
+                }
+            };
             let channel = connect::Drive {
                 name: drive.name.clone(),
-                root: opened.root().to_owned(),
+                backend,
             };
             Some((opened, channel))
         }

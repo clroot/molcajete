@@ -34,7 +34,7 @@ go tool pprof -http=:0 daemon.pb
 ```
 
 - One profile at a time per process; a concurrent request gets 409.
-- Build with line tables (the `profiling` Cargo profile, the images' default) so stacks resolve to source lines, inlined functions included. The `profiling` feature of `molcajete-telemetry` is on by default; without it `--profiling` fails at startup.
+- Build with line tables (the `profiling` Cargo profile, the images' default) so stacks resolve to source lines, inlined functions included. The `profiling` feature of `molcajete-telemetry` is on by default; without it, and on Windows (no SIGPROF), `--profiling` fails at startup.
 - The first profile loads the binary's line tables to symbolize stacks, which adds about 150 MiB to the process. Samples are buffered in a temporary file, so `/tmp` must be writable.
 - An idle process produces empty profiles, which Pyroscope does not store.
 

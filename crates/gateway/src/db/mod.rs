@@ -147,8 +147,23 @@ impl Database {
     }
 
     /// URL of the SQLite database used when none is configured.
+    ///
+    /// `sqlite:` and the path, which sqlx percent-decodes. Not `sqlite://`:
+    /// the URL is parsed as one first, and `C:` in a Windows path would be
+    /// read as a host and an invalid port.
     pub fn sqlite_url(path: &Path) -> String {
-        format!("sqlite://{}?mode=rwc", path.display())
+        let mut url = String::from("sqlite:");
+        for c in path.to_string_lossy().chars() {
+            match c {
+                // Would end the path, or be decoded.
+                '%' | '?' | '#' | ' ' => url.push_str(&format!("%{:02X}", c as u8)),
+                // Windows takes `/` as well, and a URL path has no `\`.
+                '\\' if cfg!(windows) => url.push('/'),
+                c => url.push(c),
+            }
+        }
+        url.push_str("?mode=rwc");
+        url
     }
 
     /// Uses `keys` for connection credentials. Without keys, connections
@@ -280,6 +295,42 @@ pub(crate) mod tests {
         assert_eq!(Dialect::from_url("mariadb://x/y").unwrap(), Dialect::Mysql);
         assert_eq!(Dialect::from_url("sqlite://a.db").unwrap(), Dialect::Sqlite);
         assert!(Dialect::from_url("mssql://x").is_err());
+    }
+
+    /// The file sqlx opens for `url`, parsed as `Database::open` does.
+    fn sqlite_file(url: &str) -> String {
+        use std::str::FromStr as _;
+        let any = sqlx::any::AnyConnectOptions::from_str(url).unwrap();
+        let sqlite =
+            sqlx::sqlite::SqliteConnectOptions::from_str(any.database_url.as_str()).unwrap();
+        sqlite.get_filename().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn sqlite_urls_name_the_file() {
+        for path in [
+            "/var/lib/molcajete/molcajete.db",
+            "data/molcajete.db",
+            "/srv/a dir/100%/what?#.db",
+            "/srv/한글/molcajete.db",
+        ] {
+            let url = Database::sqlite_url(Path::new(path));
+            assert_eq!(Dialect::from_url(&url).unwrap(), Dialect::Sqlite);
+            assert_eq!(sqlite_file(&url), path, "{url}");
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            sqlite_file(&Database::sqlite_url(Path::new(
+                r"C:\ProgramData\molcajete\molcajete.db"
+            ))),
+            "C:/ProgramData/molcajete/molcajete.db"
+        );
+        // What `sqlite://` made of a Windows path.
+        assert!(
+            r"sqlite://C:\data\m.db"
+                .parse::<sqlx::any::AnyConnectOptions>()
+                .is_err()
+        );
     }
 
     #[tokio::test]

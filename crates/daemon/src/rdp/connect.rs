@@ -183,17 +183,17 @@ fn connector_config(settings: &Settings) -> ironrdp_connector::Config {
 /// (`enable-drive`).
 pub struct Drive {
     pub name: String,
-    pub root: std::path::PathBuf,
+    pub backend: super::drive::DriveBackend,
 }
 
 /// Device ID of the redirected drive.
-const DRIVE_DEVICE_ID: u32 = 1;
+pub const DRIVE_DEVICE_ID: u32 = 1;
 
 fn build_connector(
     settings: &Settings,
     client_addr: std::net::SocketAddr,
     sound: Option<&SoundSink>,
-    drive: Option<&Drive>,
+    drive: Option<Drive>,
 ) -> ClientConnector {
     // Display Control is offered even with resize-method=none: the client can
     // turn resizing on during the session and change the scale with it.
@@ -219,10 +219,9 @@ fn build_connector(
     // RDPSND once RDPDR has completed its capability exchange, so sound
     // needs it even with no devices to redirect.
     if let Some(drive) = drive {
-        let backend = super::drive::DriveBackend::new(drive.root.to_string_lossy().into_owned());
         connector = connector.with_static_channel(
-            ironrdp_rdpdr::Rdpdr::new(Box::new(backend), "molcajete".to_owned())
-                .with_drives(Some(vec![(DRIVE_DEVICE_ID, drive.name.clone())])),
+            ironrdp_rdpdr::Rdpdr::new(Box::new(drive.backend), "molcajete".to_owned())
+                .with_drives(Some(vec![(DRIVE_DEVICE_ID, drive.name)])),
         );
     } else if sound.is_some() {
         connector = connector.with_static_channel(ironrdp_rdpdr::Rdpdr::new(
@@ -252,7 +251,7 @@ pub async fn begin(
     settings: &Settings,
     jump: &Chain,
     sound: Option<&SoundSink>,
-    drive: Option<&Drive>,
+    drive: Option<Drive>,
 ) -> Result<Negotiated, ConnectError> {
     let upstream = jump
         .connect(&settings.hostname, settings.port)
@@ -451,17 +450,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_drive_is_announced_on_rdpdr_without_audio() {
+    #[tokio::test]
+    async fn a_drive_is_announced_on_rdpdr_without_audio() {
+        // Opened as for a session: resolved, and on Windows in plain form.
+        let opened = crate::files::Drive::open(crate::files::DriveSettings {
+            path: std::env::temp_dir(),
+            name: "Files".into(),
+            create: false,
+            policy: crate::files::Policy {
+                download: true,
+                upload: true,
+                max_size: None,
+            },
+        })
+        .await
+        .unwrap();
         let drive = Drive {
             name: "Files".into(),
-            root: std::env::temp_dir(),
+            backend: crate::rdp::drive::DriveBackend::new(DRIVE_DEVICE_ID, "Files", opened.root())
+                .unwrap(),
         };
         let connector = build_connector(
             &settings(),
             "127.0.0.1:1".parse().unwrap(),
             None,
-            Some(&drive),
+            Some(drive),
         );
         assert!(!connector.config.enable_audio_playback);
         let rdpdr = connector

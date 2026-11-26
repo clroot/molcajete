@@ -17,8 +17,10 @@ use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_pdu::rdp::capability_sets::InputFlags;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
+use ironrdp_rdpdr::Rdpdr;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp_svc::SvcProcessorMessages;
 use ironrdp_tokio::{FramedWrite as _, TokioFramed, single_sequence_step_read, split_tokio_framed};
 use molcajete_protocol::Status;
 use tokio::io::{ReadHalf, WriteHalf};
@@ -30,6 +32,7 @@ use super::audio::AudioOutput;
 use super::clipboard::{self, GuacClipboard};
 use super::connect::{RdpFramed, RdpStream};
 use super::display_control::{self, DisplayControlStatus};
+use super::drive::DriveBackend;
 use super::gfx::GraphicsChannel;
 use super::graphics::{self, Area, Cursor};
 use super::keyboard::Keyboard;
@@ -52,6 +55,9 @@ const RESIZE_DELAY: Duration = Duration::from_millis(500);
 /// Retry interval while the Display Control channel is not open yet.
 const RESIZE_RETRY: Duration = Duration::from_secs(1);
 const KEEPALIVE: Duration = Duration::from_secs(5);
+/// How often the drive's backend is asked for requests it completed on its
+/// own threads (see [`DriveBackend::DEFERS_COMPLETIONS`]).
+const DRIVE_POLL: Duration = Duration::from_millis(50);
 
 /// Client input that arrived while the connection was being established.
 #[derive(Debug, Default)]
@@ -100,6 +106,8 @@ pub struct Session<'a> {
     audio: Option<AudioOutput>,
     /// The drive's files for the client (`enable-drive`).
     files: Option<Transfers>,
+    /// Whether the drive's backend has completions to collect.
+    poll_drive: bool,
     decode_time: DecodeTime,
     /// Frames the server marked the end of.
     server_frames: metrics::Counter,
@@ -172,6 +180,7 @@ impl<'a> Session<'a> {
             scale: settings.desktop_scale_factor(),
             display_control: DisplayControlStatus::new(dynamic_channels, Instant::now()),
             audio,
+            poll_drive: DriveBackend::DEFERS_COMPLETIONS && files.is_some(),
             files,
             decode_time: DecodeTime::new("rdp"),
             server_frames: crate::remote::frames("rdp"),
@@ -225,6 +234,8 @@ impl<'a> Session<'a> {
 
         let mut keepalive = tokio::time::interval(KEEPALIVE);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut drive_poll = tokio::time::interval(DRIVE_POLL);
+        drive_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let can_flush =
                 self.pacer.is_dirty() && self.display.unacked_frames() <= MAX_UNACKED_FRAMES;
@@ -275,6 +286,10 @@ impl<'a> Session<'a> {
                 _ = sleep_until(idle_at.unwrap_or_else(tokio::time::Instant::now)),
                     if idle_at.is_some() && !can_flush => {
                     self.send_frame().await?;
+                    Flow::Continue
+                }
+                _ = drive_poll.tick(), if self.poll_drive => {
+                    self.pump_drive().await?;
                     Flow::Continue
                 }
                 _ = keepalive.tick() => {
@@ -680,6 +695,29 @@ impl<'a> Session<'a> {
         {
             session::send_clipboard(self.writer.buffer(), &text);
         }
+        Ok(())
+    }
+
+    /// Sends what the drive's backend completed on its own threads: locks
+    /// that had to wait, directory change notifications.
+    async fn pump_drive(&mut self) -> anyhow::Result<()> {
+        let Some(rdpdr) = self.stage.get_svc_processor_mut::<Rdpdr>() else {
+            return Ok(());
+        };
+        let messages = match rdpdr.poll_deferred_messages() {
+            Ok(messages) => messages,
+            Err(err) => {
+                warn!(error = %err, "drive completions failed");
+                return Ok(());
+            }
+        };
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let frame = self
+            .stage
+            .process_svc_processor_messages(SvcProcessorMessages::<Rdpdr>::new(messages))?;
+        self.write_rdp(&frame).await?;
         Ok(())
     }
 

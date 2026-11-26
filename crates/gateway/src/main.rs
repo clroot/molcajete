@@ -1867,9 +1867,11 @@ mod tests {
 
         let (guacd_addr, _guacd) = fake_guacd(STOCK_ARGS, text_payload().into_bytes()).await;
         // A directory that cannot be created: its parent is a file.
+        let file = tempfile::NamedTempFile::new().unwrap();
         let app = app_with(&format!(
-            "\n[guacd]\nport = {}\n[recordings]\ndirectory = \"/dev/null/recordings\"\n",
-            guacd_addr.port()
+            "\n[guacd]\nport = {}\n[recordings]\ndirectory = '{}'\n",
+            guacd_addr.port(),
+            file.path().join("recordings").display()
         ))
         .await;
         let mut granted = app.state.db.connection("granted").await.unwrap();
