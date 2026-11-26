@@ -76,6 +76,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajeted_video_failures_total` | counter | | Video encoder failures (after three in a session, video is off for it) |
 | `molcajeted_video_encode_seconds` | histogram | codec, key | Encoding one video frame, including the round trip to ffmpeg |
 | `molcajeted_video_frame_bytes` | histogram | codec, key | Video frame size |
+| `molcajeted_video_frames_skipped_total` | counter | codec | Video frames the encoder left out to hold its bitrate (VideoToolbox, on content far more expensive than the bitrate of its area) |
 | `molcajeted_frames_total` | counter | protocol | Frames (`sync`) sent |
 | `molcajeted_frame_interval_seconds` | histogram | protocol | Time between a frame and the one before it, within a run of frames (intervals of a second or more, when the screen stood still, are left out). Shows how evenly frames follow each other: during a 30 fps video nearly all intervals should be within 40 ms, and a share of longer ones means frames are being merged or held back |
 | `molcajeted_frame_encoded_bytes` | histogram | protocol | Encoded image bytes per frame |

@@ -13,6 +13,11 @@
 //! length-prefixed NAL units with the parameter sets in the format
 //! description; they are converted to Annex B and every key frame carries
 //! SPS/PPS (and VPS for H.265) in-band.
+//!
+//! Low-latency rate control holds the bitrate by leaving frames out when
+//! the content costs more than it allows (noise, for one, every other
+//! frame). Such a frame comes back as an [`EncodedFrame`] without data and
+//! the stream goes on with the next one.
 
 #![allow(non_upper_case_globals, non_camel_case_types)]
 
@@ -67,6 +72,8 @@ const kCMVideoCodecType_H264: u32 = u32::from_be_bytes(*b"avc1");
 const kCMVideoCodecType_HEVC: u32 = u32::from_be_bytes(*b"hvc1");
 /// NV12 with limited ("video") range, what [`yuv`] produces.
 const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = u32::from_be_bytes(*b"420v");
+/// `kVTEncodeInfo_FrameDropped`: the encoder left the frame out.
+const kVTEncodeInfo_FrameDropped: u32 = 1 << 1;
 const kCFNumberSInt32Type: CFIndex = 3;
 const kCFNumberFloat64Type: CFIndex = 6;
 
@@ -269,7 +276,8 @@ fn check(status: OSStatus, what: &str) -> Result<(), VideoError> {
     }
 }
 
-/// What the output callback hands back for the frame being encoded.
+/// What the output callback hands back for the frame being encoded: its
+/// packet, or nothing when the encoder skipped the frame.
 type Output = Option<Result<Vec<u8>, VideoError>>;
 
 pub(crate) struct VideoToolboxEncoder {
@@ -281,7 +289,8 @@ pub(crate) struct VideoToolboxEncoder {
     #[cfg(test)]
     yuv: Vec<u8>,
     frames: i64,
-    /// Set after a failure: the next frame must be a key frame.
+    /// Set after a failure, or when the encoder skipped a frame that had to
+    /// be a key frame: the next frame must be one.
     restart: bool,
 }
 
@@ -505,7 +514,7 @@ impl VideoToolboxEncoder {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
-            .unwrap_or_else(|| Err(VideoError::Encoder("VideoToolbox dropped a frame".into())))
+            .unwrap_or_else(|| Err(VideoError::Encoder("VideoToolbox returned no frame".into())))
     }
 }
 
@@ -559,7 +568,7 @@ extern "C" fn output_callback(
     refcon: *mut c_void,
     _source_frame_refcon: *mut c_void,
     status: OSStatus,
-    _info_flags: u32,
+    info_flags: u32,
     sample: CMSampleBufferRef,
 ) {
     // SAFETY: `refcon` is the encoder's boxed mutex, which outlives the
@@ -569,8 +578,11 @@ extern "C" fn output_callback(
         Err(VideoError::Encoder(format!(
             "VideoToolbox encoding failed (OSStatus {status})"
         )))
+    } else if info_flags & kVTEncodeInfo_FrameDropped != 0 {
+        // Skipped to hold the bitrate.
+        Ok(Vec::new())
     } else if sample.is_null() {
-        Err(VideoError::Encoder("VideoToolbox dropped a frame".into()))
+        Err(VideoError::Encoder("VideoToolbox returned no frame".into()))
     } else {
         unsafe { annex_b(sample) }
     };
@@ -710,10 +722,10 @@ impl VideoEncoder for VideoToolboxEncoder {
         let force_key = force_key || self.restart;
         match self.encode_frame(rgba, force_key) {
             Ok(data) if data.is_empty() => {
-                self.restart = true;
-                Err(VideoError::Encoder(
-                    "VideoToolbox returned an empty frame".into(),
-                ))
+                // Skipped: the frames before it stay the reference of the
+                // next one, unless this one was to start anew.
+                self.restart = force_key;
+                Ok(EncodedFrame { data, key: false })
             }
             Ok(data) => {
                 let key = bitstream::is_key_frame(self.config.codec, &data);
@@ -793,6 +805,52 @@ mod tests {
                 [(x + seed) as u8, (y * 3) as u8, noise as u8, 255]
             })
             .collect()
+    }
+
+    /// Noise, which no bitrate holds.
+    fn noise(width: u32, height: u32, seed: u32) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..width * height)
+            .flat_map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let [r, g, b, _] = state.to_le_bytes();
+                [r, g, b, 255]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frames_skipped_for_the_bitrate_are_not_failures() {
+        for codec in [VideoCodec::H265, VideoCodec::H264] {
+            let config = EncoderConfig {
+                codec,
+                width: 1024,
+                height: 192,
+                fps: 30,
+                bitrate_kbps: 412,
+            };
+            let mut encoder = VideoToolboxEncoder::new(&config).expect("VideoToolbox");
+            let (mut skipped, mut keys, mut bytes) = (0, 0, 0);
+            for index in 0..90 {
+                let frame = encoder
+                    .encode(&noise(config.width, config.height, index), false)
+                    .unwrap_or_else(|err| panic!("{codec:?} frame {index}: {err}"));
+                skipped += u32::from(frame.data.is_empty());
+                keys += u32::from(frame.key);
+                bytes += frame.data.len();
+            }
+            // Most of them may be (and none without low-latency rate
+            // control), but the stream goes on.
+            assert!(skipped <= 85, "{codec:?}: {skipped} of 90 skipped");
+            // A skipped frame does not start the stream anew.
+            assert_eq!(keys, 1, "{codec:?}");
+            if skipped > 0 {
+                let kbps = bytes * 8 / 3 / 1000;
+                assert!(kbps < 2 * 412, "{codec:?}: {kbps} kbps");
+            }
+        }
     }
 
     /// The planes of a pixel buffer (Y, then UV), without the row padding.

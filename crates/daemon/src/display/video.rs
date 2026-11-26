@@ -546,7 +546,9 @@ impl Display {
         };
         video.last_change = now;
         if encoded.data.is_empty() {
-            // The encoder buffers this frame; it comes out with a later one.
+            // The encoder left this frame out to hold its bitrate; what it
+            // shows comes with the next one.
+            self.metrics.video_frame_skipped(codec);
             return FlushStats::default();
         }
         let timestamp = now.duration_since(video.started).as_millis() as u32;
@@ -756,6 +758,76 @@ mod tests {
                 key: force_key,
             })
         }
+    }
+
+    /// Leaves out every frame whose index is in `skip`, as an encoder
+    /// holding its bitrate does.
+    struct SkippingEncoder {
+        skip: Vec<u32>,
+        frames: u32,
+    }
+
+    impl VideoEncoder for SkippingEncoder {
+        fn codec(&self) -> VideoCodec {
+            VideoCodec::H264
+        }
+
+        fn encode(&mut self, rgba: &[u8], force_key: bool) -> Result<EncodedFrame, VideoError> {
+            let index = self.frames;
+            self.frames += 1;
+            let data = if self.skip.contains(&index) {
+                Vec::new()
+            } else {
+                vec![0, 0, 0, 1, 0x65, rgba[0]]
+            };
+            Ok(EncodedFrame {
+                data,
+                key: force_key,
+            })
+        }
+    }
+
+    #[test]
+    fn a_frame_the_encoder_skips_is_left_out_and_the_video_goes_on() {
+        let mut display = Display::new(
+            ImageFormats {
+                jpeg: true,
+                zstd: false,
+            },
+            false,
+        );
+        display.enable_video(
+            vec![(VideoCodec::H264, u64::MAX)],
+            Box::new(|_| {
+                Ok(Box::new(SkippingEncoder {
+                    skip: vec![2, 3, 6],
+                    frames: 0,
+                }))
+            }),
+        );
+        let mut out = Output::text();
+        display.resize(640, 480, &mut out);
+        display.flush(&mut out);
+        let (mut starts, mut blobs, mut silent) = (0, 0, 0);
+        for frame in 0..40u32 {
+            let mut out = Output::text();
+            display.put(100, 70, 300, 200, &noise(frame, 300, 200));
+            display.flush(&mut out);
+            starts += u32::from(out.contains("5.video"));
+            assert!(!out.contains("3.end,3.101;"), "frame {frame}: {out}");
+            if starts > 0 {
+                // Nothing else is sent for the area of a skipped frame.
+                assert!(!out.contains("3.img"), "frame {frame}: {out}");
+                blobs += u32::from(out.contains("4.blob,3.101,"));
+                silent += u32::from(!out.contains("4.blob,3.101,"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(starts, 1);
+        assert_eq!(silent, 3);
+        assert!(blobs > 10, "video frames: {blobs}");
+        assert!(display.video.is_some());
+        assert_eq!(display.video_support.as_ref().unwrap().failures, 0);
     }
 
     fn display_with_video() -> (Display, EncodeLog) {

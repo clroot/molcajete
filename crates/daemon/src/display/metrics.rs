@@ -329,6 +329,12 @@ impl DisplayMetrics {
         self.totals.video_bytes += bytes as u64;
     }
 
+    /// A frame the encoder left out to hold its bitrate.
+    pub(super) fn video_frame_skipped(&mut self, codec: VideoCodec) {
+        counter!("molcajeted_video_frames_skipped_total", "codec" => codec_label(codec))
+            .increment(1);
+    }
+
     /// Logs the session totals (called when the display is dropped).
     pub(super) fn summary(&self) {
         let t = &self.totals;
