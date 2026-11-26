@@ -31,6 +31,34 @@ impl DecodedImage {
     }
 }
 
+/// Which image formats arrived, for the client's stats.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Formats(u8);
+
+impl Formats {
+    /// In the order they are reported.
+    const NAMES: [&'static str; 5] = ["jpeg", "webp", "png", "zstd", "other"];
+
+    pub fn add(&mut self, mimetype: &str) {
+        let index = match mimetype.split(';').next().unwrap_or_default().trim() {
+            "image/jpeg" => 0,
+            "image/webp" => 1,
+            "image/png" => 2,
+            molcajete_protocol::zimage::MIMETYPE => 3,
+            _ => 4,
+        };
+        self.0 |= 1 << index;
+    }
+
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        Self::NAMES
+            .into_iter()
+            .enumerate()
+            .filter(move |(index, _)| self.0 & (1 << index) != 0)
+            .map(|(_, name)| name)
+    }
+}
+
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = ImageDecoder)]
@@ -187,6 +215,23 @@ pub async fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_are_named_once_each_in_a_fixed_order() {
+        let mut formats = Formats::default();
+        assert_eq!(formats.names().count(), 0);
+        formats.add("image/png");
+        formats.add(molcajete_protocol::zimage::MIMETYPE);
+        formats.add("image/jpeg");
+        formats.add("image/png");
+        assert_eq!(formats.names().collect::<Vec<_>>(), ["jpeg", "png", "zstd"]);
+        formats.add("image/webp; foo=bar");
+        formats.add("image/avif");
+        assert_eq!(
+            formats.names().collect::<Vec<_>>(),
+            ["jpeg", "webp", "png", "zstd", "other"]
+        );
+    }
 
     fn png(color_type: u8, extra_chunk: Option<&[u8; 4]>) -> Vec<u8> {
         let mut v = b"\x89PNG\r\n\x1a\n".to_vec();

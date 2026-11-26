@@ -189,6 +189,8 @@ impl Drop for Listener {
 struct Counters {
     bytes: u64,
     instructions: u64,
+    /// The formats of the images that arrived.
+    images: crate::image::Formats,
 }
 
 /// DOM parts owned by a main-thread client.
@@ -1029,6 +1031,7 @@ impl Inner {
                 x,
                 y,
             } => {
+                self.counters.images.add(mimetype);
                 let slot = ImageSlot::pending();
                 self.display.enqueue(Op::Image {
                     layer,
@@ -1065,6 +1068,7 @@ impl Inner {
                 } else {
                     "image/jpeg"
                 };
+                self.counters.images.add(mimetype);
                 let slot = ImageSlot::pending();
                 self.display.enqueue(Op::Image {
                     layer,
@@ -2199,6 +2203,17 @@ impl Inner {
         let stats = self.display.take_stats();
         let counters = std::mem::take(&mut self.counters);
         let buffered = self.tunnel.as_ref().map_or(0, Tunnel::buffered_amount);
+        // Every stream of a session has the codec of its handshake; the
+        // order only settles what is shown should that ever change.
+        let video_codec = self
+            .streams
+            .values()
+            .filter_map(|stream| match stream {
+                InStream::Video(video) => Some(video.codec),
+                _ => None,
+            })
+            .min();
+        let image_formats: js_sys::Array = counters.images.names().map(JsValue::from_str).collect();
         self.emit(
             "stats",
             object(&[
@@ -2255,6 +2270,13 @@ impl Inner {
                     self.rtt_ms.map_or(JsValue::NULL, JsValue::from_f64),
                 ),
                 ("sendBuffered", JsValue::from_f64(buffered as f64)),
+                // Null while no video stream is open.
+                (
+                    "videoCodec",
+                    video_codec.map_or(JsValue::NULL, |codec| JsValue::from_str(codec.name())),
+                ),
+                // Of the images that arrived in this second.
+                ("imageFormats", image_formats.into()),
                 ("displayWidth", JsValue::from(self.display.width())),
                 ("displayHeight", JsValue::from(self.display.height())),
             ]),

@@ -276,7 +276,7 @@ All browser callbacks go through one `with_inner` borrow of the client state, so
 
 Instructions are queued as `Op`s, and a frame (everything up to `sync`) runs at once when all of its images are ready, as in `Guacamole.Display`. Intermediate states never reach the screen. Each queued frame counts its pending images (`display/frames.rs`), so the queue is not rescanned after every decoded image. When a frame has run, `sync` is sent back, with the apply time when the server asked for it (section 3.6), and the next `requestAnimationFrame` composites once.
 
-The display also measures where a frame's time goes: when it starts arriving (`display/arrival.rs`, starting at the first instruction that draws on a visible layer), how long it waits for images, and how long an applied frame waits to be presented (`display/present.rs`). These go out as once-per-second `stats` events; see [observability.md](observability.md).
+The display also measures where a frame's time goes: when it starts arriving (`display/arrival.rs`, starting at the first instruction that draws on a visible layer), how long it waits for images, and how long an applied frame waits to be presented (`display/present.rs`). These go out as once-per-second `stats` events; see [observability.md](observability.md). The same event says how the screen arrived: `videoCodec`, the codec of the open video streams (`av1`, `h265`, `h264`, null without one), and `imageFormats`, the formats of the images received in that second (`jpeg`, `webp`, `png`, `zstd`, `other`). The page shows both in its performance stats; the gateway's client reports ignore them.
 
 ### 4.4 Images
 
