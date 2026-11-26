@@ -70,6 +70,9 @@ pub struct TunnelRequest {
     pub join: Option<String>,
     /// A live session's tunnel id (`shadow=`): an administrator watches it.
     pub shadow: Option<String>,
+    /// A one-time credential's token (`ironrdp=`): the browser runs
+    /// IronRDP's client and molcajeted relays RDP (`crate::ironrdp`).
+    pub ironrdp: Option<String>,
     /// Address of the browser, as seen by the gateway or reported by a
     /// trusted reverse proxy (`X-Forwarded-For`).
     pub peer: Option<String>,
@@ -117,6 +120,7 @@ impl TunnelRequest {
                 "page" => req.page = Some(value.chars().take(64).collect()),
                 "join" => req.join = Some(value.chars().take(128).collect()),
                 "shadow" => req.shadow = Some(value.chars().take(64).collect()),
+                "ironrdp" => req.ironrdp = Some(value.chars().take(128).collect()),
                 "width" | "GUAC_WIDTH" => {
                     if let Ok(v) = value.parse() {
                         req.info.width = clamp_dimension(v);
@@ -173,7 +177,7 @@ fn clamp_dimension(v: u32) -> u32 {
     v.clamp(1, 16384)
 }
 
-fn close_message(status: Status) -> Message {
+pub(crate) fn close_message(status: Status) -> Message {
     Message::Close(Some(CloseFrame {
         code: status.websocket_close_code(),
         reason: Utf8Bytes::from(status.code().to_string()),
@@ -196,9 +200,18 @@ pub async fn serve(
         peer = request.peer.as_deref().unwrap_or(""),
         user = request.user.as_ref().map_or("", |u| u.username.as_str()),
     );
-    serve_tunnel(socket, state, request, connection, tunnel_id)
-        .instrument(span)
-        .await;
+    match request.ironrdp.clone() {
+        Some(token) => {
+            crate::ironrdp::serve(socket, state, request, connection, &token, tunnel_id)
+                .instrument(span)
+                .await
+        }
+        None => {
+            serve_tunnel(socket, state, request, connection, tunnel_id)
+                .instrument(span)
+                .await
+        }
+    }
 }
 
 async fn serve_tunnel(
@@ -521,7 +534,7 @@ async fn serve_joined(
     );
 }
 
-fn with(
+pub(crate) fn with(
     labels: &[(&'static str, String); 2],
     key: &'static str,
     value: impl Into<String>,

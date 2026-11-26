@@ -65,6 +65,7 @@ async fn app(guacd_port: u16) -> App {
         .unwrap();
     let state = Arc::new(AppState {
         throttle: crate::throttle::LoginThrottle::new(&config.auth.throttle),
+        ironrdp: Default::default(),
         config,
         db,
         client_reports: false,

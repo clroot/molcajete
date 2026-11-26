@@ -423,6 +423,17 @@ fn validate_connection(mut c: ConnectionRecord) -> ApiResult<ConnectionRecord> {
         }
     }
     c.attributes.retain(|_, value| value == "true");
+    let ironrdp = c.flag(attributes::IRONRDP_DEFAULT) || c.flag(attributes::IRONRDP_SWITCH);
+    if ironrdp && c.protocol != "rdp" {
+        return Err(ApiError::bad_request(
+            "Only RDP connections can use IronRDP's client.",
+        ));
+    }
+    if ironrdp && c.flag(attributes::RECORD) {
+        return Err(ApiError::bad_request(
+            "Sessions with IronRDP's client cannot be recorded; turn off one of them.",
+        ));
+    }
     Ok(c)
 }
 

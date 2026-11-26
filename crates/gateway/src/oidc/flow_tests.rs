@@ -57,6 +57,7 @@ async fn sso(extra: &str) -> Sso {
     let oidc = Oidc::new(config.oidc.clone().unwrap()).unwrap();
     let state = Arc::new(AppState {
         throttle: crate::throttle::LoginThrottle::new(&config.auth.throttle),
+        ironrdp: Default::default(),
         config,
         db,
         client_reports: false,
@@ -640,6 +641,7 @@ async fn unreachable_provider_is_reported() {
     config.issuer = "http://127.0.0.1:9".into();
     let state = Arc::new(AppState {
         throttle: crate::throttle::LoginThrottle::new(&sso.state.config.auth.throttle),
+        ironrdp: Default::default(),
         config: sso.state.config.clone(),
         db: sso.state.db.clone(),
         client_reports: false,
