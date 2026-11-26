@@ -78,7 +78,14 @@ export type ConnectionSummary = {
   readOnly?: boolean;
   disableCopy?: boolean;
   disablePaste?: boolean;
+  /** Sessions open with IronRDP's client; older gateways leave it out. */
+  ironrdpDefault?: boolean;
+  /** The session menu switches between molcajete's client and IronRDP's. */
+  ironrdpSwitch?: boolean;
 };
+
+/** A one-time credential for IronRDP's client (`POST /api/connections/{id}/ironrdp`). */
+export type IronRdpGrant = {token: string; username: string; password: string};
 
 export type Connection = {
   id: string;
@@ -111,6 +118,8 @@ export const ATTRIBUTES = {
   recordExcludeMouse: 'record-exclude-mouse',
   recordMolcajeteFormats: 'record-molcajete-formats',
   recordOnDemand: 'record-on-demand',
+  ironrdpDefault: 'ironrdp-default',
+  ironrdpSwitch: 'ironrdp-switch',
 } as const;
 
 /** A recorded session (`/api/recordings`). */
@@ -303,6 +312,8 @@ export const api = {
   deleteConnection: (connectionId: string) => request<void>('DELETE', `connections/${id(connectionId)}`),
   moveConnection: (connectionId: string, parentId: string | null) =>
     request<void>('PUT', `connections/${id(connectionId)}/parent`, {parentId}),
+  ironrdpGrant: (connectionId: string) =>
+    request<IronRdpGrant>('POST', `connections/${id(connectionId)}/ironrdp`),
   connectionAccess: (connectionId: string) =>
     request<Access>('GET', `connections/${id(connectionId)}/access`),
   setConnectionAccess: (connectionId: string, access: Access) =>
