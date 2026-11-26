@@ -499,8 +499,13 @@ The web client asks `GET /api/settings` which optional features are on: `clientR
 | `--ffmpeg PATH` | `MOLCAJETED_FFMPEG` | `ffmpeg` from `PATH` | ffmpeg for the video encoders (hardware encoders when a trial encode works, otherwise libsvtav1, libx265, libx264). On macOS, H.265 and H.264 use VideoToolbox directly. |
 | `--image-zstd true\|false` | `MOLCAJETED_IMAGE_ZSTD` | `true` | Send lossless updates as zstd images to clients that announce the type; `false` keeps every client on PNG. |
 | `--encode-threads N` | `MOLCAJETED_ENCODE_THREADS` | `0` | Threads that encode the images of a frame side by side, shared by all sessions. `0` uses half the available cores, at most 8; `1` encodes on each session's own thread. |
+| `--resume-timeout SECONDS` | `MOLCAJETED_RESUME_TIMEOUT` | `120` | How long an RDP or VNC session is kept after its tunnel dropped, for the same browser tab to resume it ([administration](administration.md#sessions-that-outlive-their-tunnel)). `0` ends sessions with their tunnel. A connection's `resume-timeout` parameter overrides it. |
+| `--resume-timeout-ssh SECONDS` | `MOLCAJETED_RESUME_TIMEOUT_SSH` | `300` | The same for SSH sessions. |
+| `--resume-max-detached N` | `MOLCAJETED_RESUME_MAX_DETACHED` | `64` | Sessions kept without a client at once; a session whose tunnel drops while this many are kept ends at once. Each keeps its remote connection and its framebuffer (about 33 MB at 3840×2160, twice that for RDP and VNC with its copy for the client). |
 | `--log-format`, `--telemetry-listen`, `--profiling` | `MOLCAJETE_LOG_FORMAT`, `MOLCAJETE_TELEMETRY_LISTEN`, `MOLCAJETE_PROFILING` | | As for the gateway; see [observability.md](observability.md#options). |
 | | `RUST_LOG` | `info,pprof=warn` | Log filter. |
+
+Held sessions live in molcajeted's memory: restarting molcajeted ends them, while restarting or redeploying the gateway does not, since the resume key is derived from `[secrets]` and needs no state in the gateway (any replica with the same key resumes). Rotating the secret key makes held sessions unreachable; they end after their grace period.
 
 At startup molcajeted logs the encoders it found (`video encoders`). After three encoder failures in a session it stops using video for that session.
 

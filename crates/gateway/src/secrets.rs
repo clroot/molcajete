@@ -73,6 +73,9 @@ pub enum SecretError {
 struct Key {
     id: String,
     cipher: Aes256Gcm,
+    /// A key for something else than credentials, derived from this one
+    /// ([`SecretKeys::resume_key`]).
+    resume: [u8; 32],
 }
 
 impl Key {
@@ -83,9 +86,13 @@ impl Key {
         let mut hash = Sha256::new();
         hash.update(b"molcajete secret key id\0");
         hash.update(bytes);
+        let mut resume = Sha256::new();
+        resume.update(b"molcajete resume key\0");
+        resume.update(bytes);
         Ok(Self {
             id: hex::encode(&hash.finalize()[..4]),
             cipher: Aes256Gcm::new_from_slice(bytes).expect("checked length"),
+            resume: resume.finalize().into(),
         })
     }
 
@@ -166,6 +173,12 @@ impl SecretKeys {
                 .map(|k| Key::from_base64(k))
                 .collect::<anyhow::Result<_>>()?,
         })
+    }
+
+    /// The key that resume keys are made with (`crate::resume`), derived
+    /// from the current key: a new key ends the sessions held by then.
+    pub fn resume_key(&self) -> &[u8; 32] {
+        &self.current.resume
     }
 
     /// The id of the key new values are encrypted with.

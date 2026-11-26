@@ -256,6 +256,8 @@ pub struct Inner {
     ping_sent_at: Option<f64>,
     rtt_ms: Option<f64>,
     unstable: bool,
+    /// The display is cleared when the tunnel opened by `connect` answers.
+    reset_display: bool,
     last_lag_ms: f64,
     counters: Counters,
     stats_since: f64,
@@ -419,6 +421,7 @@ impl Inner {
                 ping_sent_at: None,
                 rtt_ms: None,
                 unstable: false,
+                reset_display: false,
                 last_lag_ms: 0.0,
                 counters: Counters::default(),
                 stats_since: now(),
@@ -595,7 +598,9 @@ impl Inner {
 
     pub fn connect(&mut self, url: &str) -> Result<(), JsValue> {
         self.disconnect_internal(None);
-        self.display.reset();
+        // The last picture stays until the gateway answers, so that a
+        // reconnect shows it meanwhile.
+        self.reset_display = true;
         self.parser = Some(Parser::new());
         self.last_sync_ack = None;
         self.counters = Counters::default();
@@ -640,7 +645,18 @@ impl Inner {
         if status.is_error() {
             self.emit_error(status, &format!("tunnel closed: {}", status.name()));
         }
+        self.emit_interrupted(status);
         self.disconnect_internal(None);
+    }
+
+    /// The tunnel ended without the server ending the session (no
+    /// `disconnect`, no `error`): the page may connect again and get the
+    /// same session back, which molcajeted holds for a while.
+    fn emit_interrupted(&mut self, status: Status) {
+        self.emit(
+            "interrupted",
+            object(&[("code", JsValue::from(status.code()))]),
+        );
     }
 
     fn emit_error(&mut self, status: Status, message: &str) {
@@ -820,10 +836,13 @@ impl Inner {
             match raw.opcode() {
                 "" => {
                     // Tunnel-internal: UUID announcement or ping reply.
-                    if raw.arg(0) == "ping"
-                        && let Some(sent) = self.ping_sent_at.take()
-                    {
-                        self.rtt_ms = Some(now() - sent);
+                    if raw.arg(0) == "ping" {
+                        if let Some(sent) = self.ping_sent_at.take() {
+                            self.rtt_ms = Some(now() - sent);
+                        }
+                    } else if std::mem::take(&mut self.reset_display) {
+                        // The new connection's first message.
+                        self.display.reset();
                     }
                     continue;
                 }
@@ -2185,7 +2204,9 @@ impl Inner {
             }
             let silence = t - self.last_received;
             if silence > 15_000.0 {
-                self.fail(Status::UPSTREAM_TIMEOUT, "connection timed out");
+                self.emit_error(Status::UPSTREAM_TIMEOUT, "connection timed out");
+                self.emit_interrupted(Status::UPSTREAM_TIMEOUT);
+                self.disconnect_internal(None);
                 return;
             }
             let unstable = silence > 1_500.0;

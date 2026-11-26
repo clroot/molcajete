@@ -78,4 +78,40 @@ describe('session events', () => {
     expect(ended(0x0303, 'denied')).toMatchObject({title: 'Connection error'});
     expect(ended(0x0203)).toMatchObject({title: 'Connection error'});
   });
+
+  test('stays on reconnecting through the attempts, until connected or given up', () => {
+    // The tunnel drops: error, then the page starts reconnecting.
+    const dropped = reduce(connected, {
+      type: 'error',
+      detail: {message: 'tunnel closed: UPSTREAM_TIMEOUT', name: 'UPSTREAM_TIMEOUT', code: 0x0202},
+    });
+    let state = reduce(dropped, {type: 'resuming'});
+    expect(state.status.kind).toBe('reconnecting');
+    for (const detail of ['disconnected', 'connecting', 'waiting'] as const) {
+      state = reduce(state, {type: 'state', detail});
+      expect(state.status.kind).toBe('reconnecting');
+    }
+    // A failed attempt is kept for later.
+    state = reduce(state, {
+      type: 'error',
+      detail: {message: 'tunnel closed: UPSTREAM_NOT_FOUND', name: 'UPSTREAM_NOT_FOUND', code: 0x0207},
+    });
+    expect(state.status.kind).toBe('reconnecting');
+    expect(reduce(state, {type: 'state', detail: 'connected'}).status).toEqual({kind: 'connected'});
+    const gaveUp = reduce(state, {type: 'gave-up'});
+    expect(gaveUp.status.kind).toBe('failed');
+    expect(gaveUp.status.kind === 'failed' && gaveUp.status.detail).toContain('UPSTREAM_NOT_FOUND');
+  });
+
+  test('says so when another window took the session', () => {
+    const state = reduce(connected, {
+      type: 'error',
+      detail: {message: 'The session was opened in another window', name: 'SESSION_CONFLICT', code: 0x0209},
+    });
+    expect(state.status).toEqual({
+      kind: 'failed',
+      title: 'Opened in another window',
+      detail: 'The session was opened in another window',
+    });
+  });
 });

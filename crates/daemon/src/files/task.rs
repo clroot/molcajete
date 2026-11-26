@@ -31,6 +31,13 @@ pub enum Request {
         stream: i32,
         ok: bool,
     },
+    /// The client went away ([`crate::resume`]): its transfers are over.
+    Detach,
+    /// A client attached, whose blobs carry `chunk` bytes: it is told
+    /// about the filesystem.
+    Attach {
+        chunk: usize,
+    },
 }
 
 struct Upload {
@@ -81,6 +88,8 @@ pub struct Task {
     /// Uploads refused or failed, whose remaining data is dropped.
     refused: HashSet<i32>,
     downloads: HashMap<i32, Download>,
+    /// The filesystem's name, once it is ready.
+    name: String,
     /// One blob's worth: each blob is one `blob` instruction or one record,
     /// so the client acknowledges each with one `ack`.
     buffer: Vec<u8>,
@@ -96,6 +105,7 @@ impl Task {
             uploads: HashMap::new(),
             refused: HashSet::new(),
             downloads: HashMap::new(),
+            name: String::new(),
             buffer: vec![0; chunk],
         }
     }
@@ -103,6 +113,13 @@ impl Task {
     /// Exposes `backend` to the client as the filesystem `name`.
     pub fn ready(&mut self, backend: Backend, name: &str) {
         self.backend = Some(backend);
+        self.name = name.to_owned();
+        self.announce();
+    }
+
+    /// Tells the client about the filesystem.
+    fn announce(&self) {
+        let name = &self.name;
         self.send(
             InstructionBuilder::new("filesystem")
                 .arg(OBJECT)
@@ -129,12 +146,37 @@ impl Task {
                 }
                 Request::Event(FileEvent::Get { object, name }) => self.get(object, &name).await,
                 Request::Ack { stream, ok } => self.download_ack(stream, ok).await,
+                Request::Detach => self.detach().await,
+                Request::Attach { chunk } => {
+                    self.window = (WINDOW_BYTES / chunk).max(1);
+                    self.buffer = vec![0; chunk];
+                    if self.backend.is_some() {
+                        self.announce();
+                    }
+                }
             }
         }
         // The session is over: what was being uploaded is incomplete.
         for (_, upload) in self.uploads.drain() {
             discard(self.backend.as_ref(), upload).await;
         }
+    }
+
+    /// Ends the transfers of a client that went away: incomplete uploads
+    /// are deleted, as at the end of a session, and downloads stop.
+    async fn detach(&mut self) {
+        let (uploads, downloads) = (self.uploads.len(), self.downloads.len());
+        if uploads + downloads > 0 {
+            info!(
+                uploads,
+                downloads, "the client went away; its transfers are aborted"
+            );
+        }
+        for (_, upload) in self.uploads.drain() {
+            discard(self.backend.as_ref(), upload).await;
+        }
+        self.downloads.clear();
+        self.refused.clear();
     }
 
     fn send(&self, text: String) {

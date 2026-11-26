@@ -22,9 +22,9 @@ type Props = {
   onLeave?: () => void;
 };
 
-/** Covers the display while connecting, after an error or once disconnected. */
+/** Covers the display while connecting or reconnecting, after an error or once disconnected. */
 export default function StatusOverlay({status, connectionName, onReconnect, onLeave}: Props) {
-  const isConnecting = status.kind === 'connecting';
+  const isConnecting = status.kind === 'connecting' || status.kind === 'reconnecting';
   return (
     <Center axis="both" padding={4} xstyle={styles.scrim}>
       <Card padding={6} xstyle={styles.card}>
@@ -54,6 +54,8 @@ function title(status: Props['status']) {
   switch (status.kind) {
     case 'connecting':
       return 'Connecting…';
+    case 'reconnecting':
+      return 'Reconnecting…';
     case 'disconnected':
       return 'Disconnected';
     case 'failed':

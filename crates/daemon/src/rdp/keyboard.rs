@@ -260,6 +260,17 @@ impl Keyboard {
         (ctrl || alt || super_) && !(ctrl && alt)
     }
 
+    /// Releases every key held, as when the client lets go of them all
+    /// (it went away).
+    pub fn release_all(&mut self) -> Vec<FastPathInputEvent> {
+        let mut out = Vec::new();
+        for (_, sent) in self.pressed.drain() {
+            sent_events(sent, false, &mut out);
+        }
+        self.modifiers.clear();
+        out
+    }
+
     /// Handles a key press or release and returns the events to send.
     pub fn key(&mut self, keysym: u32, pressed: bool) -> Vec<FastPathInputEvent> {
         let mut out = Vec::new();

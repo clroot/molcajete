@@ -43,6 +43,7 @@ pub fn client(data: &[u8]) {
                 instruction,
                 received: Instant::now(),
                 from_viewer: false,
+                control: None,
             };
             let _ = decoder.decode(&input, &mut out);
             out.clear();

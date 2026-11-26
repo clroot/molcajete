@@ -35,6 +35,11 @@ impl DisplayControlStatus {
         }
     }
 
+    /// What the client was last told, for a client that attaches later.
+    pub fn reported(&self) -> Option<bool> {
+        self.reported
+    }
+
     /// Whether the client was told the channel is missing.
     pub fn is_unavailable(&self) -> bool {
         self.reported == Some(false)

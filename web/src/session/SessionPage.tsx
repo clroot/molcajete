@@ -49,6 +49,7 @@ import FilesDrawer from './FilesDrawer';
 import {ActiveTransfers} from './TransferList';
 import DropOverlay from './DropOverlay';
 import {useFileDrop} from './useFileDrop';
+import {RECONNECT_DELAYS, resumeId, shouldReconnect} from './resume';
 
 const styles = stylex.create({
   // The remote screen, and under it the terminal key bar when it shows.
@@ -125,10 +126,13 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
   // Called for a pinch on the terminal; the client's events arrive in a
   // handler that must not change, so it reaches the current one through this.
   const onZoom = useRef((delta: number) => void delta);
+  // Called when the tunnel of a session that was up drops; set further down.
+  const onInterrupted = useRef((code: number) => void code);
 
   const onEvent = useCallback(
     (event: SessionEvent) => {
       dispatch(event);
+      if (event.type === 'interrupted') onInterrupted.current(event.detail.code);
       dispatchFiles(event);
       if (event.type === 'transfer' && (event.detail.state === 'done' || event.detail.state === 'failed')) {
         const t = event.detail;
@@ -153,9 +157,12 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
   const tunnelParameters = useCallback(() => {
     const page = newPageId();
     setPageId(page);
+    // A one-time link is used up: its session cannot be resumed.
+    const resume = ticketId === undefined ? resumeId(connectionId) : null;
     return {
       ...tunnelOverrides(readDisplayChoices(connectionId)),
       ...(ticketId === undefined ? {} : {ticket: ticketId}),
+      ...(resume === null ? {} : {resume}),
       page,
     };
   }, [connectionId, ticketId]);
@@ -208,12 +215,43 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
     };
   });
 
+  const isTicket = ticketId !== undefined;
+  // Reconnecting by itself: whether the session was up since the last
+  // time the user asked to connect, the attempts since, and the next one.
+  const wasConnected = useRef(false);
+  const attempts = useRef(0);
+  const retryTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(retryTimer.current), []);
+  useEffect(() => {
+    if (session.status.kind === 'connected') {
+      wasConnected.current = true;
+      attempts.current = 0;
+    }
+  }, [session.status.kind]);
+  useEffect(() => {
+    onInterrupted.current = code => {
+      const delay = RECONNECT_DELAYS[attempts.current];
+      if (isTicket || !wasConnected.current) return;
+      if (!shouldReconnect(code) || delay === undefined) {
+        wasConnected.current = false;
+        dispatch({type: 'gave-up'});
+        return;
+      }
+      attempts.current += 1;
+      dispatch({type: 'resuming'});
+      window.clearTimeout(retryTimer.current);
+      retryTimer.current = window.setTimeout(() => connect(), delay);
+    };
+  });
+
   const reconnect = () => {
     unlockAudio();
+    window.clearTimeout(retryTimer.current);
+    wasConnected.current = false;
+    attempts.current = 0;
     dispatch({type: 'reconnecting'});
     connect();
   };
-  const isTicket = ticketId !== undefined;
 
   const setMenuOpen = useCallback(
     (open: boolean) => {
@@ -405,14 +443,13 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
         onRemoteCompositionChange={setRemoteComposition}
         onCtrlAltDel={() => client()?.send_ctrl_alt_del()}
         onSwitchClient={onSwitchClient ?? null}
-        onDisconnect={
-          isTicket
-            ? () => {
-                setMenuOpen(false);
-                client()?.disconnect();
-              }
-            : leave
-        }
+        onDisconnect={() => {
+          // Ends the session itself: a tunnel that merely closes leaves it
+          // held for this tab to come back.
+          setMenuOpen(false);
+          client()?.disconnect();
+          if (!isTicket) leave();
+        }}
         recording={
           shared && <RecordingSection pageId={pageId} recording={shared.recording} onChange={reloadShared} />
         }

@@ -1030,3 +1030,46 @@ fn row_differences_of_a_segment_follow_from_the_whole_row() {
         }
     }
 }
+
+/// A client that attaches to a held display gets the whole framebuffer,
+/// and nothing is encoded while none is attached.
+#[test]
+fn an_attached_client_gets_the_whole_screen() {
+    let mut display = Display::new(ImageFormats::default(), true);
+    let mut first = Client::new();
+    let mut out = Output::text();
+    display.resize(200, 120, &mut out);
+    let pattern: Vec<u8> = (0..200 * 120)
+        .flat_map(|i: u32| [(i % 251) as u8, (i % 13) as u8 * 19, (i / 200) as u8, 255])
+        .collect();
+    display.put(0, 0, 200, 120, &pattern);
+    display.flush(&mut out);
+    display.sync(&mut out);
+    first.apply(&out);
+    assert_eq!(first.pixels, display.pixels);
+    assert_eq!(display.unacked_frames(), 1);
+
+    display.detach();
+    assert!(display.is_detached());
+    assert_eq!(display.unacked_frames(), 0);
+    out.clear();
+    display.fill(10, 10, 50, 50, [9, 8, 7, 255]);
+    display.flush(&mut out);
+    display.sync(&mut out);
+    assert!(out.is_empty(), "nothing goes out while detached: {out}");
+    assert_eq!(display.unacked_frames(), 0);
+    assert_eq!(display.idle_deadline(), None);
+
+    let mut second = Client::new();
+    out.clear();
+    display.attach(ImageFormats::default(), &mut out);
+    assert!(!display.is_detached());
+    display.flush(&mut out);
+    display.sync(&mut out);
+    second.apply(&out);
+    assert_eq!(
+        second.pixels, display.pixels,
+        "the whole screen, changes included"
+    );
+    assert_eq!(display.unacked_frames(), 1);
+}

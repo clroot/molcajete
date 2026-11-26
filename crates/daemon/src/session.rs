@@ -15,10 +15,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::display::{Display, SyncReply};
+use crate::display::{Display, ImageFormats, SyncReply};
 use crate::files::FileEvent;
 use crate::handshake::ClientInfo;
 use crate::io::{GuacReader, GuacWriter, Output};
+use crate::resume::{Attach, Control};
 use crate::video::VideoEncoders;
 
 /// Input from the Guacamole client, already decoded.
@@ -65,6 +66,12 @@ pub enum ClientEvent {
     /// File transfer (see [`crate::files`]), for sessions that accept it.
     File(FileEvent),
     Disconnect,
+    /// The client's connection ended; the session is held without it
+    /// ([`crate::resume`]). Only sessions that may be resumed get it.
+    Detached,
+    /// A client took the session (back): write to it from now on with
+    /// [`crate::resume::take_over`] and send it the whole screen.
+    Attached(Attach),
 }
 
 enum InboundKind {
@@ -85,6 +92,9 @@ pub struct Input {
     /// [`crate::share`]): what it owes in return (stream acknowledgements)
     /// went to that user already and is not sent to this client.
     pub from_viewer: bool,
+    /// Not an instruction but news of the client's connection
+    /// ([`crate::resume`]).
+    pub control: Option<Control>,
 }
 
 impl Deref for Input {
@@ -125,6 +135,16 @@ impl InputDecoder {
     /// Decodes one instruction. Acknowledgements owed to the client are
     /// appended to `out`.
     pub fn decode(&mut self, ins: &Input, out: &mut Output) -> Option<ClientEvent> {
+        match &ins.control {
+            Some(Control::Detached) => {
+                // What the client was sending is not coming any more.
+                self.streams.clear();
+                self.uploads.clear();
+                return Some(ClientEvent::Detached);
+            }
+            Some(Control::Attached(attach)) => return Some(ClientEvent::Attached(attach.clone())),
+            None => {}
+        }
         let mut elsewhere;
         let out = if ins.from_viewer {
             elsewhere = Output::text();
@@ -318,11 +338,18 @@ impl InputDecoder {
 /// the client disconnects.
 ///
 /// In a connection others may join, the channel also carries the input of
-/// the joined users who may control it ([`crate::share`]).
+/// the joined users who may control it ([`crate::share`]). In a session
+/// that may be resumed, it carries the instructions of whichever client is
+/// attached, and [`ClientEvent::Detached`] and [`ClientEvent::Attached`]
+/// ([`crate::resume`]).
 pub fn spawn_reader(mut reader: GuacReader) -> (mpsc::Receiver<Input>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<Input>(512);
     if let Some(shared) = crate::share::current() {
         shared.set_input(tx.clone());
+    }
+    if let Some(hub) = crate::resume::current() {
+        let task = hub.first_reader(reader, tx);
+        return (rx, task);
     }
     let task = tokio::spawn(async move {
         while let Ok(Some(instruction)) = reader.next().await {
@@ -330,6 +357,7 @@ pub fn spawn_reader(mut reader: GuacReader) -> (mpsc::Receiver<Input>, JoinHandl
                 instruction,
                 received: Instant::now(),
                 from_viewer: false,
+                control: None,
             };
             if tx.send(input).await.is_err() {
                 break;
@@ -452,6 +480,14 @@ pub fn enable_video(display: &mut Display, info: &ClientInfo) {
     display.enable_video(codecs, Box::new(move |config| encoders.create(config)));
 }
 
+/// Sends a client that just attached to a held session ([`crate::resume`])
+/// what `display` shows: its size and cursor now, the whole framebuffer
+/// with the next flush, in the formats this client accepts.
+pub fn attach_display(display: &mut Display, info: &ClientInfo, out: &mut Output) {
+    display.attach(ImageFormats::from_mimetypes(&info.image), out);
+    enable_video(display, info);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +499,7 @@ mod tests {
             instruction: parse_all(text).unwrap().remove(0),
             received: Instant::now(),
             from_viewer: false,
+            control: None,
         }
     }
 

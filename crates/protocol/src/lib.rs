@@ -15,6 +15,7 @@ pub mod apply_time;
 pub mod binary;
 mod instruction;
 mod parser;
+pub mod resume;
 pub mod server;
 mod status;
 mod types;

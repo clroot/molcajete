@@ -58,6 +58,18 @@ struct Cli {
     /// encode on the session's own thread.
     #[arg(long, env = "MOLCAJETED_ENCODE_THREADS", default_value_t = 0)]
     encode_threads: usize,
+    /// Seconds an RDP or VNC session is kept after its connection to the
+    /// gateway ended unasked, for the same browser tab to resume it; 0 ends
+    /// it at once. A connection's `resume-timeout` parameter overrides it.
+    #[arg(long, env = "MOLCAJETED_RESUME_TIMEOUT", default_value_t = 120)]
+    resume_timeout: u64,
+    /// The same for SSH sessions.
+    #[arg(long, env = "MOLCAJETED_RESUME_TIMEOUT_SSH", default_value_t = 300)]
+    resume_timeout_ssh: u64,
+    /// Sessions kept without a client at once; a session whose client
+    /// leaves while this many are kept ends at once.
+    #[arg(long, env = "MOLCAJETED_RESUME_MAX_DETACHED", default_value_t = 64)]
+    resume_max_detached: usize,
     #[command(flatten)]
     telemetry: molcajete_telemetry::TelemetryArgs,
 }
@@ -69,6 +81,11 @@ async fn main() -> anyhow::Result<()> {
     molcajete_telemetry::start(&cli.telemetry, "molcajeted").await?;
     molcajete_daemon::set_zstd_images(cli.image_zstd);
     molcajete_daemon::set_encode_threads(cli.encode_threads);
+    molcajete_daemon::configure_resume(molcajete_daemon::ResumeConfig {
+        desktop: std::time::Duration::from_secs(cli.resume_timeout),
+        ssh: std::time::Duration::from_secs(cli.resume_timeout_ssh),
+        max_detached: cli.resume_max_detached,
+    });
     let allowed: Vec<_> = cli
         .video
         .iter()

@@ -17,6 +17,7 @@ mod ironrdp;
 mod oidc;
 mod proxy;
 mod recording;
+mod resume;
 mod secrets;
 mod sensitive;
 mod sessions;
@@ -137,6 +138,8 @@ async fn websocket_tunnel(
     let (user, connection) = if let Some(ticket) = ticketed.as_ref() {
         match tickets::redeem(&state, ticket, &address).await {
             Ok(redeemed) => {
+                // The link is used up: there is no coming back to it.
+                request.resume = None;
                 request.connection = Some(redeemed.connection.id.clone());
                 request.overrides.extend(redeemed.parameters);
                 (redeemed.user, Some(redeemed.connection))
@@ -493,6 +496,8 @@ mod tests {
     mod live_sessions;
     /// Recording sessions from the session menu (src/tests/on_demand_recording.rs).
     mod on_demand_recording;
+    /// Sessions resumed by the tab that opened them (src/tests/resume.rs).
+    mod resume;
     /// Share links and administrators watching sessions (src/tests/sharing.rs).
     mod sharing;
 

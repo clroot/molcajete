@@ -140,6 +140,10 @@ pub mod action {
     /// An administrator started watching a live session (`owner`); the
     /// target is the session watched.
     pub const SESSION_SHADOW: &str = "session.shadow";
+    /// A tunnel got back a session molcajeted held after the previous
+    /// tunnel ended (`connection`, `guacdId`); the target is the new
+    /// tunnel's session.
+    pub const SESSION_RESUME: &str = "session.resume";
 
     pub const ALL: &[&str] = &[
         LOGIN_SUCCESS,
@@ -186,6 +190,7 @@ pub mod action {
         SESSION_UNSHARE,
         SESSION_JOIN,
         SESSION_SHADOW,
+        SESSION_RESUME,
     ];
 }
 
@@ -230,6 +235,13 @@ impl Entry {
     pub fn by(mut self, user: &User) -> Self {
         self.actor_id = Some(user.id.clone());
         self.actor_name = Some(user.username.clone());
+        self
+    }
+
+    /// Done by the user `id` called `name`.
+    pub fn by_id(mut self, id: &str, name: &str) -> Self {
+        self.actor_id = Some(id.to_owned());
+        self.actor_name = Some(name.to_owned());
         self
     }
 

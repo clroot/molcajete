@@ -4,6 +4,8 @@ import type {HeldModifiers, SessionEvent, SessionStats, VideoMode} from './clien
 export type ConnectionStatus =
   | {kind: 'connecting'}
   | {kind: 'connected'}
+  /** The tunnel dropped and the page connects again; `error` is why the last attempt failed. */
+  | {kind: 'reconnecting'; error?: ConnectionStatus}
   | {kind: 'disconnected'}
   | {kind: 'failed'; title: string; detail: string};
 
@@ -30,6 +32,10 @@ export type SessionState = {
 type Action =
   | SessionEvent
   | {type: 'reconnecting'}
+  /** The page connects again by itself after the tunnel dropped. */
+  | {type: 'resuming'}
+  /** It stopped trying: what the last attempt failed with stays on screen. */
+  | {type: 'gave-up'}
   | {type: 'answered'}
   | {type: 'failed'; title: string; detail: string};
 
@@ -67,31 +73,54 @@ function errorStatus(error: {message: string; name: string; code?: number}): Con
       ? ENDED_BY_GATEWAY[error.code]
       : undefined;
   if (ended) return {kind: 'failed', ...ended};
+  // molcajeted: another window took the session over.
+  if (error.code === 0x0209 && !error.message.startsWith('tunnel closed'))
+    return {kind: 'failed', title: 'Opened in another window', detail: error.message};
   return {kind: 'failed', title: 'Connection error', detail: `${error.message} (${error.name})`};
 }
 
 export function reduce(state: SessionState, action: Action): SessionState {
+  const isReconnecting = state.status.kind === 'reconnecting';
   switch (action.type) {
     case 'state':
       // A new connection may reach a different server.
       if (action.detail === 'connecting')
         return {
           ...state,
-          status: {kind: 'connecting'},
+          status: isReconnecting ? state.status : {kind: 'connecting'},
           canChangeDisplay: true,
           link: null,
           modifiers: NO_MODIFIERS,
           videoMode: null,
         };
-      if (action.detail === 'waiting') return {...state, status: {kind: 'connecting'}};
+      if (action.detail === 'waiting' && !isReconnecting) return {...state, status: {kind: 'connecting'}};
       if (action.detail === 'connected') return {...state, status: {kind: 'connected'}};
       // Keep the error that caused the disconnect on screen.
-      if (action.detail === 'disconnected' && state.status.kind !== 'failed') {
+      if (action.detail === 'disconnected' && state.status.kind !== 'failed' && !isReconnecting) {
         return {...state, status: {kind: 'disconnected'}};
       }
       return state;
     case 'error':
+      // Kept for when the page stops trying.
+      if (state.status.kind === 'reconnecting')
+        return {...state, status: {kind: 'reconnecting', error: errorStatus(action.detail)}};
       return {...state, status: errorStatus(action.detail)};
+    case 'resuming':
+      return {
+        ...state,
+        status: {kind: 'reconnecting', error: state.status.kind === 'failed' ? state.status : undefined},
+        required: null,
+      };
+    case 'gave-up':
+      if (state.status.kind !== 'reconnecting') return state;
+      return {
+        ...state,
+        status: state.status.error ?? {
+          kind: 'failed',
+          title: 'Connection lost',
+          detail: 'The connection to the server dropped and could not be restored.',
+        },
+      };
     case 'failed':
       return {...state, status: {kind: 'failed', title: action.title, detail: action.detail}};
     case 'clipboard':
