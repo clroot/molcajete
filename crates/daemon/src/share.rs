@@ -9,10 +9,11 @@
 //! What connects them is a [`Shared`] per connection:
 //!
 //! - **Screen.** While anyone has joined, the owner's display copies the
-//!   tiles it is about to compare for a frame into the shared screen and
-//!   marks them for every joined user ([`Shared::publish`]); each user's
-//!   task copies the tiles marked for it into its own framebuffer and
-//!   sends them when its own pacing allows. Marks are a bit per tile, so a
+//!   tiles touched since its last frame into the shared screen and marks
+//!   them for every joined user ([`Shared::publish`]), those it sends its
+//!   own client as video included; each user's task copies the tiles
+//!   marked for it into its own framebuffer and sends them when its own
+//!   pacing allows. Marks are a bit per tile, so a
 //!   user who falls behind costs no memory: it simply gets the newest
 //!   pixels of more tiles in its next frame. A user who joins asks for the
 //!   whole screen; the owner's session is woken with an empty `sync` (which
@@ -212,7 +213,7 @@ impl Shared {
     }
 
     /// Takes the owner's framebuffer: the pixels of `regions` (the tiles
-    /// about to be compared for the owner's next frame), or all of them
+    /// touched since the owner's last frame), or all of them
     /// when someone waits for the whole screen or the size changed.
     pub fn publish(
         &self,
