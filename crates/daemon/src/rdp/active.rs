@@ -717,7 +717,7 @@ impl<'a> Session<'a> {
         let frame = self
             .stage
             .process_svc_processor_messages(SvcProcessorMessages::<Rdpdr>::new(messages))?;
-        self.write_rdp(&frame).await?;
+        self.write_rdp(&frame, WriteCause::Response).await?;
         Ok(())
     }
 
