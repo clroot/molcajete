@@ -570,7 +570,7 @@ fn busy_areas_go_lossy_then_get_refined() {
     d.heat.iter_mut().for_each(|h| *h = 0.0);
     out.clear();
     let stats = d.flush(&mut out);
-    assert_eq!(stats.images, 16, "one PNG per 64x64 tile");
+    assert_eq!(stats.images, 1, "adjacent tiles share an image");
     assert!(
         parse_all(&out)
             .unwrap()
@@ -579,6 +579,81 @@ fn busy_areas_go_lossy_then_get_refined() {
             .all(|i| i.arg(3) == "image/png")
     );
     assert!(d.lossy.iter().all(|l| !l));
+}
+
+/// A display whose whole screen counts as sent lossy, and its client.
+/// (The screen is a pattern of a few colours, which is quick to encode.)
+fn lossy_display(w: u32, h: u32) -> (Display, Client) {
+    let mut d = Display::new(
+        ImageFormats {
+            jpeg: true,
+            zstd: false,
+        },
+        false,
+    );
+    let mut out = Output::text();
+    d.resize(w, h, &mut out);
+    let mut c = Client::new();
+    c.apply(&out);
+    let pattern: Vec<u8> = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            [(x / 7 % 5 * 50) as u8, (y / 5 % 4 * 60) as u8, 90, 255]
+        })
+        .collect();
+    d.put(0, 0, w, h, &pattern);
+    flush_into(&mut d, &mut c);
+    d.lossy.iter_mut().for_each(|l| *l = true);
+    (d, c)
+}
+
+#[test]
+fn a_large_cool_area_is_refined_in_blocks() {
+    // 10 x 9 tiles, the last column and row cut by the edge.
+    let (mut d, mut c) = lossy_display(600, 530);
+    d.heat.iter_mut().for_each(|h| *h = 0.0);
+    let (stats, _) = flush_into(&mut d, &mut c);
+    // Blocks of 8 x 8 tiles: 2 x 2 of them.
+    assert_eq!(stats.images, 4);
+    assert_eq!(stats.pixels, 600 * 530);
+    assert!(d.lossy.iter().all(|l| !l));
+}
+
+#[test]
+fn only_the_cool_part_is_refined() {
+    let (mut d, mut c) = lossy_display(512, 256);
+    // The left half calms down, the right half is still busy.
+    let cols = d.tile_cols;
+    for (i, heat) in d.heat.iter_mut().enumerate() {
+        *heat = if (i as u32 % cols) < 4 { 0.0 } else { HOT };
+    }
+    let (stats, _) = flush_into(&mut d, &mut c);
+    assert_eq!(stats.images, 1);
+    assert_eq!(stats.pixels, 256 * 256);
+    for (i, &lossy) in d.lossy.iter().enumerate() {
+        assert_eq!(lossy, (i as u32 % cols) >= 4, "tile {i}");
+    }
+}
+
+#[test]
+fn a_screen_that_cools_at_once_is_refined_over_several_flushes() {
+    let (w, h) = (2560, 2048);
+    let (mut d, mut c) = lossy_display(w, h);
+    d.heat.iter_mut().for_each(|h| *h = 0.0);
+    let mut flushes = 0;
+    let mut pixels = 0;
+    while d.lossy.iter().any(|&l| l) {
+        // Nothing else is due: the refinement asks for the next flush.
+        assert!(d.idle_deadline().is_some());
+        let (stats, _) = flush_into(&mut d, &mut c);
+        assert!(stats.pixels > 0);
+        assert!(stats.pixels <= REFINE_PIXELS_PER_FLUSH + (TILE * TILE) as u64);
+        pixels += stats.pixels;
+        flushes += 1;
+    }
+    assert_eq!(pixels, (w * h) as u64, "every pixel refined once");
+    assert_eq!(flushes, 2);
+    assert_eq!(d.idle_deadline(), None);
 }
 
 #[test]

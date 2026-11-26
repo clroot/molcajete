@@ -566,3 +566,63 @@ fn zstd_images() {
         );
     }
 }
+
+/// The whole desktop was sent lossy (full-screen video that just stopped)
+/// and is refined once it has cooled down: how long each flush holds the
+/// session, and how many images the client gets in one frame.
+#[test]
+#[ignore = "benchmark"]
+fn refine() {
+    let doc = Document::new();
+    let window = Rect::new(400, 200, 3200, 2200);
+    let full = Rect::new(0, 0, WIDTH, HEIGHT);
+    for (scene, with_window) in [("photo", false), ("desktop", true)] {
+        for zstd in [false, true] {
+            let mut desktop = Desktop::new();
+            let mut display = Display::new(ImageFormats { jpeg: true, zstd }, false);
+            let mut out = Output::text();
+            display.resize(WIDTH, HEIGHT, &mut out);
+            // A screen that keeps changing everywhere goes out as JPEG.
+            for frame in 0..6u32 {
+                let shade = (frame % 2) as u8;
+                for (px, wallpaper) in desktop
+                    .pixels
+                    .chunks_exact_mut(4)
+                    .zip(desktop.wallpaper.chunks_exact(4))
+                {
+                    px[0] = wallpaper[0] + shade;
+                }
+                if with_window {
+                    desktop.blit(&window, &doc.render(window.w, frame * 28, window.h));
+                }
+                desktop.update(&mut display, &full);
+                out.clear();
+                display.flush(&mut out);
+            }
+            let lossy = display.lossy.iter().filter(|&&l| l).count();
+            // It stops changing and cools down.
+            display.heat.iter_mut().for_each(|h| *h = 0.0);
+            let (mut flushes, mut total, mut longest) = (0u32, Duration::ZERO, Duration::ZERO);
+            let (mut images, mut most_images, mut bytes) = (0u32, 0u32, 0usize);
+            while display.lossy.iter().any(|&l| l) {
+                out.clear();
+                let started = Instant::now();
+                let stats = display.flush(&mut out);
+                let elapsed = started.elapsed();
+                flushes += 1;
+                total += elapsed;
+                longest = longest.max(elapsed);
+                images += stats.images;
+                most_images = most_images.max(stats.images);
+                bytes += stats.bytes;
+            }
+            println!(
+                "bench refine {scene:<7} {:<4} lossy tiles {lossy:5} | flushes {flushes:3} total {:7.2} max {:7.2} ms | images {images:5} (max {most_images:5} per frame) kB {:8.1}",
+                if zstd { "zstd" } else { "png" },
+                ms(total),
+                ms(longest),
+                bytes as f64 / 1000.0,
+            );
+        }
+    }
+}
