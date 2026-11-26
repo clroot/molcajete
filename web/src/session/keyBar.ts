@@ -29,3 +29,15 @@ export function nextHold(hold: Hold): Hold {
  * device whose main pointer is a finger.
  */
 export const showsKeyBar = (choice: boolean | null, isCoarsePointer: boolean) => choice ?? isCoarsePointer;
+
+/**
+ * How much shorter than the window the visible part may be before an
+ * on-screen keyboard is taken to cover the rest. An address bar that
+ * collapses or a find bar accounts for less; the shortest phone keyboards,
+ * on a phone on its side, for more.
+ */
+const KEYBOARD_MIN_HEIGHT = 150;
+
+/** Whether an on-screen keyboard covers the window: `visibleHeight` from `window.visualViewport`. */
+export const isKeyboardOpen = (visibleHeight: number, windowHeight: number) =>
+  windowHeight - visibleHeight > KEYBOARD_MIN_HEIGHT;
