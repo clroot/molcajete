@@ -73,6 +73,30 @@ describe('connection form', () => {
     expect(result.ok && 'dpi' in result.connection.parameters).toBe(false);
   });
 
+  test('shows the RDP visual effects on switches that store true or nothing', () => {
+    // Set under Advanced before the form had switches for them.
+    const effects = {
+      ...rdp,
+      parameters: {...rdp.parameters, 'enable-wallpaper': 'true', 'enable-theming': 'true'},
+    };
+    const form = toConnectionForm(effects);
+    expect(form.fields).toMatchObject({'enable-wallpaper': 'true', 'enable-theming': 'true'});
+    expect(form.extras.map(e => e.name)).toEqual(['color-depth']);
+    expect(toConnection(form)).toEqual({ok: true, connection: effects});
+    // On stores true; off stores nothing, leaving the effect off.
+    form.fields['enable-menu-animations'] = 'true';
+    form.fields['enable-wallpaper'] = '';
+    const result = toConnection(form);
+    expect(result.ok && result.connection.parameters).toEqual({
+      ...rdp.parameters,
+      'enable-theming': 'true',
+      'enable-menu-animations': 'true',
+    });
+    // New connections get none of them.
+    const fresh = changeProtocol({...emptyConnectionForm(), name: 'New'}, 'rdp', true);
+    expect(Object.keys(fresh.fields).filter(name => name.startsWith('enable-'))).toEqual([]);
+  });
+
   test('uses the guacd port only with a host', () => {
     const form = {...toConnectionForm(rdp), guacdPort: '4823'};
     expect(toConnection(form)).toMatchObject({ok: true, connection: {guacdHost: null, guacdPort: null}});
