@@ -44,6 +44,11 @@ export type SessionEvent =
       detail: 'idle' | 'connecting' | 'waiting' | 'connected' | 'disconnecting' | 'disconnected';
     }
   | {type: 'error'; detail: {message: string; name: string; code?: number}}
+  /**
+   * The tunnel ended without the server ending the session (`code` is its status): connecting
+   * again may get the same session back.
+   */
+  | {type: 'interrupted'; detail: {code: number}}
   | {type: 'name'; detail: string}
   | {type: 'clipboard'; detail: string}
   | {type: 'required'; detail: string[]}

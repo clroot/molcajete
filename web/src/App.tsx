@@ -17,6 +17,7 @@ import PlaybackPage from './recordings/PlaybackPage';
 import AuditPage from './audit/AuditPage';
 import ActiveSessionsPage from './activity/ActiveSessionsPage';
 import HistoryPage from './activity/HistoryPage';
+import {forgetResumeIds} from './session/resume';
 
 type Auth = {status: 'checking'} | {status: 'signedOut'} | {status: 'signedIn'; user: Me};
 
@@ -43,6 +44,8 @@ function SignInGate() {
   }, []);
 
   const signOut = useCallback(async () => {
+    // Sessions this tab could have resumed stay out of reach.
+    forgetResumeIds();
     const result = await api.logout().catch(() => undefined);
     if (result?.logoutUrl) {
       // Signed in through the identity provider: sign out there too.
