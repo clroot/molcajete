@@ -79,7 +79,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajeted_frame_encoded_bytes` | histogram | protocol | Encoded image bytes per frame |
 | `molcajeted_frame_images` | histogram | protocol | Images per frame (fills and copies not counted): the client decodes each, and the daemon encodes them side by side |
 | `molcajeted_client_ack_seconds` | histogram | protocol | From sending a frame to the client's ack arriving: network round trip, plus the time the frame's data takes to arrive (`molcajete_client_frame_receive_seconds`), plus browser processing |
-| `molcajeted_client_ack_wait_seconds` | histogram | protocol | How long an ack then waited for the session loop (busy building a frame or handling server data); not part of `client_ack` |
+| `molcajeted_client_ack_wait_seconds` | histogram | protocol | How long an ack then waited for the session loop (busy building a frame or handling server data); not part of `client_ack`. The time an SSH session spends connecting to the remote host, in which it reads no input, is left out |
 | `molcajeted_client_apply_seconds` | histogram | protocol | How long the client says it took to apply a frame (decoding and drawing, without waiting behind earlier frames). Only molcajete's client reports it, and for those clients it sets the frame interval (median of the last 8 reports, forgotten after 1 s) |
 | `molcajeted_unacked_frames` | histogram | protocol | Frames still unacknowledged when a frame is sent; at most 3 for RDP and VNC, 2 for SSH |
 | `molcajeted_socket_write_seconds` | histogram | protocol | Time blocked writing to the gateway; grows when the gateway or browser cannot keep up (backpressure) |
@@ -121,7 +121,7 @@ All are histograms with one sample per second of the report:
 
 | Metric | Meaning |
 | --- | --- |
-| `molcajete_client_frame_lag_seconds` | From receiving a frame's `sync` to applying it and acknowledging: waiting for its images to decode and for the frames before it (average per second) |
+| `molcajete_client_frame_lag_seconds` | From receiving a frame's `sync` to applying it and acknowledging: waiting for its images to decode and for the frames before it (average per second). The time the page was hidden, in which the browser may suspend it, is left out |
 | `molcajete_client_frame_receive_seconds` | From a frame's first instruction that draws on the screen (or into a buffer the frame then uses) to its `sync`: how long its data took to arrive and be parsed (average per second; no sample for a second without frames). A cursor change sent between frames does not start a frame |
 | `molcajete_client_frame_present_seconds` | From applying a frame to having drawn the canvas with it: the wait for the next animation frame plus the composite (average per second; no sample for a second without a drawn frame). The browser shows the canvas at a later display refresh, which is not included |
 | `molcajete_client_image_decode_seconds` | Decoding one image (average per second). For PNG, JPEG and WebP: from handing the data to the browser's decoder to the decoded image, waiting included. For zstd images: the decode itself, which runs while the frame is drawn |
