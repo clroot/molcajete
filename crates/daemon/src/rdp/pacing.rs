@@ -8,7 +8,10 @@
 //! used-up byte budget) and never more often than [`MIN_FRAME_INTERVAL`],
 //! which is the same floor counted from when the frame was written out.
 //! A server that never pauses (video) still gets a frame every
-//! [`MAX_FRAME_DELAY`].
+//! [`MAX_FRAME_DELAY`], and one that ends its frames (the graphics pipeline,
+//! Frame Marker surface commands) gets one where it ends a frame, as soon as
+//! the pacing allows: what is pending then is whole, and its next frame may
+//! already be arriving.
 //!
 //! A server that marks its frames (Frame Marker surface commands) is not
 //! cut in the middle of one: while it is between two frame ends, the pending
@@ -82,6 +85,17 @@ impl FramePacer {
         }
     }
 
+    /// Whether the pending frame should be sent now that the server has
+    /// ended a frame of its own: what is pending is whole, so it need not
+    /// wait for the socket to fall silent.
+    ///
+    /// The server's next frame often follows at once (video on a large
+    /// desktop), and waiting for a pause would hold every frame until it is
+    /// [`Self::overdue`] and merged with the next ones.
+    pub fn due_at_frame_end(&self, now: Instant, display_due: Instant) -> bool {
+        self.is_dirty() && !self.in_server_frame && now >= self.earliest(display_due)
+    }
+
     /// Whether a stream of PDUs has delayed the pending frame for too long.
     pub fn overdue(&self, now: Instant, display_due: Instant) -> bool {
         self.dirty_since
@@ -121,6 +135,37 @@ mod tests {
         pacer.frame_sent(t0);
         pacer.mark_dirty(t0 + Duration::from_millis(1));
         assert_eq!(pacer.earliest(t_any()), t0 + MIN_FRAME_INTERVAL);
+    }
+
+    #[test]
+    fn a_frame_is_due_where_the_server_ends_one() {
+        let t0 = Instant::now();
+        let mut pacer = FramePacer::new(t0);
+        pacer.frame_sent(t0);
+        // Nothing changed: nothing to send.
+        assert!(!pacer.due_at_frame_end(t0 + Duration::from_millis(50), t_any()));
+        pacer.graphics_updated(t0 + Duration::from_millis(20));
+        pacer.server_frame_ended();
+        // Long before the changes are overdue.
+        let now = t0 + Duration::from_millis(25);
+        assert!(!pacer.overdue(now, t_any()));
+        assert!(pacer.due_at_frame_end(now, t_any()));
+        // Not sooner than the shortest interval, or than the display allows.
+        assert!(!pacer.due_at_frame_end(t0 + Duration::from_millis(10), t_any()));
+        assert!(!pacer.due_at_frame_end(now, now + Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn a_frame_is_not_due_inside_a_server_frame() {
+        let t0 = Instant::now();
+        let mut pacer = FramePacer::new(t0);
+        pacer.frame_sent(t0);
+        pacer.server_frame_ended();
+        // The server started its next frame.
+        pacer.graphics_updated(t0 + Duration::from_millis(20));
+        assert!(!pacer.due_at_frame_end(t0 + Duration::from_millis(30), t_any()));
+        pacer.server_frame_ended();
+        assert!(pacer.due_at_frame_end(t0 + Duration::from_millis(30), t_any()));
     }
 
     #[test]
