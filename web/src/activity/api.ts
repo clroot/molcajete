@@ -17,7 +17,12 @@ export type LiveSession = {
   bytesToGuacd: number;
   /** The latest round trip the page reported; null without client reports. */
   rttMs: number | null;
+  /** The recording of *Record sessions*. */
   recordingId: string | null;
+  /** Being recorded right now. */
+  recording: boolean;
+  /** Every recording of the session so far, oldest first. */
+  recordingIds: string[];
   guacdId: string;
   /** For someone who joined another session: that session's id. */
   joinedTo: string | null;
@@ -49,7 +54,10 @@ export type HistoryEntry = {
   endedBy: string | null;
   bytesToBrowser: number;
   bytesToGuacd: number;
+  /** The recording of *Record sessions*. */
   recordingId: string | null;
+  /** Every recording of the session, oldest first, those started from its menu included. */
+  recordingIds: string[];
 };
 
 /** What `GET /api/history` narrows to; empty fields do not filter. */

@@ -10,6 +10,7 @@ import {TextArea} from '@astryxdesign/core/TextArea';
 import {Button} from '@astryxdesign/core/Button';
 import {Kbd} from '@astryxdesign/core/Kbd';
 import {Text} from '@astryxdesign/core/Text';
+import {useToast} from '@astryxdesign/core/Toast';
 import {href, navigate} from '../route';
 import {sessionsApi} from '../activity/api';
 import type {SessionEvent} from './client';
@@ -19,7 +20,8 @@ import {useMenuShortcut} from './useMenuShortcut';
 import StatusOverlay from './StatusOverlay';
 import SessionMenuButton from './SessionMenuButton';
 import type {ScaleMode} from './SessionMenu';
-import {sharingApi} from './sharing';
+import {CornerBadges, RecordingBadge} from './SessionBadges';
+import {REFRESH_MS, sharingApi} from './sharing';
 
 const styles = stylex.create({
   display: {position: 'fixed', inset: 0, backgroundColor: 'black', overflow: 'hidden'},
@@ -71,6 +73,46 @@ function useJoined({kind, id}: JoinTarget) {
     };
   }, [kind, id]);
   return joined;
+}
+
+/** Whether the session joined is being recorded, checked every few seconds while connected. */
+function useIsRecorded({kind, id}: JoinTarget, isConnected: boolean): boolean {
+  const [isRecorded, setIsRecorded] = useState(false);
+  useEffect(() => {
+    if (!isConnected) return;
+    let isCurrent = true;
+    const check = () => {
+      const recorded =
+        kind === 'link'
+          ? sharingApi.describeLink(id).then(link => link.recording)
+          : sessionsApi.live().then(list => list.find(s => s.id === id)?.recording ?? false);
+      recorded.then(
+        value => isCurrent && setIsRecorded(value),
+        () => {}, // The tunnel reports a session that ended.
+      );
+    };
+    check();
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') check();
+    }, REFRESH_MS);
+    return () => {
+      isCurrent = false;
+      clearInterval(timer);
+    };
+  }, [kind, id, isConnected]);
+  return isConnected && isRecorded;
+}
+
+/** Tells once when the session turns out to be recorded: on joining, or when recording starts. */
+function useRecordingNotice(isRecorded: boolean) {
+  const showToast = useToast();
+  const wasRecorded = useRef(false);
+  useEffect(() => {
+    if (isRecorded && !wasRecorded.current) {
+      showToast({body: 'This session is being recorded.', autoHideDuration: 6000});
+    }
+    wasRecorded.current = isRecorded;
+  }, [isRecorded, showToast]);
 }
 
 export default function JoinedSessionPage({kind, id}: JoinTarget) {
@@ -126,6 +168,8 @@ export default function JoinedSessionPage({kind, id}: JoinTarget) {
   useMenuShortcut(toggleMenu);
 
   const isConnected = session.status.kind === 'connected';
+  const isRecorded = useIsRecorded({kind, id}, isConnected);
+  useRecordingNotice(isRecorded);
   // The owner leaving closes the tunnel normally.
   const status =
     session.status.kind === 'disconnected'
@@ -151,6 +195,7 @@ export default function JoinedSessionPage({kind, id}: JoinTarget) {
           onLeave={leave}
         />
       )}
+      <CornerBadges>{isRecorded && <RecordingBadge />}</CornerBadges>
       {isConnected && <SessionMenuButton onOpen={() => setMenuOpen(true)} />}
 
       <Drawer isOpen={isMenuOpen} onOpenChange={setMenuOpen} label="Session menu" width={360}>

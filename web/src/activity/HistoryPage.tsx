@@ -2,7 +2,6 @@ import {useCallback, useMemo, useState} from 'react';
 import {Table, pixel, type TableColumn} from '@astryxdesign/core/Table';
 import {HStack, VStack} from '@astryxdesign/core/Stack';
 import {Button} from '@astryxdesign/core/Button';
-import {Link} from '@astryxdesign/core/Link';
 import {Text} from '@astryxdesign/core/Text';
 import {TextInput} from '@astryxdesign/core/TextInput';
 import {DateRangeInput, type DateRange} from '@astryxdesign/core/DateRangeInput';
@@ -13,11 +12,11 @@ import {EmptyState} from '@astryxdesign/core/EmptyState';
 import {ArrowDownTrayIcon, ClockIcon} from '@heroicons/react/24/outline';
 import {useApiData} from '../useApiData';
 import {useSettled} from '../useSettled';
-import {href} from '../route';
 import PageFrame from '../shell/PageFrame';
 import AsyncContent from '../shell/AsyncContent';
 import {protocolLabel} from '../connections/protocols';
 import {formatClock, formatSize} from '../recordings/format';
+import RecordingLinks from '../recordings/RecordingLinks';
 import {localDayStart} from '../audit/format';
 import {historyCsvUrl, sessionsApi, type HistoryEntry, type HistoryFilter} from './api';
 import {outcome} from './format';
@@ -114,15 +113,10 @@ export default function HistoryPage() {
       ),
     },
     {
-      key: 'recordingId',
+      key: 'recordingIds',
       header: 'Recording',
       width: pixel(110),
-      renderCell: e =>
-        e.recordingId ? (
-          <Link href={href.playback(e.recordingId)}>Play</Link>
-        ) : (
-          <Text color="secondary">—</Text>
-        ),
+      renderCell: e => <RecordingLinks ids={e.recordingIds} />,
     },
   ];
 

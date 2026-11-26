@@ -15,7 +15,8 @@ import {
   ClockIcon,
   CommandLineIcon,
 } from '@heroicons/react/24/outline';
-import type {Me} from '../api';
+import {api, type Me} from '../api';
+import {useApiData} from '../useApiData';
 import {href, type Route} from '../route';
 import Logo from './Logo';
 import ChangePasswordDialog from '../auth/ChangePasswordDialog';
@@ -29,6 +30,9 @@ type Props = {
 
 export default function AppFrame({user, route, onSignOut, children}: Props) {
   const [isPasswordOpen, setIsPasswordOpen] = useState(false);
+  const settings = useApiData(api.settings);
+  // Users see the recordings they made from the session menu, while the gateway records.
+  const hasOwnRecordings = !user.isAdmin && settings.status === 'ready' && settings.data.recordings;
 
   return (
     <AppShell
@@ -62,6 +66,14 @@ export default function AppFrame({user, route, onSignOut, children}: Props) {
               href={href.connections}
               isSelected={route.name === 'connections'}
             />
+            {hasOwnRecordings && (
+              <SideNavItem
+                label="Recordings"
+                icon={FilmIcon}
+                href={href.recordings}
+                isSelected={route.name === 'recordings'}
+              />
+            )}
             {user.isAdmin && (
               <>
                 <SideNavItem

@@ -53,6 +53,8 @@ type Props = {
   onRemoteCompositionChange: (isRemote: boolean) => void;
   onCtrlAltDel: () => void;
   onDisconnect: () => void;
+  /** Starting and stopping a recording, when the gateway knows the session. */
+  recording?: ReactNode;
   /** Who joined and the share links, when the gateway knows the session. */
   sharing?: ReactNode;
   /** Opens the file panel; `null` when the connection shares no files. */
@@ -114,7 +116,7 @@ function Clipboard({restrictions, isTerminal, clipboard, onClipboardChange}: Pro
   );
 }
 
-/** The Ctrl+Alt+Shift menu: files, clipboard, display, input, stats, sharing and keys. */
+/** The Ctrl+Alt+Shift menu: files, clipboard, display, input, stats, recording, sharing and keys. */
 export default function SessionMenu(props: Props) {
   const {isOpen, onOpenChange, connectionName, remoteDisplay} = props;
   const isDisplayFixed = remoteDisplay !== null && !remoteDisplay.canChange;
@@ -198,6 +200,7 @@ export default function SessionMenu(props: Props) {
                 value={props.showStats}
                 onChange={props.onShowStatsChange}
               />
+              {props.recording}
               {props.sharing}
             </VStack>
           </LayoutContent>

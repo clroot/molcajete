@@ -76,9 +76,17 @@ export type RecordingChoices = {
   mouse: boolean;
   /** molcajeted's zstd images and video, which only molcajete's player can play. */
   molcajeteFormats: boolean;
+  /** The user of a session may record it from the session menu. */
+  onDemand: boolean;
 };
 
-const NO_RECORDING: RecordingChoices = {record: false, keys: false, mouse: true, molcajeteFormats: false};
+const NO_RECORDING: RecordingChoices = {
+  record: false,
+  keys: false,
+  mouse: true,
+  molcajeteFormats: false,
+  onDemand: false,
+};
 
 function toRecordingChoices(attributes: Record<string, string> = {}): RecordingChoices {
   const flag = (name: string) => attributes[name] === 'true';
@@ -87,6 +95,7 @@ function toRecordingChoices(attributes: Record<string, string> = {}): RecordingC
     keys: flag(ATTRIBUTES.recordKeys),
     mouse: !flag(ATTRIBUTES.recordExcludeMouse),
     molcajeteFormats: flag(ATTRIBUTES.recordMolcajeteFormats),
+    onDemand: flag(ATTRIBUTES.recordOnDemand),
   };
 }
 
@@ -97,6 +106,7 @@ function toAttributes(r: RecordingChoices): Record<string, string> {
     [ATTRIBUTES.recordKeys, r.keys],
     [ATTRIBUTES.recordExcludeMouse, !r.mouse],
     [ATTRIBUTES.recordMolcajeteFormats, r.molcajeteFormats],
+    [ATTRIBUTES.recordOnDemand, r.onDemand],
   ];
   return Object.fromEntries(flags.filter(([, on]) => on).map(([name]) => [name, 'true']));
 }
