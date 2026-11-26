@@ -42,6 +42,7 @@ use pacing::FrameClock;
 pub use pacing::{Pacing, SyncReply};
 pub use pool::set_threads as set_encode_threads;
 pub use source::{ChannelOrder, SourceImage};
+pub use video::{VIDEO_MODE, VideoMode};
 
 /// Granularity of change tracking and of the heat map.
 const TILE: u32 = 64;

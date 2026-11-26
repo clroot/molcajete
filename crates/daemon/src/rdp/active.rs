@@ -40,7 +40,7 @@ use super::mouse::Mouse;
 use super::pacing::FramePacer;
 use super::settings::{self, ResizeMethod, Settings};
 use super::slow_path;
-use crate::display::{Display, ImageFormats, Pacing};
+use crate::display::{Display, ImageFormats, Pacing, VIDEO_MODE, VideoMode};
 use crate::files::{self, Transfers};
 use crate::handshake::ClientInfo;
 use crate::io::GuacWriter;
@@ -836,6 +836,9 @@ impl<'a> Session<'a> {
                 info!(dpi, "client changed the DPI");
                 self.request_scale(dpi);
             }
+            VIDEO_MODE => self
+                .display
+                .set_video_mode(VideoMode::from_param(Some(value)), self.writer.buffer()),
             _ => debug!(name, "parameter cannot be changed during the session"),
         }
     }

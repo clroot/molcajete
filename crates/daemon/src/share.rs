@@ -22,7 +22,8 @@
 //!   into the owner's input channel ([`Shared::forward`]), so the protocol
 //!   merges them with the owner's own. Size changes, `argv` and everything
 //!   else stay with the user: the owner's display decides the size of the
-//!   remote desktop.
+//!   remote desktop, and each user's `video-mode` applies to their own
+//!   display.
 //!
 //! Joined users get no audio and no clipboard from the remote side, and
 //! their frames follow the owner's: the shared screen is updated when the
@@ -39,7 +40,9 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 use tracing::{Instrument as _, debug, info, info_span, warn};
 
-use crate::display::{ChannelOrder, Display, ImageFormats, Pacing, Rect, SourceImage};
+use crate::display::{
+    ChannelOrder, Display, ImageFormats, Pacing, Rect, SourceImage, VIDEO_MODE, VideoMode,
+};
 use crate::handshake::{self, ClientInfo};
 use crate::io::{GuacReader, GuacWriter, Output};
 use crate::send_error;
@@ -638,6 +641,10 @@ impl User<'_> {
             }
             (Some(ClientEvent::Clipboard(text)), _) if !self.read_only => {
                 self.viewer.forward_clipboard(&text).await;
+            }
+            // Each user chooses the video mode of their own display.
+            (Some(ClientEvent::Argv { name, value }), Some(display)) if name == VIDEO_MODE => {
+                display.set_video_mode(VideoMode::from_param(Some(&value)), writer.buffer());
             }
             _ => {}
         }

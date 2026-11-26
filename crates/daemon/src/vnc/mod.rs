@@ -8,7 +8,7 @@ use molcajete_protocol::Status;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::display::{Display, ImageFormats, Pacing};
+use crate::display::{Display, ImageFormats, Pacing, VIDEO_MODE, VideoMode};
 use crate::handshake::{ClientInfo, Params};
 use crate::io::{GuacReader, GuacWriter};
 use crate::jump::Chain;
@@ -315,6 +315,9 @@ async fn run_session(
                     }
                     Some(ClientEvent::Clipboard(text)) if settings.accepts_paste() => {
                         rfb_writer.cut_text(&text).await?;
+                    }
+                    Some(ClientEvent::Argv { name, value }) if name == VIDEO_MODE => {
+                        display.set_video_mode(VideoMode::from_param(Some(&value)), writer.buffer());
                     }
                     Some(ClientEvent::Disconnect) => break Ok(()),
                     _ => {}

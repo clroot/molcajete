@@ -13,6 +13,8 @@ use metrics::{Counter, Histogram, counter, histogram};
 use molcajete_protocol::video::VideoCodec;
 use tracing::info;
 
+use super::video::VideoMode;
+
 /// Image encodings timed separately.
 #[derive(Clone, Copy)]
 pub(super) enum ImageKind {
@@ -315,15 +317,17 @@ impl DisplayMetrics {
     pub(super) fn video_frame(
         &mut self,
         codec: VideoCodec,
+        mode: VideoMode,
         key: bool,
         elapsed: Duration,
         bytes: usize,
     ) {
         let codec = codec_label(codec);
+        let mode = mode.label();
         let key = if key { "true" } else { "false" };
-        histogram!("molcajeted_video_encode_seconds", "codec" => codec, "key" => key)
+        histogram!("molcajeted_video_encode_seconds", "codec" => codec, "mode" => mode, "key" => key)
             .record(elapsed);
-        histogram!("molcajeted_video_frame_bytes", "codec" => codec, "key" => key)
+        histogram!("molcajeted_video_frame_bytes", "codec" => codec, "mode" => mode, "key" => key)
             .record(bytes as f64);
         self.totals.video.add(elapsed);
         self.totals.video_bytes += bytes as u64;
