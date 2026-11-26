@@ -121,6 +121,13 @@ mod wasm_api {
             self.run(|inner| inner.set_audio_forwarding(enabled));
         }
 
+        /// Whether the page is visible (`document.visibilityState`). The time
+        /// it is hidden does not count as frame lag: the browser may suspend
+        /// the page, and a worker cannot see that itself.
+        pub fn set_page_visible(&self, visible: bool) {
+            self.run(|inner| inner.set_page_visible(visible));
+        }
+
         /// Types text (finished IME composition, paste-as-typing).
         pub fn type_text(&self, text: &str) {
             self.run(|inner| inner.type_text(text));

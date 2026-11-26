@@ -12,6 +12,7 @@
 
 mod arrival;
 mod frames;
+mod hidden;
 pub mod path;
 mod present;
 
@@ -26,6 +27,7 @@ use crate::gl::{
 use crate::image::DecodedImage;
 use arrival::Arrival;
 use frames::Frames;
+use hidden::Hidden;
 use molcajete_protocol::zimage;
 use path::{Path, Shape};
 use present::Unpresented;
@@ -447,6 +449,8 @@ pub struct Display {
     last_applied: f64,
     /// When the frame being received started arriving.
     arrival: Arrival,
+    /// When the page was hidden, which is not frame lag.
+    hidden: Hidden,
     /// Source of layer generations (unique across layers and re-creations).
     generation_counter: u64,
     /// Identity of the last cursor read back: (src, rect, hotspot, generation).
@@ -491,6 +495,7 @@ impl Display {
             unpresented: Unpresented::default(),
             last_applied: 0.0,
             arrival: Arrival::default(),
+            hidden: Hidden::default(),
             generation_counter: 0,
             last_cursor: None,
             pending_cursor: None,
@@ -580,6 +585,13 @@ impl Display {
         self.queue.push_back(op);
     }
 
+    /// The page became visible, or hidden (in the background, or behind
+    /// another tab). Until told otherwise it counts as visible.
+    pub fn set_page_visible(&mut self, visible: bool) {
+        self.hidden
+            .set_visible(visible, crate::scope::performance_now());
+    }
+
     /// Records how long decoding one image took.
     pub fn image_decoded(&mut self, ms: f64) {
         self.stats.decode.add(ms);
@@ -603,14 +615,15 @@ impl Display {
                         self.stats.frames_applied += 1;
                         self.needs_composite = true;
                         let now = crate::scope::performance_now();
-                        let lag_ms = now - received_at;
+                        // A page in the background may not run at all.
+                        let lag_ms = now - received_at - self.hidden.within(received_at, now);
                         // The time this frame kept the client busy: from
                         // when it was complete or, if later, the frame
                         // before it was applied.
                         let apply_ms = (now - received_at.max(self.last_applied)).max(0.0);
                         self.last_applied = now;
                         self.stats.lag.add(lag_ms);
-                        self.unpresented.add(received_at + lag_ms);
+                        self.unpresented.add(now);
                         self.events.push(DisplayEvent::FrameComplete {
                             timestamp,
                             frames,
