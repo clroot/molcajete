@@ -45,6 +45,7 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
   // A new connection's id follows its name until the id is edited by hand.
   const changeName = (name: string) => update(isNew && !isIdEdited ? {name, id: slugify(name)} : {name});
   const protocol = protocolInfo(form.protocol);
+  const visualEffects = protocol.fields.filter(field => field.section === 'visual-effects');
   const storedSecret = (name: string): StoredSecret | undefined => {
     const state = secretState(form, name);
     if (state === 'none') return undefined;
@@ -142,6 +143,16 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
           </VStack>
 
           <Divider />
+
+          {visualEffects.length > 0 && (
+            <>
+              <VStack gap={4}>
+                <Heading level={3}>Visual effects</Heading>
+                {visualEffects.map(parameterInput)}
+              </VStack>
+              <Divider />
+            </>
+          )}
 
           <VStack gap={4}>
             <Heading level={3}>Clipboard and input</Heading>

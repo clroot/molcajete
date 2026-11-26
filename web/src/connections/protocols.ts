@@ -16,8 +16,11 @@ export type ParameterField = {
   onValue?: string;
   /** Set when a new connection takes this protocol. */
   defaultValue?: string;
-  /** Shown under *Clipboard and input* instead of with the protocol's settings. */
-  section?: 'input';
+  /**
+   * Shown under *Visual effects* or *Clipboard and input* instead of with
+   * the protocol's settings.
+   */
+  section?: 'visual-effects' | 'input';
 };
 
 export type Protocol = {
@@ -72,6 +75,46 @@ const INPUT_RESTRICTIONS: ParameterField[] = [
     section: 'input',
   },
 ];
+
+const TRAFFIC_NOTE = 'Sends more over the network.';
+
+/**
+ * Desktop effects an RDP connection asks the server to turn off unless
+ * these are set; on, they store guacd's `true`, off they store nothing.
+ */
+const RDP_VISUAL_EFFECTS: ParameterField[] = [
+  {
+    name: 'enable-wallpaper',
+    label: 'Show the desktop wallpaper',
+    description: 'Instead of a plain black desktop.',
+  },
+  {
+    name: 'enable-theming',
+    label: 'Window themes',
+    description: 'Themed window borders, buttons and controls.',
+  },
+  {
+    name: 'enable-font-smoothing',
+    label: 'Font smoothing (ClearType)',
+    description: 'Text with smooth edges instead of jagged ones.',
+  },
+  {
+    name: 'enable-full-window-drag',
+    label: 'Show window contents while dragging',
+    description: 'Instead of only an outline.',
+  },
+  {
+    name: 'enable-desktop-composition',
+    label: 'Desktop composition (transparency, shadows)',
+    description: 'Transparent window borders and shadows.',
+  },
+  {name: 'enable-menu-animations', label: 'Menu animations', description: 'Menus fade and slide open.'},
+].map(field => ({
+  ...field,
+  kind: 'switch',
+  description: `${field.description} ${TRAFFIC_NOTE}`,
+  section: 'visual-effects',
+}));
 
 const withInputRestrictions = (protocol: Protocol): Protocol => ({
   ...protocol,
@@ -145,6 +188,7 @@ const PROTOCOL_SETTINGS: Protocol[] = [
         placeholder: AUTOMATIC_SCALE_LABEL,
         options: SCALE_OPTIONS,
       },
+      ...RDP_VISUAL_EFFECTS,
     ],
   },
   {
