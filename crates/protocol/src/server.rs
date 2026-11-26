@@ -317,6 +317,13 @@ pub enum ServerInstruction<'a> {
         message: &'a str,
         status: Status,
     },
+    /// The video mode a session uses (molcajeted, VNC and RDP with video):
+    /// `auto` (busy areas) or `full-screen`, which the client may switch
+    /// between with `argv video-mode`; `None` once video is off for the
+    /// session. Stock guacd never sends it.
+    VideoMode {
+        mode: Option<&'a str>,
+    },
     /// The link under the pointer in a terminal (molcajeted, SSH): its
     /// target URL, or `None` when the pointer left it. Stock guacd never
     /// sends it.
@@ -674,6 +681,9 @@ impl<'a> ServerInstruction<'a> {
             "link" => S::Link {
                 url: Some(d.s(0)).filter(|url| !url.is_empty()),
             },
+            "video-mode" => S::VideoMode {
+                mode: Some(d.s(0)).filter(|mode| !mode.is_empty()),
+            },
             "log" => S::Log { message: d.s(0) },
             "selection" => S::Selection {
                 active: d.s(0) == "1",
@@ -770,6 +780,21 @@ mod tests {
             assert_eq!(
                 ServerInstruction::decode(&&ins).unwrap(),
                 ServerInstruction::DisplayControl { available }
+            );
+        }
+    }
+
+    #[test]
+    fn video_mode() {
+        for (arg, mode) in [
+            ("full-screen", Some("full-screen")),
+            ("auto", Some("auto")),
+            ("", None),
+        ] {
+            let ins = Instruction::new("video-mode", [arg]);
+            assert_eq!(
+                ServerInstruction::decode(&&ins).unwrap(),
+                ServerInstruction::VideoMode { mode }
             );
         }
     }

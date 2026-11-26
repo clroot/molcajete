@@ -1147,6 +1147,9 @@ impl Inner {
             S::DisplayControl { available } => {
                 self.emit("display-control", JsValue::from_bool(available))
             }
+            S::VideoMode { mode } => {
+                self.emit("video-mode", mode.map_or(JsValue::NULL, JsValue::from_str))
+            }
             S::Msg { id } => self.emit("msg", JsValue::from(id)),
             S::Link { url } => self.emit("link", url.map_or(JsValue::NULL, JsValue::from_str)),
             S::Selection { active } => self.emit("selection", JsValue::from_bool(active)),
