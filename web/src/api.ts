@@ -72,6 +72,8 @@ export type ConnectionSummary = {
   /** The `dpi` and `resize-method` parameters, for the session menu. */
   dpi: string | null;
   resizeMethod: string | null;
+  /** The `font-size` parameter of a terminal; older gateways leave it out. */
+  fontSize?: string | null;
   /** The `read-only`, `disable-copy` and `disable-paste` parameters; older gateways leave them out. */
   readOnly?: boolean;
   disableCopy?: boolean;
@@ -178,6 +180,7 @@ export type TicketInfo = {
   protocol: string;
   dpi: string | null;
   resizeMethod: string | null;
+  fontSize?: string | null;
   readOnly: boolean;
   disableCopy: boolean;
   disablePaste: boolean;

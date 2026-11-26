@@ -20,7 +20,7 @@ use super::keys::{self, KeyOptions, Modifiers};
 use super::link::{self, Link};
 use super::mouse::{self, MouseAction};
 use super::render::{Pointer, Renderer};
-use super::settings::Settings;
+use super::settings::{self, Settings};
 use super::terminal::{Size, Terminal};
 use crate::display::Display;
 use crate::files::{self, Transfers};
@@ -86,6 +86,9 @@ pub struct Bridge {
     clipboard: String,
     dirty: bool,
     dirty_since: Instant,
+    /// A `size` went out that no frame has ended yet. The client applies it
+    /// at the end of a frame, also when the resize changed no pixel.
+    resized: bool,
     /// SFTP, when the connection has it (`enable-sftp`).
     files: Option<Transfers>,
 }
@@ -112,6 +115,7 @@ impl Bridge {
             clipboard: String::new(),
             dirty: true,
             dirty_since: Instant::now(),
+            resized: false,
             files,
         };
         bridge.renderer.invalidate(size);
@@ -261,7 +265,8 @@ impl Bridge {
             let rows = renderer.render(terminal.term(), display);
             (rows, display.flush(writer.buffer()))
         });
-        if self.writer.pending() > before {
+        let resized = std::mem::take(&mut self.resized);
+        if self.writer.pending() > before || resized {
             self.display.sync(self.writer.buffer());
             debug!(
                 rows,
@@ -331,6 +336,7 @@ impl Bridge {
             ClientEvent::Key { keysym, pressed } => self.key(keysym, pressed),
             ClientEvent::Mouse { x, y, mask } => self.pointer(x, y, mask),
             ClientEvent::Size { width, height } => self.resize(width, height),
+            ClientEvent::Argv { name, value } if name == "font-size" => self.set_font_size(&value),
             ClientEvent::Clipboard(text) if !self.settings.disable_paste => self.clipboard = text,
             ClientEvent::Sync {
                 timestamp,
@@ -616,11 +622,36 @@ impl Bridge {
         );
     }
 
+    /// Changes the text size during the session (guacd's `font-size`, sent
+    /// as `argv`): the display keeps its size and holds more or fewer
+    /// cells.
+    fn set_font_size(&mut self, value: &str) {
+        let Some(size_pt) = settings::font_size(value) else {
+            return;
+        };
+        if !self.renderer.set_font_size(size_pt) {
+            return;
+        }
+        let size = self
+            .renderer
+            .grid_size(self.display.width(), self.display.height());
+        if size != self.terminal.size() {
+            self.terminal.resize(size);
+        }
+        // The cells have a new size in pixels even where their number stayed.
+        let _ = self
+            .ssh
+            .send(Outgoing::Resize(Self::pty_size(&self.renderer, size)));
+        self.renderer.invalidate(size);
+        self.mark_dirty();
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
         if (width, height) == (self.display.width(), self.display.height()) {
             return;
         }
         self.display.resize(width, height, self.writer.buffer());
+        self.resized = true;
         let size = self.renderer.grid_size(width, height);
         if size != self.terminal.size() {
             self.terminal.resize(size);

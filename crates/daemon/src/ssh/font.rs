@@ -152,6 +152,8 @@ pub struct Fonts {
     regular: FontArc,
     /// `None`: no bold face, bold is synthesised.
     bold: Option<FontArc>,
+    /// Client resolution (pixels per inch) the point size is scaled by.
+    dpi: f32,
     px_per_em: f32,
     metrics: CellMetrics,
     fallback_paths: Vec<PathBuf>,
@@ -178,12 +180,7 @@ impl Fonts {
             0 => 96.0,
             dpi => dpi.clamp(48, 480) as f32,
         };
-        let size_pt = if options.size_pt > 0.0 {
-            options.size_pt
-        } else {
-            12.0
-        };
-        let px_per_em = (size_pt * dpi / 72.0).clamp(4.0, 200.0);
+        let px_per_em = px_per_em(options.size_pt, dpi);
         let metrics = cell_metrics(&regular, px_per_em);
 
         // User fonts first, then the built-in CJK face, then system fonts.
@@ -197,6 +194,7 @@ impl Fonts {
             fallback_fonts: vec![None; fallback_paths.len()],
             regular,
             bold,
+            dpi,
             px_per_em,
             metrics,
             fallback_paths,
@@ -207,6 +205,20 @@ impl Fonts {
 
     pub fn metrics(&self) -> CellMetrics {
         self.metrics
+    }
+
+    /// Changes the font size (points) of the loaded faces. Returns whether
+    /// the size differs from before: the cells then have new metrics, and
+    /// glyphs are rasterised again as they are needed.
+    pub fn set_size(&mut self, size_pt: f32) -> bool {
+        let px_per_em = px_per_em(size_pt, self.dpi);
+        if px_per_em == self.px_per_em {
+            return false;
+        }
+        self.px_per_em = px_per_em;
+        self.metrics = cell_metrics(&self.regular, px_per_em);
+        self.glyphs.clear();
+        true
     }
 
     /// Coverage mask for `c` drawn across `cells` cells, or `None` for
@@ -300,6 +312,13 @@ fn scale_for(font: &FontArc, px_per_em: f32) -> PxScale {
 }
 
 /// Cell size: the advance of `0` by the font's ascent + descent.
+/// Pixels per em of a point size at a resolution; 12 pt for a size that
+/// is not one.
+fn px_per_em(size_pt: f32, dpi: f32) -> f32 {
+    let size_pt = if size_pt > 0.0 { size_pt } else { 12.0 };
+    (size_pt * dpi / 72.0).clamp(4.0, 200.0)
+}
+
 fn cell_metrics(font: &FontArc, px_per_em: f32) -> CellMetrics {
     let scaled = font.as_scaled(scale_for(font, px_per_em));
     let advance = scaled.h_advance(font.glyph_id('0'));
@@ -545,6 +564,23 @@ mod tests {
         assert_eq!((m.width, m.height), (19, 38));
         let m = bundled(9.0, 96).metrics();
         assert_eq!((m.width, m.height), (7, 14));
+    }
+
+    #[test]
+    fn size_changes_without_loading_the_fonts_again() {
+        let mut fonts = bundled(12.0, 96);
+        let wide = fonts.glyph('A', false, 1).unwrap();
+        assert!(!fonts.set_size(12.0), "the same size changes nothing");
+        assert!(fonts.set_size(9.0));
+        let m = fonts.metrics();
+        assert_eq!((m.width, m.height), (7, 14));
+        // Glyphs drawn at the old size are not handed out again.
+        let narrow = fonts.glyph('A', false, 1).unwrap();
+        assert_eq!((narrow.width, narrow.height), (7, 14));
+        assert_ne!(wide.width, narrow.width);
+        // A size that is not one falls back to 12 pt, as at the start.
+        assert!(fonts.set_size(f32::NAN));
+        assert_eq!(fonts.metrics().width, 10);
     }
 
     #[test]

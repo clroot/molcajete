@@ -143,6 +143,7 @@ pub struct TicketInfo {
     /// Display parameters the session starts from.
     dpi: Option<String>,
     resize_method: Option<String>,
+    font_size: Option<String>,
     /// What the connection turns off (`read-only`, `disable-copy`,
     /// `disable-paste`), for the page to say so.
     read_only: bool,
@@ -204,6 +205,7 @@ pub async fn info(
         protocol: connection.protocol,
         dpi: display.remove("dpi"),
         resize_method: display.remove("resize-method"),
+        font_size: display.remove("font-size"),
         read_only: flag("read-only"),
         disable_copy: flag("disable-copy"),
         disable_paste: flag("disable-paste"),

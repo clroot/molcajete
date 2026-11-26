@@ -103,6 +103,13 @@ impl Renderer {
         self.fonts.metrics()
     }
 
+    /// Changes the font size (points). Returns whether the cells changed
+    /// size; the grid then has to be laid out again
+    /// ([`Renderer::grid_size`], [`Renderer::invalidate`]).
+    pub fn set_font_size(&mut self, size_pt: f32) -> bool {
+        self.fonts.set_size(size_pt)
+    }
+
     pub fn scheme(&self) -> &ColorScheme {
         &self.scheme
     }

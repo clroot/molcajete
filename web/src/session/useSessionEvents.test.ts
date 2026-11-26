@@ -11,6 +11,7 @@ const connected: SessionState = {
   canChangeDisplay: true,
   link: null,
   isAudioBlocked: false,
+  modifiers: {ctrl: 'off', alt: 'off'},
 };
 
 describe('session events', () => {
@@ -21,6 +22,12 @@ describe('session events', () => {
       const action = {type, detail: {stream: 128}} as unknown as Parameters<typeof reduce>[1];
       expect(reduce(connected, action)).toBe(connected);
     }
+  });
+
+  test('follows the modifiers the key bar holds, until the next connection', () => {
+    const held = reduce(connected, {type: 'modifiers', detail: {ctrl: 'once', alt: 'off'}});
+    expect(held.modifiers).toEqual({ctrl: 'once', alt: 'off'});
+    expect(reduce(held, {type: 'state', detail: 'connecting'}).modifiers).toEqual({ctrl: 'off', alt: 'off'});
   });
 
   test('says when sound waits for a click', () => {

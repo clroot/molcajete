@@ -41,7 +41,7 @@ mod wasm_api {
     /// Events are delivered to the handler installed with
     /// [`MolcajeteClient::set_event_handler`] as `(type, detail)`:
     /// `state`, `error`, `name`, `clipboard`, `resize`, `required`,
-    /// `unstable`, `stats`, `msg`, `focus`; for files `filesystem`,
+    /// `unstable`, `stats`, `msg`, `focus`, `modifiers`; for files `filesystem`,
     /// `undefine`, `get-error`, `stream-start`, `stream-data`,
     /// `stream-end` and `stream-ack`.
     #[wasm_bindgen]
@@ -198,6 +198,20 @@ mod wasm_api {
 
         pub fn send_key(&self, keysym: u32, pressed: bool) {
             self.run(|inner| inner.send_key(keysym, pressed));
+        }
+
+        /// Presses and releases a key, with the modifiers held by
+        /// [`MolcajeteClient::hold_modifier`]: a key the page offers as a
+        /// button because the device's keyboard lacks it.
+        pub fn press_key(&self, keysym: u32) {
+            self.run(|inner| inner.press_key(keysym));
+        }
+
+        /// Holds `ctrl` or `alt` as if its key were down: `once` for the
+        /// next key, `locked` until it is turned `off`. Each change arrives
+        /// as a `modifiers` event with the state of both.
+        pub fn hold_modifier(&self, name: &str, hold: &str) {
+            self.run(|inner| inner.hold_modifier(name, hold));
         }
 
         /// Asks the filesystem object `object` (announced by a `filesystem`

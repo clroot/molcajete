@@ -7,7 +7,14 @@ import {Heading} from '@astryxdesign/core/Heading';
 import {Icon} from '@astryxdesign/core/Icon';
 import {Kbd} from '@astryxdesign/core/Kbd';
 import {Text} from '@astryxdesign/core/Text';
-import {Bars3Icon} from '@heroicons/react/24/outline';
+import {
+  ArrowsPointingOutIcon,
+  ArrowsUpDownIcon,
+  Bars3Icon,
+  CursorArrowRaysIcon,
+  HandRaisedIcon,
+  LinkIcon,
+} from '@heroicons/react/24/outline';
 import {terminalKeys} from './terminal';
 
 function Way({lead, children}: {lead: ReactNode; children: ReactNode}) {
@@ -46,27 +53,59 @@ function TerminalWays({hasLinks}: {hasLinks: boolean}) {
   );
 }
 
+/** A terminal used by finger: the gestures, and the bar that has the keys and the menu. */
+function TouchWays({hasLinks}: {hasLinks: boolean}) {
+  return (
+    <VStack gap={4}>
+      <Way lead={<Icon icon={CursorArrowRaysIcon} />}>Tap the terminal to open the keyboard.</Way>
+      <Way lead={<Icon icon={ArrowsUpDownIcon} />}>Drag up or down to scroll through earlier output.</Way>
+      <Way lead={<Icon icon={HandRaisedIcon} />}>
+        Touch and hold, then drag, to select text. Lifting copies it.
+      </Way>
+      <Way lead={<Icon icon={ArrowsPointingOutIcon} />}>Pinch to make the text smaller or larger.</Way>
+      {hasLinks && <Way lead={<Icon icon={LinkIcon} />}>Tap a link, then Open, to open it in a new tab.</Way>}
+      <Way lead={<Icon icon={Bars3Icon} />}>
+        The bar under the terminal has Esc, Tab, Ctrl and the arrow keys. Its last button opens the session
+        menu.
+      </Way>
+    </VStack>
+  );
+}
+
 type Props = {
-  /** Copy, paste and links are explained for terminals; `null` for desktops. */
-  terminal: {hasLinks: boolean} | null;
+  /**
+   * Copy, paste and links are explained for terminals, or with `isTouch`
+   * the gestures and the key bar; `null` for desktops.
+   */
+  terminal: {hasLinks: boolean; isTouch: boolean} | null;
   onDismiss: () => void;
 };
 
 /** Shown once in this browser, and once more on the first terminal: the session menu, copy and paste. */
 export default function SessionGuide({terminal, onDismiss}: Props) {
+  const isTouch = terminal?.isTouch === true;
   return (
     <Dialog isOpen onOpenChange={isOpen => !isOpen && onDismiss()} width={440}>
       <Layout
         height="auto"
         header={
-          <DialogHeader
-            title="The session menu"
-            subtitle="Clipboard, display scale, keyboard options and disconnecting."
-          />
+          isTouch ? (
+            <DialogHeader
+              title="The terminal by touch"
+              subtitle="Typing, scrolling, copying and the session menu."
+            />
+          ) : (
+            <DialogHeader
+              title="The session menu"
+              subtitle="Clipboard, display scale, keyboard options and disconnecting."
+            />
+          )
         }
         content={
           <LayoutContent>
-            {terminal ? (
+            {isTouch ? (
+              <TouchWays hasLinks={terminal.hasLinks} />
+            ) : terminal ? (
               <VStack gap={5}>
                 <MenuWays />
                 <VStack gap={3}>

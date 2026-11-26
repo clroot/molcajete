@@ -8,6 +8,9 @@ export const isTerminal = (protocol: string | null) =>
 /** Terminals that report links under the pointer (molcajeted's SSH terminal). */
 export const hasLinks = (protocol: string | null) => protocol === 'ssh';
 
+/** Links the page opens: the schemes the client's own ⌘-click accepts (molcajete.js). */
+export const isOpenableLink = (url: string) => /^(https?:\/\/|mailto:)./i.test(url);
+
 const isMac = /mac/i.test(navigator.platform);
 
 /**

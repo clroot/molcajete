@@ -1,5 +1,5 @@
 import {useReducer} from 'react';
-import type {SessionEvent, SessionStats} from './client';
+import type {HeldModifiers, SessionEvent, SessionStats} from './client';
 
 export type ConnectionStatus =
   | {kind: 'connecting'}
@@ -21,6 +21,8 @@ export type SessionState = {
   link: string | null;
   /** An audio stream is open, but the browser plays nothing until a click or key press. */
   isAudioBlocked: boolean;
+  /** Ctrl and Alt as the terminal key bar holds them. */
+  modifiers: HeldModifiers;
 };
 
 type Action =
@@ -28,6 +30,8 @@ type Action =
   | {type: 'reconnecting'}
   | {type: 'answered'}
   | {type: 'failed'; title: string; detail: string};
+
+const NO_MODIFIERS: HeldModifiers = {ctrl: 'off', alt: 'off'};
 
 const initialState: SessionState = {
   status: {kind: 'connecting'},
@@ -38,6 +42,7 @@ const initialState: SessionState = {
   canChangeDisplay: true,
   link: null,
   isAudioBlocked: false,
+  modifiers: NO_MODIFIERS,
 };
 
 /** Statuses the gateway closes a tunnel with when it ends the session itself. */
@@ -67,7 +72,13 @@ export function reduce(state: SessionState, action: Action): SessionState {
     case 'state':
       // A new connection may reach a different server.
       if (action.detail === 'connecting')
-        return {...state, status: {kind: 'connecting'}, canChangeDisplay: true, link: null};
+        return {
+          ...state,
+          status: {kind: 'connecting'},
+          canChangeDisplay: true,
+          link: null,
+          modifiers: NO_MODIFIERS,
+        };
       if (action.detail === 'waiting') return {...state, status: {kind: 'connecting'}};
       if (action.detail === 'connected') return {...state, status: {kind: 'connected'}};
       // Keep the error that caused the disconnect on screen.
@@ -95,6 +106,8 @@ export function reduce(state: SessionState, action: Action): SessionState {
       return {...state, link: action.detail};
     case 'audio':
       return {...state, isAudioBlocked: action.detail.blocked};
+    case 'modifiers':
+      return {...state, modifiers: action.detail};
     case 'reconnecting':
       return {...state, status: {kind: 'connecting'}, required: null};
     case 'name':
