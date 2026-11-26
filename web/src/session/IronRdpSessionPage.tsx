@@ -39,6 +39,9 @@ function loadIronRdp(): Promise<RdpModule> {
   return loading;
 }
 
+/** How long the web component may take to start before the page gives up. */
+const READY_TIMEOUT_MS = 15_000;
+
 /** Time without a new window size before the remote desktop follows it. */
 const RESIZE_DELAY_MS = 300;
 
@@ -56,7 +59,7 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
   const [status, setStatus] = useState<ConnectionStatus>({kind: 'connecting'});
   const [attempt, setAttempt] = useState(0);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
-  const elementRef = useRef<HTMLElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let isCurrent = true;
@@ -75,15 +78,40 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
     };
   }, []);
 
-  // The component announces itself once its canvas is ready.
+  // The component announces itself with `ready` a few microtasks after it
+  // is inserted, sooner than an effect would attach a listener to an element
+  // React rendered (on Safari the page waited forever). So it is made here,
+  // listened to, and only then inserted.
   useEffect(() => {
-    const element = elementRef.current;
-    if (!rdp || !element) return;
-    const onReady = (event: Event) =>
+    const frame = frameRef.current;
+    if (!rdp || !frame) return;
+    const element = document.createElement('iron-remote-desktop') as HTMLElement & {module: unknown};
+    element.setAttribute('scale', 'fit');
+    element.setAttribute('flexcenter', 'true');
+    element.className = stylex.props(styles.display).className ?? '';
+    element.module = rdp.Backend;
+    // Never a spinner forever: a component that does not start says so.
+    const timer = setTimeout(
+      () =>
+        setStatus({
+          kind: 'failed',
+          title: 'The client could not start',
+          detail: "IronRDP's client did not get ready. Reload the page, or reconnect with molcajete.",
+        }),
+      READY_TIMEOUT_MS,
+    );
+    element.addEventListener('ready', event => {
+      clearTimeout(timer);
       setUi((event as CustomEvent<{irgUserInteraction: UserInteraction}>).detail.irgUserInteraction);
-    element.addEventListener('ready', onReady);
-    return () => element.removeEventListener('ready', onReady);
-  }, [rdp]);
+    });
+    frame.append(element);
+    return () => {
+      clearTimeout(timer);
+      element.remove();
+      setUi(null);
+    };
+    // Every attempt starts with a new component.
+  }, [rdp, attempt]);
 
   useEffect(() => {
     if (!rdp || !ui) return;
@@ -119,7 +147,7 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
       isCurrent = false;
       ui.shutdown();
     };
-  }, [rdp, ui, connectionId, attempt]);
+  }, [rdp, ui, connectionId]);
 
   // The remote desktop follows the window.
   useEffect(() => {
@@ -147,17 +175,7 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
 
   return (
     <>
-      <div {...stylex.props(styles.frame)}>
-        {rdp && (
-          <iron-remote-desktop
-            ref={elementRef}
-            scale="fit"
-            flexcenter="true"
-            module={rdp.Backend}
-            {...stylex.props(styles.display)}
-          />
-        )}
-      </div>
+      <div ref={frameRef} {...stylex.props(styles.frame)} />
       {status.kind !== 'connected' && (
         <StatusOverlay
           status={status}
