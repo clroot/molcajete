@@ -606,6 +606,25 @@ fn time_an_ack_waited_unread_is_not_lag() {
     assert!(d.processing_lag() < Duration::from_millis(5));
 }
 
+#[test]
+fn time_before_the_session_reads_input_is_not_ack_wait() {
+    let (mut d, _, mut out) = setup(4, 4);
+    d.sync(&mut out);
+    let received = Instant::now();
+    // The session connects to the remote host and reads no input meanwhile.
+    std::thread::sleep(Duration::from_millis(40));
+    d.reading_input();
+    d.ack(d.last_sync.unwrap(), received);
+    assert!(d.metrics.ack_wait_max() < Duration::from_millis(20));
+
+    // From then on, a reply that waits for the session counts in full.
+    d.sync(&mut out);
+    let received = Instant::now();
+    std::thread::sleep(Duration::from_millis(40));
+    d.ack(d.last_sync.unwrap(), received);
+    assert!(d.metrics.ack_wait_max() >= Duration::from_millis(40));
+}
+
 /// Random mixes of puts, fills, protocol copies, scrolls and resizes: after
 /// every flush the simulated client must equal the framebuffer exactly.
 #[test]

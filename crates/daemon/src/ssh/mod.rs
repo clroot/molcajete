@@ -202,7 +202,7 @@ async fn connect_and_run(
     sftp: Option<files::SftpSettings>,
     jump: &Chain,
     renderer: Renderer,
-    display: Display,
+    mut display: Display,
     mut writer: GuacWriter,
     inputs: mpsc::Receiver<Input>,
     mut decoder: InputDecoder,
@@ -265,6 +265,8 @@ async fn connect_and_run(
     };
     let (channel_reader, channel_writer) = channel.split();
     let (ssh, writer_task) = client::spawn_writer(channel_writer);
+    // The reply to the background's `sync` has waited for the connection.
+    display.reading_input();
     let bridge = Bridge::new(settings, renderer, display, writer, ssh, files);
     let result = bridge.run(channel_reader, inputs, decoder).await;
     writer_task.abort();

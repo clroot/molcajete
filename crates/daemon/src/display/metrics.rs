@@ -234,6 +234,12 @@ impl DisplayMetrics {
         self.totals.zstd.count
     }
 
+    /// Longest time an acknowledgement waited for the session so far.
+    #[cfg(test)]
+    pub(super) fn ack_wait_max(&self) -> Duration {
+        self.totals.ack_wait.max
+    }
+
     pub(super) fn flushed(&mut self, elapsed: Duration) {
         self.flush.record(elapsed);
         self.totals.flush.add(elapsed);

@@ -243,6 +243,9 @@ pub struct Display {
     motion: Vec<f32>,
     last_decay: Instant,
     last_flush: Instant,
+    /// Since when the session reads the client's input (see
+    /// [`Display::reading_input`]).
+    reading_since: Instant,
     formats: ImageFormats,
     /// Whether zstd images are sent (the client accepts them). Every
     /// encoding thread has its own encoder ([`pool::with_zstd`]).
@@ -628,6 +631,7 @@ impl Display {
             motion: Vec::new(),
             last_decay: Instant::now(),
             last_flush: Instant::now(),
+            reading_since: Instant::now(),
             formats,
             zstd: formats.zstd,
             pool: pool::shared(),
@@ -1924,9 +1928,19 @@ impl Display {
         }
         let received = received.into();
         if let Some(elapsed) = self.clock.acked(timestamp, received) {
-            self.metrics
-                .acked(elapsed, received.at.elapsed(), received.apply);
+            // Only the time the session could have read the reply.
+            let waited = received.at.max(self.reading_since).elapsed();
+            self.metrics.acked(elapsed, waited, received.apply);
         }
+    }
+
+    /// The session reads the client's input from now on, after a time in
+    /// which it did not (while it connected to the remote host).
+    ///
+    /// A `sync` reply that arrived in that time waited for the connection,
+    /// not for the session's own work, so its wait is counted from here.
+    pub fn reading_input(&mut self) {
+        self.reading_since = Instant::now();
     }
 
     /// Frames sent but not yet acknowledged by the client.
