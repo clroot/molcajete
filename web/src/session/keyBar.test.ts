@@ -1,5 +1,5 @@
 import {describe, expect, test} from 'bun:test';
-import {KEYSYM, SYMBOLS, nextHold, showsKeyBar} from './keyBar';
+import {KEYSYM, SYMBOLS, isKeyboardOpen, nextHold, showsKeyBar} from './keyBar';
 
 describe('terminal key bar', () => {
   test('a tap holds a modifier for one key, the next locks it, the third lets go', () => {
@@ -14,6 +14,15 @@ describe('terminal key bar', () => {
     // A tablet with a keyboard, a laptop with a touch screen.
     expect(showsKeyBar(false, true)).toBe(false);
     expect(showsKeyBar(true, false)).toBe(true);
+  });
+
+  test('takes the keyboard as open when it covers more than an address bar would', () => {
+    // A 393×852 phone upright: Safari's address bar, then the keyboard.
+    expect(isKeyboardOpen(852, 852)).toBe(false);
+    expect(isKeyboardOpen(852 - 80, 852)).toBe(false);
+    expect(isKeyboardOpen(852 - 336, 852)).toBe(true);
+    // On its side, with the keyboard taking most of the height.
+    expect(isKeyboardOpen(393 - 200, 393)).toBe(true);
   });
 
   test('sends the keysyms terminals expect', () => {
