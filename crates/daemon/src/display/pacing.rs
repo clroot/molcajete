@@ -114,6 +114,10 @@ pub(super) struct FrameClock {
     /// Bytes sent that the budget has not covered yet, as of the last frame.
     /// It shrinks at the budget's rate.
     backlog: usize,
+    /// How much later the last frame was sent than its content's own
+    /// interval allowed ([`Self::frame_sent_spaced`]). The next frame may
+    /// follow that much sooner.
+    late: Duration,
 }
 
 impl FrameClock {
@@ -126,6 +130,7 @@ impl FrameClock {
             reports: false,
             last_frame: None,
             backlog: 0,
+            late: Duration::ZERO,
         }
     }
 
@@ -138,7 +143,37 @@ impl FrameClock {
     }
 
     /// A frame of `bytes` encoded bytes was ended with `sync(timestamp)`.
+    #[cfg(test)]
     pub(super) fn frame_sent(&mut self, timestamp: i64, now: Instant, bytes: usize) {
+        self.frame_sent_spaced(timestamp, now, bytes, Duration::ZERO);
+    }
+
+    /// Like [`Self::frame_sent`], for content whose frames must stay
+    /// `at_least` apart (see [`Self::next_frame_at`]).
+    ///
+    /// That interval is kept on average, not after every single frame. A
+    /// frame is sent some time after it was due: building it takes time, and
+    /// a session sends it where the remote server ends a frame of its own.
+    /// Counting the whole interval again from there would add that delay to
+    /// every frame: video at 30 frames per second whose frames take 10 ms to
+    /// encode would go out every 43 ms, and from a server that ends a frame
+    /// every 33 ms only every other one. The delay is taken off the next
+    /// interval instead, up to one interval: frames stay `at_least` apart on
+    /// average, and no more than one catches up after a pause.
+    pub(super) fn frame_sent_spaced(
+        &mut self,
+        timestamp: i64,
+        now: Instant,
+        bytes: usize,
+        at_least: Duration,
+    ) {
+        self.late = match self.last_frame {
+            Some((last, _)) if !at_least.is_zero() => {
+                let due = last + at_least.saturating_sub(self.late);
+                now.saturating_duration_since(due).min(at_least)
+            }
+            _ => Duration::ZERO,
+        };
         self.pending.push_back((timestamp, now));
         if let Some(budget) = self.pacing.budget {
             let since_last = self.last_frame.map_or(Duration::MAX, |(last, _)| {
@@ -222,12 +257,17 @@ impl FrameClock {
     /// delivered), so it has to be asked again after every `acked`.
     ///
     /// `at_least` raises the profile's shortest interval, for content that
-    /// must not be sent faster.
+    /// must not be sent faster on average; what the last frame was late by
+    /// is taken off it ([`Self::frame_sent_spaced`]).
     pub(super) fn next_frame_at(&self, at_least: Duration) -> Option<Instant> {
         let (last, bytes) = self.last_frame?;
+        let shortest = self
+            .pacing
+            .min_interval
+            .max(at_least.saturating_sub(self.late));
         let mut interval = self
             .client_interval(last)
-            .clamp(self.pacing.min_interval.max(at_least), MAX_LAG_COMPENSATION);
+            .clamp(shortest, MAX_LAG_COMPENSATION);
         let delivered = self.pacing.heavy_until_acked && self.pending.is_empty();
         if bytes > LARGE_FRAME_BYTES && !delivered {
             interval = interval.max(LARGE_FRAME_INTERVAL);
@@ -377,6 +417,131 @@ mod tests {
             frame_bytes,
             most_unacked,
         }
+    }
+
+    /// When frames are sent over `seconds` of content that must stay
+    /// `at_least` apart, from a server that ends a frame of its own every
+    /// `source`, when building a frame takes `build`. A frame is started
+    /// once it is due and the server has ended a frame since the last one.
+    fn spaced_frames(
+        at_least: Duration,
+        source: Duration,
+        build: Duration,
+        seconds: u32,
+    ) -> Vec<Duration> {
+        let start = Instant::now();
+        let end = Duration::from_secs(u64::from(seconds));
+        let mut clock = FrameClock::new(Pacing::DESKTOP);
+        let mut sent = Vec::new();
+        // The server's next frame that has not been sent on.
+        let mut next_source = Duration::ZERO;
+        loop {
+            let due = clock
+                .next_frame_at(at_least)
+                .map_or(Duration::ZERO, |due| due - start);
+            let started = due.max(next_source);
+            let at = started + build;
+            if at >= end {
+                return sent;
+            }
+            clock.frame_sent_spaced(sent.len() as i64, start + at, 2_000, at_least);
+            sent.push(at);
+            // Everything the server ended up to the start went into it.
+            let ended = started.as_nanos() / source.as_nanos() + 1;
+            next_source = source * ended as u32;
+        }
+    }
+
+    /// Time between frames once the rate has settled: the first frame has
+    /// nothing before it to be late against.
+    fn gaps(frames: &[Duration]) -> Vec<Duration> {
+        frames[1..].windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    const VIDEO: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+    #[test]
+    fn spaced_frames_keep_their_rate_whatever_building_them_takes() {
+        // The server ends 30 frames per second, as the content allows.
+        // (A frame that takes longer to build than this leaves less than the
+        // profile's own 16 ms before the next one, which then waits.)
+        for build in [Duration::ZERO, 10 * MS, 17 * MS] {
+            let frames = spaced_frames(VIDEO, VIDEO, build, 10);
+            assert!(
+                (298..=301).contains(&frames.len()),
+                "{} frames with {build:?} to build",
+                frames.len()
+            );
+            for gap in gaps(&frames) {
+                assert!(
+                    gap >= 33 * MS && gap <= 34 * MS,
+                    "{gap:?} with {build:?} to build"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spaced_frames_follow_a_faster_server_at_their_own_rate() {
+        // 38.8 frames per second, as measured from a Windows host (GH-112).
+        let source = Duration::from_micros(25_773);
+        let frames = spaced_frames(VIDEO, source, 10 * MS, 10);
+        assert!(
+            (290..=301).contains(&frames.len()),
+            "{} frames",
+            frames.len()
+        );
+        // One or two of the server's frames apart, never more.
+        for gap in gaps(&frames) {
+            assert!(gap <= 2 * source + MS, "{gap:?}");
+        }
+        // A server at twice the rate is followed evenly.
+        let frames = spaced_frames(VIDEO, VIDEO / 2, 10 * MS, 10);
+        assert!((298..=301).contains(&frames.len()), "{}", frames.len());
+        for gap in gaps(&frames) {
+            assert!(gap >= 33 * MS && gap <= 34 * MS, "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn spaced_frames_never_exceed_their_rate_by_more_than_a_frame() {
+        for (source, build) in [
+            (MS, Duration::ZERO),
+            (7 * MS, 3 * MS),
+            (25_773 * MS / 1000, 10 * MS),
+            (40 * MS, 30 * MS),
+        ] {
+            let frames = spaced_frames(VIDEO, source, build, 10);
+            for (i, &first) in frames.iter().enumerate() {
+                let second = first + Duration::from_secs(1);
+                let within = frames[i..].iter().take_while(|&&t| t < second).count();
+                assert!(
+                    within <= 31,
+                    "{within} frames in a second ({source:?}, {build:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pause_lets_one_interval_be_caught_up() {
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(Pacing::DESKTOP);
+        clock.frame_sent_spaced(1, t0, 2_000, VIDEO);
+        // Nothing changed for a second: the frame is late by far more than
+        // an interval, and one interval of that counts.
+        let t1 = t0 + 1000 * MS;
+        clock.frame_sent_spaced(2, t1, 2_000, VIDEO);
+        // The next frame may follow at the profile's own interval...
+        assert_eq!(clock.next_frame_at(VIDEO), Some(t1 + 16 * MS));
+        let t2 = t1 + 16 * MS;
+        clock.frame_sent_spaced(3, t2, 2_000, VIDEO);
+        // ... which used up 16 ms of the interval that was caught up...
+        let t3 = t2 + (VIDEO - 16 * MS);
+        assert_eq!(clock.next_frame_at(VIDEO), Some(t3));
+        clock.frame_sent_spaced(4, t3, 2_000, VIDEO);
+        // ... and after the rest of it the frames are an interval apart.
+        assert_eq!(clock.next_frame_at(VIDEO), Some(t3 + VIDEO));
     }
 
     #[test]
