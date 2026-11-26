@@ -20,8 +20,10 @@
 //!
 //! - [`Pacing::DESKTOP`] (RDP, VNC): up to ~60 fps. A heavy frame holds the
 //!   next one back only until the client has acknowledged it, so a link with
-//!   room is not slowed down, and a byte budget caps what one session may
-//!   take from a link that would deliver even more.
+//!   room is not slowed down, and a client that acknowledges quickly
+//!   ([`FAST_ACK`]) is sent the next one while one heavy frame is still on
+//!   its way. A byte budget caps what one session may take from a link that
+//!   would deliver even more.
 //! - [`Pacing::TERMINAL`] (SSH): up to ~30 fps, and a fixed pause after
 //!   every heavy frame however fast it was acknowledged. A flood of terminal
 //!   output is not worth more frames, only more bytes.
@@ -34,6 +36,14 @@ const LARGE_FRAME_BYTES: usize = 32 * 1024;
 /// Longest pause after a heavy frame (~15 fps, similar to guacd under floods
 /// of output).
 const LARGE_FRAME_INTERVAL: Duration = Duration::from_millis(66);
+/// A client whose acknowledgements take no longer than this (smoothed) has
+/// a link and a decoder with room: the next frame may follow a heavy one
+/// that is not acknowledged yet, as long as it is the only one. Waiting for
+/// every acknowledgement adds that time to every frame: 4K video frames are
+/// all heavy (52 kB on average), and with 21 ms to encode one and 17 ms
+/// until its acknowledgement, 26 frames per second went out for 28 from the
+/// server. A client that takes longer keeps the frames one at a time.
+const FAST_ACK: Duration = Duration::from_millis(33);
 /// Upper bound for waiting on a slow client (same as guacd), and for
 /// waiting on the byte budget: the screen never stands still for longer.
 const MAX_LAG_COMPENSATION: Duration = Duration::from_millis(500);
@@ -70,7 +80,8 @@ pub struct Pacing {
     /// Shortest interval between frames while content keeps changing.
     min_interval: Duration,
     /// Whether the pause after a heavy frame ends as soon as the client has
-    /// acknowledged that frame (and every frame before it).
+    /// acknowledged that frame (and every frame before it), or, for a client
+    /// that acknowledges quickly ([`FAST_ACK`]), every frame before it.
     heavy_until_acked: bool,
     /// Encoded bytes per second that may be sent before further frames
     /// wait. Frames above the budget are spaced out evenly rather than sent
@@ -104,6 +115,8 @@ pub(super) struct FrameClock {
     pending: VecDeque<(i64, Instant)>,
     /// Smoothed time the client needs to acknowledge a frame.
     lag: Duration,
+    /// An acknowledgement has arrived: the lag is a measurement.
+    measured: bool,
     /// The last apply times the client reported, with when each arrived
     /// (newest last).
     applies: VecDeque<(Instant, Duration)>,
@@ -127,6 +140,7 @@ impl FrameClock {
             pacing,
             pending: VecDeque::new(),
             lag: Duration::ZERO,
+            measured: false,
             applies: VecDeque::with_capacity(APPLY_SAMPLES),
             reports: false,
             last_frame: None,
@@ -195,6 +209,7 @@ impl FrameClock {
             if ts == timestamp {
                 let elapsed = received.saturating_duration_since(sent_at);
                 self.lag = (self.lag * 3 + elapsed.min(MAX_LAG_COMPENSATION)) / 4;
+                self.measured = true;
                 acked = Some(elapsed);
                 if let Some(apply) = reply.apply {
                     if self.applies.len() == APPLY_SAMPLES {
@@ -252,11 +267,19 @@ impl FrameClock {
         let mut interval = self
             .client_interval(last)
             .clamp(self.pacing.min_interval, MAX_LAG_COMPENSATION);
-        let delivered = self.pacing.heavy_until_acked && self.pending.is_empty();
+        let delivered =
+            self.pacing.heavy_until_acked && self.pending.len() <= self.heavy_in_flight();
         if bytes > LARGE_FRAME_BYTES && !delivered {
             interval = interval.max(LARGE_FRAME_INTERVAL);
         }
         Some(last + interval.max(self.budget_wait()))
+    }
+
+    /// How many frames may be unacknowledged when the next one follows a
+    /// heavy frame: none, or one for a client that has been seen to
+    /// acknowledge quickly ([`FAST_ACK`]).
+    fn heavy_in_flight(&self) -> usize {
+        usize::from(self.measured && self.lag <= FAST_ACK)
     }
 
     /// How long after the last frame the bytes sent are back within the
@@ -502,11 +525,56 @@ mod tests {
         let mut clock = FrameClock::new(Pacing::DESKTOP);
         clock.frame_sent(1, t0, 100);
         clock.frame_sent(2, t0 + 20 * MS, 100_000);
-        clock.acked(1, t0 + 25 * MS);
+        // A client that takes its time: 200 ms for the light frame.
+        clock.acked(1, t0 + 200 * MS);
         assert_eq!(
             clock.next_frame_at(),
             Some(t0 + 20 * MS + LARGE_FRAME_INTERVAL)
         );
+    }
+
+    #[test]
+    fn a_fast_client_is_sent_the_next_frame_behind_one_heavy_frame() {
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(Pacing::DESKTOP);
+        // Nothing is known about the client yet: the first heavy frame is
+        // waited for.
+        clock.frame_sent(1, t0, 100_000);
+        assert_eq!(clock.next_frame_at(), Some(t0 + LARGE_FRAME_INTERVAL));
+        // It acknowledges within 17 ms, as a 4K video client on a LAN does.
+        clock.acked(1, t0 + 17 * MS);
+        let t1 = t0 + 35 * MS;
+        clock.frame_sent(2, t1, 100_000);
+        // One heavy frame on its way does not hold the next one back...
+        assert_eq!(clock.next_frame_at(), Some(t1 + 16 * MS));
+        let t2 = t1 + 16 * MS;
+        clock.frame_sent(3, t2, 100_000);
+        // ... two do, until the first of them is acknowledged.
+        assert_eq!(clock.next_frame_at(), Some(t2 + LARGE_FRAME_INTERVAL));
+        clock.acked(2, t1 + 17 * MS);
+        assert_eq!(clock.next_frame_at(), Some(t2 + 16 * MS));
+    }
+
+    #[test]
+    fn a_client_that_slows_down_gets_heavy_frames_one_at_a_time_again() {
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(Pacing::DESKTOP);
+        clock.frame_sent(1, t0, 100_000);
+        clock.acked(1, t0 + 17 * MS);
+        // The link fills up: the next acknowledgements take 150 ms.
+        let mut t = t0 + 100 * MS;
+        for ts in 2..5 {
+            clock.frame_sent(ts, t, 100_000);
+            clock.acked(ts, t + 150 * MS);
+            t += 200 * MS;
+        }
+        clock.frame_sent(5, t, 100_000);
+        // At least the pause after a heavy frame (and the lag of this
+        // client, which is longer by now).
+        assert!(clock.next_frame_at() >= Some(t + LARGE_FRAME_INTERVAL));
+        // Its acknowledgement releases the next frame as before.
+        clock.acked(5, t + 150 * MS);
+        assert!(clock.next_frame_at() < Some(t + 150 * MS));
     }
 
     #[test]
@@ -862,15 +930,16 @@ mod tests {
     }
 
     #[test]
-    fn heavy_frames_still_wait_for_their_acknowledgement() {
+    fn heavy_frames_still_wait_behind_another_unacknowledged_frame() {
         let t0 = Instant::now();
         let mut clock = FrameClock::new(Pacing::DESKTOP);
         clock.frame_sent(1, t0, 2_000);
         clock.acked(1, reply(t0 + 10 * MS, MS));
         clock.frame_sent(2, t0 + 16 * MS, 100_000);
+        clock.frame_sent(3, t0 + 32 * MS, 100_000);
         assert_eq!(
             clock.next_frame_at(),
-            Some(t0 + 16 * MS + LARGE_FRAME_INTERVAL)
+            Some(t0 + 32 * MS + LARGE_FRAME_INTERVAL)
         );
     }
 }
