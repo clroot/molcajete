@@ -48,6 +48,8 @@ export type SessionEvent =
   | {type: 'link'; detail: string | null}
   /** The terminal has no selection any more (molcajeted SSH only); a selection arrives as `clipboard`. */
   | {type: 'selection'; detail: boolean}
+  /** Two fingers moved apart (1) or together (-1) on a terminal: one step of text size. */
+  | {type: 'zoom'; detail: {delta: 1 | -1}}
   /** Ctrl and Alt held with `hold_modifier`, after every change. */
   | {type: 'modifiers'; detail: HeldModifiers}
   /** The copy shortcut wrote the selection to the local clipboard, or could not. */

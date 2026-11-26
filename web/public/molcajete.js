@@ -137,6 +137,13 @@ function writeClipboard(text) {
   return Promise.resolve(copied);
 }
 
+/** How long a finger rests before it selects instead of scrolling. */
+const LONG_PRESS_MS = 500;
+/** How far a finger may wander (CSS pixels) and still be a tap or a long press. */
+const TOUCH_SLOP = 10;
+/** How much two fingers move apart or together for one step of text size. */
+const PINCH_STEP = 1.15;
+
 function timezone() {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -167,6 +174,7 @@ export class MolcajeteSession {
     if (useWorker) await session.#startWorker();
     else await session.#startMain();
     session.#installTerminalShortcuts();
+    session.#installTerminalTouch();
     if (options.binary === false) session.call("set_binary_tunnel", false);
     if (options.zstd === false) {
       session.#zstd = false;
@@ -387,6 +395,125 @@ export class MolcajeteSession {
         // The press never reached the remote side; neither does the rest.
         e.stopPropagation();
         if (type !== "pointermove") this.#heldPointer = null;
+      }, capture);
+    }
+  }
+
+  /**
+   * Touch in terminals. A finger sent as a mouse with its button held can
+   * only select text, and a phone has no wheel to scroll with, so the
+   * gestures are told apart here, ahead of the client's own listeners (in
+   * either mode), and reach the remote side as what a mouse would do:
+   *
+   * - A drag up or down scrolls: its distance goes out as wheel movement,
+   *   so the history scrolls, and so do full-screen applications.
+   * - A finger that rests first selects: the button goes down where it
+   *   rested and up where it is lifted.
+   * - A tap focuses the input, which opens the on-screen keyboard, and
+   *   clicks.
+   * - Two fingers moving apart or together are reported as `zoom` events
+   *   (`{delta: 1}` or `{delta: -1}`) for the page to change the text size.
+   *
+   * A mouse and a pen are not touched by this, nor is any pointer outside
+   * terminals.
+   */
+  #installTerminalTouch() {
+    if (this.#playback) return;
+    const container = this.#container;
+    const capture = { capture: true };
+    /** Where each finger on the display is, by pointer id. */
+    const touches = new Map();
+    /**
+     * What the fingers are doing: the first one is `pending` until it moves
+     * (`scroll`) or rests (`select`); two are a `pinch`; `over` once that
+     * ended while a finger is still down.
+     */
+    let gesture = null;
+
+    const position = (e) => {
+      const canvas = this.#canvas ?? container.querySelector("canvas") ?? container;
+      const r = canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    };
+    const pointer = ({ x, y }, buttons) => this.call("pointer", x, y, buttons);
+    const spread = () => {
+      const [a, b] = [...touches.values()];
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    };
+    /** Ends what the first finger was doing; the button does not stay down. */
+    const stop = () => {
+      clearTimeout(gesture?.timer);
+      if (gesture?.kind === "select") pointer(gesture.at, 0);
+    };
+    const handles = (e) => this.#terminal && e.pointerType === "touch";
+
+    this.#listen(container, "pointerdown", (e) => {
+      if (!handles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.#resumeAudio();
+      const at = position(e);
+      touches.set(e.pointerId, at);
+      if (touches.size === 1) {
+        const first = { kind: "pending", id: e.pointerId, start: at, at, timer: 0 };
+        first.timer = setTimeout(() => {
+          if (gesture !== first || first.kind !== "pending") return;
+          first.kind = "select";
+          navigator.vibrate?.(10);
+          pointer(first.start, 1);
+        }, LONG_PRESS_MS);
+        gesture = first;
+      } else if (touches.size === 2) {
+        stop();
+        gesture = { kind: "pinch", spread: spread() };
+      }
+    }, capture);
+
+    this.#listen(container, "pointermove", (e) => {
+      if (!handles(e) || !touches.has(e.pointerId)) return;
+      e.stopPropagation();
+      const at = position(e);
+      touches.set(e.pointerId, at);
+      if (!gesture) return;
+      if (gesture.kind === "pinch") {
+        if (touches.size < 2 || !gesture.spread) return;
+        const ratio = spread() / gesture.spread;
+        if (ratio < PINCH_STEP && ratio > 1 / PINCH_STEP) return;
+        gesture.spread = spread();
+        this.#handler?.("zoom", { delta: ratio > 1 ? 1 : -1 });
+        return;
+      }
+      if (e.pointerId !== gesture.id) return;
+      const { start } = gesture;
+      if (gesture.kind === "pending" && Math.hypot(at.x - start.x, at.y - start.y) > TOUCH_SLOP) {
+        clearTimeout(gesture.timer);
+        gesture.kind = "scroll";
+        // Applications that read the mouse are told where the wheel turns.
+        pointer(start, 0);
+      }
+      // The text follows the finger: moving it up shows what comes after.
+      if (gesture.kind === "scroll") this.call("wheel", gesture.at.y - at.y, 0);
+      else if (gesture.kind === "select") pointer(at, 1);
+      gesture.at = at;
+    }, capture);
+
+    for (const type of ["pointerup", "pointercancel"]) {
+      this.#listen(container, type, (e) => {
+        if (!handles(e) || !touches.has(e.pointerId)) return;
+        e.stopPropagation();
+        touches.delete(e.pointerId);
+        const ended = gesture;
+        if (!ended) return;
+        const isFirst = e.pointerId === ended.id;
+        if (ended.kind !== "pinch" && ended.kind !== "over" && !isFirst) return;
+        stop();
+        // A finger left over from a pinch does not start to scroll.
+        gesture = touches.size > 0 ? { kind: "over" } : null;
+        if (ended.kind === "pending" && type === "pointerup") {
+          this.focus();
+          pointer(ended.at, 1);
+          pointer(ended.at, 0);
+        }
       }, capture);
     }
   }

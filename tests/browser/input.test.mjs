@@ -1,6 +1,6 @@
 // Keyboard and IME handling of the page-side client (web/public/molcajete.js),
-// and the keys and held modifiers a page sends for an on-screen keyboard, in
-// worker mode and in main-thread mode.
+// the keys and held modifiers a page sends for an on-screen keyboard, and
+// touch in terminals, in worker mode and in main-thread mode.
 //
 // Headless Chromium has no system IME, so the events a Korean IME produces are
 // driven over CDP: `keydown` with key "Process" plus composition updates when
@@ -21,6 +21,9 @@ const web = path.join(root, "web/public");
 
 const HANGUL = 0xff31;
 const CAPS_LOCK = 0xffe5;
+// Bits of the button mask of a `mouse` instruction.
+const LEFT = 1;
+const WHEEL_DOWN = 16;
 const CTRL = 0xffe3;
 const ALT = 0xffe9;
 const TAB = 0xff09;
@@ -39,7 +42,10 @@ async function open(mode) {
   page.on("pageerror", (e) => console.error("[pageerror]", e.message));
   await page.addInitScript(() => {
     window.sent = [];
+    window.mice = [];
+    window.zooms = [];
     const keyIns = /3\.key,\d+\.(\d+),1\.([01]);/g;
+    const mouseIns = /5\.mouse,\d+\.\d+,\d+\.\d+,\d+\.(\d+);/g;
     // Main-thread mode: `key` instructions on the tunnel.
     window.WebSocket = class {
       static OPEN = 1;
@@ -54,6 +60,8 @@ async function open(mode) {
       send(data) {
         for (const [, keysym, pressed] of data.matchAll(keyIns))
           window.sent.push(`${keysym} ${pressed === "1" ? "down" : "up"}`);
+        // The button mask of each `mouse` instruction.
+        for (const [, mask] of data.matchAll(mouseIns)) window.mice.push(Number(mask));
       }
       close() {}
     };
@@ -84,6 +92,8 @@ window.ready = true;
   send(data) {
     for (const [, keysym, pressed] of data.matchAll(/3\\.key,\\d+\\.(\\d+),1\\.([01]);/g))
       self.postMessage({ type: "event", event: "test-key", detail: keysym + (pressed === "1" ? " down" : " up") });
+    for (const [, mask] of data.matchAll(/5\\.mouse,\\d+\\.\\d+,\\d+\\.\\d+,\\d+\\.(\\d+);/g))
+      self.postMessage({ type: "event", event: "test-mouse", detail: Number(mask) });
   }
   close() {}
 };
@@ -100,6 +110,8 @@ ${source}`,
     window.session.set_event_handler((type, detail) => {
       if (type === "test-key") window.sent.push(detail);
       if (type === "modifiers") window.modifiers = detail;
+      if (type === "test-mouse") window.mice.push(detail);
+      if (type === "zoom") window.zooms.push(detail.delta);
     });
     window.session.connect("ws://guac.test/tunnel");
     await new Promise((r) => setTimeout(r, 300));
@@ -212,6 +224,74 @@ for (const mode of ["worker", "main"]) {
   assert.deepEqual(await sent(() => hold("alt", "off")), [`${ALT} up`]);
   assert.deepEqual(await held(), { ctrl: "off", alt: "off" });
   assert.deepEqual(await sent(() => hold("shift", "once")), [], `${mode}: only Ctrl and Alt can be held`);
+
+  // Touch in terminals: a drag scrolls, a finger that rests first selects, a
+  // tap clicks and takes the keyboard, two fingers change the text size.
+  const terminal = (enabled) => page.evaluate((e) => window.session.set_terminal_shortcuts(e), enabled);
+  const touch = (type, ...points) =>
+    cdp.send("Input.dispatchTouchEvent", { type, touchPoints: points.map(([x, y], id) => ({ x, y, id })) });
+  /** Runs `actions` and returns the button masks sent meanwhile. */
+  const mice = async (actions) => {
+    await page.evaluate(() => (window.mice = []));
+    await actions();
+    await page.waitForTimeout(100);
+    return page.evaluate(() => window.mice);
+  };
+  const drag = async () => {
+    await touch("touchStart", [100, 150]);
+    for (const y of [120, 90, 60, 30]) await touch("touchMove", [100, y]);
+    await touch("touchEnd");
+  };
+  // A display for the fingers to land on: the canvas has no size without one.
+  await page.evaluate(() => window.session.call("debug_feed", "4.size,1.0,3.200,3.200;4.sync,1.1;"));
+  await page.waitForFunction(() => document.querySelector("canvas").getBoundingClientRect().height === 200);
+  await terminal(true);
+  assert.deepEqual(
+    await mice(drag),
+    // The pointer goes to where the drag began, then the wheel turns there.
+    [0, WHEEL_DOWN, 0, WHEEL_DOWN, 0],
+    `${mode}: a drag of 120 px turns the wheel twice and holds no button`,
+  );
+  assert.deepEqual(
+    await mice(async () => {
+      await touch("touchStart", [100, 100]);
+      await page.waitForTimeout(650);
+      await touch("touchMove", [140, 100]);
+      await touch("touchEnd");
+    }),
+    [LEFT, LEFT, 0],
+    `${mode}: a finger that rests holds the button until it is lifted`,
+  );
+  await page.evaluate(() => document.activeElement.blur());
+  assert.deepEqual(
+    await mice(async () => {
+      await touch("touchStart", [100, 100]);
+      await touch("touchEnd");
+    }),
+    [LEFT, 0],
+    `${mode}: a tap clicks`,
+  );
+  assert.equal(await page.evaluate(() => document.activeElement.tagName), "TEXTAREA", `${mode}: a tap takes the keyboard`);
+  assert.deepEqual(
+    await mice(async () => {
+      await touch("touchStart", [100, 100]);
+      await touch("touchStart", [100, 100], [100, 140]);
+      // Each step is a change of the fingers' distance by 15%.
+      await touch("touchMove", [100, 100], [100, 150]);
+      await touch("touchMove", [100, 100], [100, 140]);
+      await touch("touchEnd");
+    }),
+    [],
+    `${mode}: two fingers press nothing`,
+  );
+  assert.deepEqual(await page.evaluate(() => window.zooms), [1, -1], `${mode}: a pinch out and in`);
+  // Anywhere else a finger stays the mouse it was: the button is down while it drags.
+  await terminal(false);
+  assert.deepEqual(
+    await mice(drag),
+    [LEFT, LEFT, LEFT, LEFT, LEFT, 0],
+    `${mode}: outside terminals a drag is a drag`,
+  );
 
   console.log(`ok - ${mode} mode`);
   await page.close();
