@@ -657,6 +657,31 @@ fn a_screen_that_cools_at_once_is_refined_over_several_flushes() {
 }
 
 #[test]
+fn difference_tells_a_new_picture_from_one_the_display_holds() {
+    let (mut d, _, _) = setup(8, 8);
+    let gray = [100u8, 100, 100, 255].repeat(64);
+    d.put(0, 0, 8, 8, &gray);
+    // The same picture again: nothing differs.
+    assert_eq!(d.difference(0, 0, 8, 8, &gray, 1), (64, 0, 0));
+    // The left half 50 brighter, the right half 4 brighter (noise).
+    let next: Vec<u8> = (0..64)
+        .flat_map(|i| {
+            let v = if i % 8 < 4 { 150 } else { 104 };
+            [v, v, v, 255]
+        })
+        .collect();
+    assert_eq!(
+        d.difference(0, 0, 8, 8, &next, 1),
+        (64, 32, 32 * 50 + 32 * 4)
+    );
+    // Every second pixel per axis is a quarter of them.
+    assert_eq!(d.difference(0, 0, 8, 8, &next, 2).0, 16);
+    // A rectangle outside the display, or too little data, compares nothing.
+    assert_eq!(d.difference(8, 0, 8, 8, &next, 1), (0, 0, 0));
+    assert_eq!(d.difference(0, 0, 8, 8, &next[..32], 1), (0, 0, 0));
+}
+
+#[test]
 fn sync_and_ack_track_lag() {
     let (mut d, _, mut out) = setup(4, 4);
     d.sync(&mut out);
