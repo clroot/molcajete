@@ -86,6 +86,9 @@ pub struct Bridge {
     clipboard: String,
     dirty: bool,
     dirty_since: Instant,
+    /// A `size` went out that no frame has ended yet. The client applies it
+    /// at the end of a frame, also when the resize changed no pixel.
+    resized: bool,
     /// SFTP, when the connection has it (`enable-sftp`).
     files: Option<Transfers>,
 }
@@ -112,6 +115,7 @@ impl Bridge {
             clipboard: String::new(),
             dirty: true,
             dirty_since: Instant::now(),
+            resized: false,
             files,
         };
         bridge.renderer.invalidate(size);
@@ -261,7 +265,8 @@ impl Bridge {
             let rows = renderer.render(terminal.term(), display);
             (rows, display.flush(writer.buffer()))
         });
-        if self.writer.pending() > before {
+        let resized = std::mem::take(&mut self.resized);
+        if self.writer.pending() > before || resized {
             self.display.sync(self.writer.buffer());
             debug!(
                 rows,
@@ -621,6 +626,7 @@ impl Bridge {
             return;
         }
         self.display.resize(width, height, self.writer.buffer());
+        self.resized = true;
         let size = self.renderer.grid_size(width, height);
         if size != self.terminal.size() {
             self.terminal.resize(size);
