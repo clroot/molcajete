@@ -138,7 +138,10 @@ For containers, Kubernetes and running molcajeted natively on macOS, see
 ## In a session
 
 Press **Ctrl+Alt+Shift** for the menu (files, clipboard, scaling,
-Ctrl+Alt+Del, performance statistics, disconnect). Drop files on the
+Ctrl+Alt+Del, performance statistics, disconnect). The statistics name
+the video codec in use (`av1`, `h265`, `h264`) and the formats of the
+images that arrived in the last second, next to frame rates, lag and round
+trip. Drop files on the
 session to upload them when the connection has SFTP or a drive. Append `?main` to the URL to run the
 client on the main thread instead of a worker, `?text` to keep the tunnel on
 the Guacamole text protocol (base64), and `?png` to receive lossless updates
