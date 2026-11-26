@@ -72,10 +72,10 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajeted_image_encode_seconds` | histogram | protocol, format | Encoding one image: `png`, `jpeg`, `zstd`. Images of a frame are encoded in parallel, so these add up to more than the `pixels` phase |
 | `molcajeted_image_encoded_bytes` | histogram | protocol, format | Size of one encoded image; many small images cost the client a decode each |
 | `molcajeted_image_bytes_total`, `molcajeted_image_pixels_total` | counter | protocol, format | Encoded size and pixels processed (compression efficiency) |
-| `molcajeted_video_streams_total` | counter | codec | Video mode starts (`av1`, `h265`, `h264`) |
+| `molcajeted_video_streams_total` | counter | codec, mode | Video mode starts (`av1`, `h265`, `h264`), over a busy area (`auto`) or the whole screen (`full-screen`) |
 | `molcajeted_video_failures_total` | counter | | Video encoder failures (after three in a session, video is off for it) |
-| `molcajeted_video_encode_seconds` | histogram | codec, key | Encoding one video frame, including the round trip to ffmpeg |
-| `molcajeted_video_frame_bytes` | histogram | codec, key | Video frame size |
+| `molcajeted_video_encode_seconds` | histogram | codec, mode, key | Encoding one video frame, including the round trip to ffmpeg |
+| `molcajeted_video_frame_bytes` | histogram | codec, mode, key | Video frame size |
 | `molcajeted_video_frames_skipped_total` | counter | codec | Video frames the encoder left out to hold its bitrate (VideoToolbox, on content far more expensive than the bitrate of its area) |
 | `molcajeted_video_bitrate_raises_total` | counter | codec | Times the bitrate of a video was doubled because its encoder left out a quarter of the frames or more |
 | `molcajeted_frames_total` | counter | protocol | Frames (`sync`) sent |
@@ -153,7 +153,9 @@ Both processes log to stdout. With `--log-format json`, every line is one JSON o
 | `connection closed` | molcajeted | `duration_s` |
 | `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `encoded_bytes`, `flush_ms_avg/max`, `scroll_ms_avg`, `moves_ms_avg`, `pixels_ms_avg`, `frame_images_max`, `scroll_copies`, `move_copies`, `client_ack_ms_avg/max`, `client_ack_wait_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*` (`images`, `bytes`, `ms_avg`, `ms_max`), `video_frames`, `video_bytes`, `video_encode_ms_avg/max` |
 | `pipeline frame decoded`, `pipeline frame content`, `pipeline frames drawn`, `frame sent`, `frame acknowledged` | molcajeted (debug) | The timeline of every RDP graphics pipeline frame, with `RUST_LOG=info,pprof=warn,molcajete_daemon::rdp=debug,molcajete_daemon::display=debug` (about five lines per frame). `decoded`: `messages`, `bytes`, `arrive_ms`, `queued_ms`, `decode_ms`, `total_ms` on the pipeline's thread. `content`: `regions`, `pixels`, and how much they differ from what the display held (`changed_share` of the pixels sampled, `mean_diff`), which tells a new picture from a refinement or a repeat of the last one. `drawn`: `results`, `frames`, `waited_ms` for the session loop, `due_in_ms`, `unacked`, `send`. `sent`: `images`, `bytes`, `flush_ms`. `acknowledged`: `ack_ms`, `waited_ms`, `apply_ms` |
-| `video mode started` | molcajeted | `codec`, `x`, `y`, `width`, `height`, `kbps` |
+| `video mode started` | molcajeted | `codec`, `mode` (`auto`, `full-screen`), `x`, `y`, `width`, `height`, `kbps` |
+| `client changed the video mode` | molcajeted | `mode`: the user turned full-screen video on or off in the session menu |
+| `full-screen video falls back to busy areas` | molcajeted | `width`, `height`, `reason`: no real-time encoder for the display size, or the encoder failed |
 | `video encoder failed` | molcajeted | `error`, `failures` |
 | `video encoders` | molcajeted | At startup: the encoders found per codec |
 | `RDP session active` | molcajeted | `width`, `height`, `fastpath_input`, `graphics_pipeline_offered` (false with `disable-gfx`, `force-lossless` or a colour depth below 32) |
