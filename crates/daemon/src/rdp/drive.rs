@@ -1,16 +1,26 @@
 //! The redirected drive's RDPDR backend: IronRDP's native filesystem
-//! backend, which serves a directory on this host without following
-//! symbolic links out of it, taught what xrdp needs besides Windows.
+//! backend for this platform, which serves a directory on this host
+//! without leaving it, taught what xrdp needs besides Windows.
 //!
-//! - The native backend answers directory queries only in the class Windows
-//!   uses (`FileBothDirectoryInformation`). xrdp asks for
+//! - On Linux and macOS, `NixRdpdrBackend` refuses symbolic links. It
+//!   answers directory queries only in the class Windows uses
+//!   (`FileBothDirectoryInformation`). xrdp asks for
 //!   `FileDirectoryInformation`, and other servers may ask for the full or
 //!   names-only classes ([MS-RDPEFS] 2.2.3.3.10 allows all four), so those
 //!   queries are answered by the native backend in the class it knows and
 //!   the entry rewritten into the one asked for.
+//! - On Windows, `WindowsRdpdrBackend` opens every path relative to the
+//!   root's handle without following reparse points (symbolic links,
+//!   junctions), and answers all four classes itself. It completes waiting
+//!   byte-range locks and directory change notifications on worker
+//!   threads; the session collects them with
+//!   [`RdpdrBackend::poll_deferred_messages`] (see
+//!   [`DriveBackend::DEFERS_COMPLETIONS`]).
 //! - xrdp separates path components with `/` when it opens files, where
-//!   Windows uses `\`; the native backend only takes `\`. A `/` cannot be
+//!   Windows uses `\`; both native backends only take `\`. A `/` cannot be
 //!   part of a Windows file name, so it is turned into `\`.
+
+use std::path::Path;
 
 use ironrdp_core::{ReadCursor, impl_as_any};
 use ironrdp_pdu::PduResult;
@@ -25,22 +35,35 @@ use ironrdp_rdpdr::pdu::efs::{
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_rdpdr::pdu::esp::PortIoRequest;
 use ironrdp_rdpdr::{Rdpdr, RdpdrBackend};
-use ironrdp_rdpdr_native::backend::NixRdpdrBackend;
+#[cfg(windows)]
+use ironrdp_rdpdr_native::WindowsRdpdrBackend as NativeBackend;
+#[cfg(not(windows))]
+use ironrdp_rdpdr_native::backend::NixRdpdrBackend as NativeBackend;
 use ironrdp_svc::SvcMessage;
+
+/// Whether the native backend answers directory queries only in
+/// `FileBothDirectoryInformation`.
+const ONLY_BOTH_DIRECTORY_CLASS: bool = !cfg!(windows);
 
 #[derive(Debug)]
 pub struct DriveBackend {
-    native: NixRdpdrBackend,
+    native: NativeBackend,
 }
 
 impl_as_any!(DriveBackend);
 
 impl DriveBackend {
-    /// Serves the directory `root`.
-    pub fn new(root: String) -> Self {
-        Self {
-            native: NixRdpdrBackend::new(root),
-        }
+    /// Whether the backend completes some requests later, from other
+    /// threads, so that its deferred messages must be polled.
+    pub const DEFERS_COMPLETIONS: bool = cfg!(windows);
+
+    /// Serves the directory `root` as the drive `device_id`, announced as
+    /// `name`. `root` must be an existing directory, resolved; on Windows,
+    /// on a drive letter, without the `\\?\` prefix.
+    pub fn new(device_id: u32, name: &str, root: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            native: native_backend(device_id, name, root)?,
+        })
     }
 
     /// Answers a directory query in another class than the native
@@ -59,6 +82,19 @@ impl DriveBackend {
             .map(|message| convert(&message, &wanted).unwrap_or(message))
             .collect())
     }
+}
+
+#[cfg(not(windows))]
+fn native_backend(_device_id: u32, _name: &str, root: &Path) -> std::io::Result<NativeBackend> {
+    Ok(NativeBackend::new(root.to_string_lossy().into_owned()))
+}
+
+#[cfg(windows)]
+fn native_backend(device_id: u32, name: &str, root: &Path) -> std::io::Result<NativeBackend> {
+    use ironrdp_rdpdr_native::{RedirectedDrive, WindowsRdpdrBackendFactory};
+    let drive = RedirectedDrive::new(device_id, name, root, false)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    Ok(WindowsRdpdrBackendFactory::new(drive).build())
 }
 
 /// The directory query response `message` with its entry in the class
@@ -191,12 +227,13 @@ impl RdpdrBackend for DriveBackend {
     fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
         match windows_separators(req) {
             ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(request)
-                if matches!(
-                    request.file_info_class_lvl,
-                    FileInformationClassLevel::FILE_DIRECTORY_INFORMATION
-                        | FileInformationClassLevel::FILE_FULL_DIRECTORY_INFORMATION
-                        | FileInformationClassLevel::FILE_NAMES_INFORMATION
-                ) =>
+                if ONLY_BOTH_DIRECTORY_CLASS
+                    && matches!(
+                        request.file_info_class_lvl,
+                        FileInformationClassLevel::FILE_DIRECTORY_INFORMATION
+                            | FileInformationClassLevel::FILE_FULL_DIRECTORY_INFORMATION
+                            | FileInformationClassLevel::FILE_NAMES_INFORMATION
+                    ) =>
             {
                 let wanted = request.file_info_class_lvl.clone();
                 self.query_directory_as(request, wanted)
