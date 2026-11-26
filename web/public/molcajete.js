@@ -619,6 +619,30 @@ export class MolcajeteSession {
     this.call("send_ctrl_alt_del");
   }
 
+  /**
+   * Presses and releases a key the page offers as a button, because an
+   * on-screen keyboard has no Tab, Esc or arrow keys. It goes out with the
+   * modifiers held by `hold_modifier`.
+   */
+  press_key(keysym) {
+    this.call("press_key", keysym);
+  }
+
+  /**
+   * Holds `"ctrl"` or `"alt"` as if its key were down: `"once"` until the
+   * next key has gone out, from a button or from the keyboard, `"locked"`
+   * until it is turned `"off"`. Every change, the release after a key
+   * included, arrives as a `modifiers` event (`{ctrl, alt}`).
+   */
+  hold_modifier(name, hold) {
+    this.call("hold_modifier", name, hold);
+  }
+
+  /** Pastes text into a terminal, as its paste shortcut does. */
+  paste_text(text) {
+    this.call("paste_text", text);
+  }
+
   set_scale_mode(mode) {
     this.call("set_scale_mode", mode);
   }

@@ -25,7 +25,7 @@ use crate::audio::{RawAudioPlayer, RawFormat};
 use crate::display::{DisplayEvent, DrawOp, ImageSlot, ImageState, Op, QueuedImage};
 use crate::geom::Rect;
 use crate::gl::CanvasTarget;
-use crate::input::{self, Composition, Keyboard, WheelAccumulator};
+use crate::input::{self, Composition, HeldModifiers, Hold, Keyboard, WheelAccumulator};
 use crate::scope;
 use crate::tunnel::{Tunnel, TunnelHandlers, TunnelMessage};
 use crate::{display::Display, gl::Renderer};
@@ -222,6 +222,8 @@ pub struct Inner {
     /// Output streams of uploads (see [`Inner::open_upload`]).
     uploads: Vec<i32>,
     keyboard: Keyboard,
+    /// Ctrl and Alt held from the page (see [`Inner::hold_modifier`]).
+    held: HeldModifiers,
     wheel: WheelAccumulator,
     mouse: (i32, i32, MouseButtons),
     last_sync_ack: Option<i64>,
@@ -391,6 +393,7 @@ impl Inner {
                 next_out_stream: 0,
                 uploads: Vec::new(),
                 keyboard: Keyboard::default(),
+                held: HeldModifiers::default(),
                 wheel: WheelAccumulator::default(),
                 mouse: (0, 0, MouseButtons::default()),
                 last_sync_ack: None,
@@ -659,7 +662,12 @@ impl Inner {
     }
 
     fn disconnect_internal(&mut self, farewell: Option<&str>) {
-        let releases = self.keyboard.release_all();
+        let mut releases = self.keyboard.release_all();
+        let held = self.held.release_all();
+        if !held.is_empty() {
+            self.emit_modifiers();
+        }
+        releases.extend(held);
         if let Some(tunnel) = self.tunnel.take() {
             for (keysym, pressed) in releases {
                 tunnel.send(
@@ -1572,7 +1580,7 @@ impl Inner {
         self.send_clipboard(text);
         let mut keys = Vec::new();
         for (left, right) in [(CONTROL_L, CONTROL_R), (SHIFT_L, SHIFT_R)] {
-            if !self.keyboard.is_down(&[left, right]) {
+            if !self.keyboard.is_down(&[left, right]) && !self.held.is_held(left) {
                 keys.push(left);
             }
         }
@@ -1729,13 +1737,71 @@ impl Inner {
             .key_down(key, code, location, composing, caps_lock)
         {
             Some(events) => {
+                let mut typed = false;
                 for (keysym, pressed) in events {
                     self.send_key(keysym, pressed);
+                    typed |= pressed && !input::keysym::is_modifier(keysym);
+                }
+                if typed {
+                    self.release_held_once();
                 }
                 true
             }
             None => false,
         }
+    }
+
+    /// Holds Ctrl or Alt (`name`: `ctrl`, `alt`) as if its key were down,
+    /// for devices whose keyboard has neither: `once` until the next key
+    /// has gone out, `locked` until it is turned `off`. The page hears of
+    /// every change, the release after a key included, as a `modifiers`
+    /// event (`{ctrl, alt}`).
+    pub fn hold_modifier(&mut self, name: &str, hold: &str) {
+        let Some(hold) = Hold::parse(hold) else {
+            return;
+        };
+        // Nothing can be held without a connection to hold it on.
+        if hold != Hold::Off && !self.is_connected() {
+            return;
+        }
+        let before = (self.held.ctrl(), self.held.alt());
+        let Some(events) = self.held.set(name, hold) else {
+            return;
+        };
+        for (keysym, pressed) in events {
+            self.send_key(keysym, pressed);
+        }
+        if before != (self.held.ctrl(), self.held.alt()) {
+            self.emit_modifiers();
+        }
+    }
+
+    /// Presses and releases a key that the page offers as a button, with
+    /// the modifiers held by [`Inner::hold_modifier`].
+    pub fn press_key(&mut self, keysym: u32) {
+        self.send_key(keysym, true);
+        self.send_key(keysym, false);
+        self.release_held_once();
+    }
+
+    /// Releases the modifiers that were held for the key that just went out.
+    fn release_held_once(&mut self) {
+        let releases = self.held.after_key();
+        if releases.is_empty() {
+            return;
+        }
+        for (keysym, pressed) in releases {
+            self.send_key(keysym, pressed);
+        }
+        self.emit_modifiers();
+    }
+
+    fn emit_modifiers(&mut self) {
+        let detail = object(&[
+            ("ctrl", JsValue::from_str(self.held.ctrl().as_str())),
+            ("alt", JsValue::from_str(self.held.alt().as_str())),
+        ]);
+        self.emit("modifiers", detail);
     }
 
     pub fn key_up(&mut self, key: &str, code: &str, location: u32, caps_lock: bool) -> bool {
@@ -1800,6 +1866,10 @@ impl Inner {
         if !self.composes_remotely() {
             for (keysym, pressed) in input::type_text(text) {
                 self.send_key(keysym, pressed);
+                // A modifier held for one key applies to the first character.
+                if !pressed {
+                    self.release_held_once();
+                }
             }
         }
         if let Some(dom) = &self.dom {

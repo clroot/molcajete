@@ -182,6 +182,117 @@ impl Keyboard {
     }
 }
 
+/// How long a modifier pressed from the page stays down.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// Not held.
+    #[default]
+    Off,
+    /// Held for the next key, then released.
+    Once,
+    /// Held until it is turned off.
+    Locked,
+}
+
+impl Hold {
+    pub fn parse(hold: &str) -> Option<Self> {
+        Some(match hold {
+            "off" => Self::Off,
+            "once" => Self::Once,
+            "locked" => Self::Locked,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Once => "once",
+            Self::Locked => "locked",
+        }
+    }
+}
+
+/// Ctrl and Alt held with a button of the page instead of a key: an
+/// on-screen keyboard has neither, so the page holds one for the next key
+/// typed, or until it is turned off.
+#[derive(Default)]
+pub struct HeldModifiers {
+    ctrl: Hold,
+    alt: Hold,
+}
+
+impl HeldModifiers {
+    fn slot(&mut self, name: &str) -> Option<(&mut Hold, u32)> {
+        match name {
+            "ctrl" => Some((&mut self.ctrl, keysym::CONTROL_L)),
+            "alt" => Some((&mut self.alt, keysym::ALT_L)),
+            _ => None,
+        }
+    }
+
+    /// Sets how the modifier `name` (`ctrl` or `alt`) is held. Returns
+    /// the press or release that makes the remote side follow, or `None`
+    /// for a name that is not one of the two.
+    pub fn set(&mut self, name: &str, hold: Hold) -> Option<Vec<KeyEvent>> {
+        let (slot, keysym) = self.slot(name)?;
+        let was_held = std::mem::replace(slot, hold) != Hold::Off;
+        let is_held = hold != Hold::Off;
+        Some(if was_held == is_held {
+            Vec::new()
+        } else {
+            vec![(keysym, is_held)]
+        })
+    }
+
+    pub fn ctrl(&self) -> Hold {
+        self.ctrl
+    }
+
+    pub fn alt(&self) -> Hold {
+        self.alt
+    }
+
+    /// Whether the modifier with this keysym is held.
+    pub fn is_held(&self, keysym: u32) -> bool {
+        match keysym {
+            keysym::CONTROL_L => self.ctrl != Hold::Off,
+            keysym::ALT_L => self.alt != Hold::Off,
+            _ => false,
+        }
+    }
+
+    /// A key went out with the held modifiers: returns the releases of
+    /// those that were held for one key.
+    pub fn after_key(&mut self) -> Vec<KeyEvent> {
+        let mut events = Vec::new();
+        for (slot, keysym) in [
+            (&mut self.ctrl, keysym::CONTROL_L),
+            (&mut self.alt, keysym::ALT_L),
+        ] {
+            if *slot == Hold::Once {
+                *slot = Hold::Off;
+                events.push((keysym, false));
+            }
+        }
+        events
+    }
+
+    /// Releases both (on disconnect).
+    pub fn release_all(&mut self) -> Vec<KeyEvent> {
+        let mut events = Vec::new();
+        for (slot, keysym) in [
+            (&mut self.ctrl, keysym::CONTROL_L),
+            (&mut self.alt, keysym::ALT_L),
+        ] {
+            if std::mem::take(slot) != Hold::Off {
+                events.push((keysym, false));
+            }
+        }
+        events
+    }
+}
+
 /// Events needed to type text (from IME composition) on the remote side.
 pub fn type_text(text: &str) -> Vec<KeyEvent> {
     let mut events = Vec::with_capacity(text.len() * 2);
@@ -262,6 +373,53 @@ mod tests {
         // Shift is up now, but the release must still be "A".
         assert_eq!(kb.key_up("a", "KeyA", 0, false), vec![('A' as u32, false)]);
         assert!(!kb.any_pressed());
+    }
+
+    #[test]
+    fn held_modifier_is_released_after_one_key() {
+        let mut held = HeldModifiers::default();
+        assert_eq!(
+            held.set("ctrl", Hold::Once),
+            Some(vec![(keysym::CONTROL_L, true)])
+        );
+        assert!(held.is_held(keysym::CONTROL_L));
+        assert_eq!(held.after_key(), vec![(keysym::CONTROL_L, false)]);
+        assert_eq!(held.ctrl(), Hold::Off);
+        // Nothing is held any more, so the next key releases nothing.
+        assert_eq!(held.after_key(), Vec::new());
+    }
+
+    #[test]
+    fn locked_modifier_stays_until_turned_off() {
+        let mut held = HeldModifiers::default();
+        assert_eq!(
+            held.set("alt", Hold::Once),
+            Some(vec![(keysym::ALT_L, true)])
+        );
+        // Locking a modifier that is already down sends nothing.
+        assert_eq!(held.set("alt", Hold::Locked), Some(Vec::new()));
+        assert_eq!(held.after_key(), Vec::new());
+        assert_eq!(held.alt(), Hold::Locked);
+        assert_eq!(
+            held.set("alt", Hold::Off),
+            Some(vec![(keysym::ALT_L, false)])
+        );
+        assert_eq!(held.set("shift", Hold::Once), None);
+    }
+
+    #[test]
+    fn held_modifiers_are_released_together() {
+        let mut held = HeldModifiers::default();
+        held.set("ctrl", Hold::Locked);
+        held.set("alt", Hold::Once);
+        assert_eq!(
+            held.release_all(),
+            vec![(keysym::CONTROL_L, false), (keysym::ALT_L, false)]
+        );
+        assert_eq!((held.ctrl(), held.alt()), (Hold::Off, Hold::Off));
+        assert_eq!(Hold::parse("locked"), Some(Hold::Locked));
+        assert_eq!(Hold::parse("held"), None);
+        assert_eq!(Hold::Once.as_str(), "once");
     }
 
     #[test]

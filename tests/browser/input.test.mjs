@@ -1,5 +1,6 @@
 // Keyboard and IME handling of the page-side client (web/public/molcajete.js),
-// in worker mode and in main-thread mode.
+// and the keys and held modifiers a page sends for an on-screen keyboard, in
+// worker mode and in main-thread mode.
 //
 // Headless Chromium has no system IME, so the events a Korean IME produces are
 // driven over CDP: `keydown` with key "Process" plus composition updates when
@@ -20,6 +21,9 @@ const web = path.join(root, "web/public");
 
 const HANGUL = 0xff31;
 const CAPS_LOCK = 0xffe5;
+const CTRL = 0xffe3;
+const ALT = 0xffe9;
+const TAB = 0xff09;
 const tap = (keysym) => [`${keysym} down`, `${keysym} up`];
 const typed = (text) => [...text].flatMap((c) => tap(c.codePointAt(0)));
 const hangul = (c) => 0x01000000 | c.codePointAt(0);
@@ -95,6 +99,7 @@ ${source}`,
   await page.evaluate(async () => {
     window.session.set_event_handler((type, detail) => {
       if (type === "test-key") window.sent.push(detail);
+      if (type === "modifiers") window.modifiers = detail;
     });
     window.session.connect("ws://guac.test/tunnel");
     await new Promise((r) => setTimeout(r, 300));
@@ -174,6 +179,39 @@ for (const mode of ["worker", "main"]) {
   assert.equal(await page.evaluate(() => document.querySelector("textarea").readOnly), false);
   assert.deepEqual(await sent(() => compose("KeyG", "ㅎ")), []);
   assert.deepEqual(await sent(() => cdp.send("Input.insertText", { text: "ㅎ" })), tap(hangul("ㅎ")));
+
+  // Modifiers held from the page (the terminal key bar on a phone): for the
+  // next key, whether it is typed or comes from a button, or until turned off.
+  const hold = (name, how) => page.evaluate(([n, h]) => window.session.hold_modifier(n, h), [name, how]);
+  const pressKey = (keysym) => page.evaluate((k) => window.session.press_key(k), keysym);
+  const held = () => page.evaluate(() => window.modifiers);
+  assert.deepEqual(await sent(() => hold("ctrl", "once")), [`${CTRL} down`], `${mode}: Ctrl is held`);
+  assert.deepEqual(await held(), { ctrl: "once", alt: "off" });
+  assert.deepEqual(
+    await sent(() => press("c", "KeyC")),
+    ["99 down", `${CTRL} up`, "99 up"],
+    `${mode}: Ctrl is let go after the key it was held for`,
+  );
+  assert.deepEqual(await held(), { ctrl: "off", alt: "off" });
+  // Text from an on-screen keyboard: the modifier goes with its first character.
+  await hold("ctrl", "once");
+  assert.deepEqual(
+    await sent(() => cdp.send("Input.insertText", { text: "ab" })),
+    [...typed("a"), `${CTRL} up`, ...typed("b")],
+    `${mode}: Ctrl applies to the first character of typed text`,
+  );
+  // A key of the bar takes the held modifier with it as well.
+  await hold("ctrl", "once");
+  assert.deepEqual(await sent(() => pressKey(TAB)), [...tap(TAB), `${CTRL} up`]);
+  // A locked modifier stays down until it is turned off.
+  assert.deepEqual(await sent(() => hold("alt", "once")), [`${ALT} down`]);
+  assert.deepEqual(await sent(() => hold("alt", "locked")), [], `${mode}: locking sends nothing more`);
+  assert.deepEqual(await sent(() => pressKey(TAB)), tap(TAB));
+  assert.deepEqual(await sent(() => press("b", "KeyB")), typed("b"));
+  assert.deepEqual(await held(), { ctrl: "off", alt: "locked" });
+  assert.deepEqual(await sent(() => hold("alt", "off")), [`${ALT} up`]);
+  assert.deepEqual(await held(), { ctrl: "off", alt: "off" });
+  assert.deepEqual(await sent(() => hold("shift", "once")), [], `${mode}: only Ctrl and Alt can be held`);
 
   console.log(`ok - ${mode} mode`);
   await page.close();
