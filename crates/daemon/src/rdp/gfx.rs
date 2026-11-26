@@ -47,7 +47,7 @@ use ironrdp_egfx::pdu::{
 use ironrdp_pdu::PduResult;
 use metrics::{Counter, Histogram, counter, histogram};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::display::Display;
 use crate::video::PipelineDecoder;
@@ -342,12 +342,16 @@ pub struct Decoded {
     pub replies: Result<Vec<DvcMessage>, String>,
     /// The frames the message completed.
     pub frames: Option<Frames>,
+    /// When the thread was done with the message.
+    pub decoded_at: Instant,
 }
 
 /// A message of the channel, for the decoding thread.
 struct Job {
     channel_id: u32,
     payload: Vec<u8>,
+    /// When the session handed it over.
+    received: Instant,
 }
 
 /// The graphics pipeline's dynamic channel.
@@ -407,6 +411,10 @@ impl GraphicsChannel {
     }
 }
 
+fn ms(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 10_000.0).round() / 10.0
+}
+
 /// The decoding thread: runs the client for every message, in order, until
 /// the channel is dropped or the session no longer listens.
 fn decode_messages(
@@ -415,20 +423,47 @@ fn decode_messages(
     closed: &AtomicBool,
     results: &UnboundedSender<Decoded>,
 ) {
+    // The messages since the last frame was handed over, for the log: when
+    // the first one arrived, how many and how large, and the time spent on
+    // them.
+    let mut first_received = None;
+    let (mut messages, mut bytes, mut busy) = (0u32, 0usize, Duration::ZERO);
     for Job {
         channel_id,
         payload,
+        received,
     } in queue
     {
         if closed.load(Ordering::Acquire) {
             continue;
         }
+        let started = Instant::now();
         let mut pipeline = pipeline.lock().unwrap_or_else(PoisonError::into_inner);
         let replies = pipeline
             .process(channel_id, &payload)
             .map_err(|err| format!("{err:#}"));
         let frames = pipeline.take_frames();
         drop(pipeline);
+        let decoded_at = Instant::now();
+        let first = *first_received.get_or_insert(received);
+        messages += 1;
+        bytes += payload.len();
+        busy += decoded_at - started;
+        if frames.is_some() {
+            debug!(
+                messages,
+                bytes,
+                // From the frame's first message to its last.
+                arrive_ms = ms(received - first),
+                // The last message waited this long for the thread.
+                queued_ms = ms(started.saturating_duration_since(received)),
+                decode_ms = ms(busy),
+                total_ms = ms(decoded_at - first),
+                "pipeline frame decoded"
+            );
+            first_received = None;
+            (messages, bytes, busy) = (0, 0, Duration::ZERO);
+        }
         // A channel closed meanwhile takes no replies any more.
         if closed.load(Ordering::Acquire) {
             continue;
@@ -437,6 +472,7 @@ fn decode_messages(
             channel_id,
             replies,
             frames,
+            decoded_at,
         };
         if results.send(decoded).is_err() {
             return;
@@ -461,6 +497,7 @@ impl DvcProcessor for GraphicsChannel {
         let job = Job {
             channel_id,
             payload: payload.to_vec(),
+            received: Instant::now(),
         };
         // The thread only ends early when the session is gone.
         let _ = self.jobs.send(job);
