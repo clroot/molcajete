@@ -582,3 +582,223 @@ impl PduHint for RdCleanPathHint {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_pdu::nego::RequestFlags;
+    use ironrdp_pdu::rdp::client_info::{
+        AddressFamily, ClientInfo as RdpClientInfo, CompressionType,
+        Credentials as InfoCredentials, ExtendedClientInfo, ExtendedClientOptionalInfo,
+    };
+    use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+
+    use super::*;
+
+    fn settings(pairs: &[(&str, &str)]) -> Settings {
+        struct Pairs<'a>(&'a [(&'a str, &'a str)]);
+        impl crate::rdp::settings::ParamSource for Pairs<'_> {
+            fn value(&self, name: &str) -> Option<&str> {
+                self.0.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+            }
+        }
+        Settings::parse(&Pairs(pairs), &ClientInfo::default()).unwrap()
+    }
+
+    fn one_time() -> OneTime {
+        OneTime {
+            username: "relay-7f3a".to_owned(),
+            password: "one-time".to_owned(),
+        }
+    }
+
+    fn client_info_pdu(username: &str, password: &str) -> Vec<u8> {
+        let info = ClientInfoPdu {
+            security_header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::INFO_PKT,
+            },
+            client_info: RdpClientInfo {
+                credentials: InfoCredentials {
+                    username: username.to_owned(),
+                    password: password.to_owned(),
+                    domain: None,
+                },
+                password_cookie: None,
+                code_page: 0,
+                flags: ClientInfoFlags::UNICODE | ClientInfoFlags::MOUSE,
+                compression_type: CompressionType::K8,
+                alternate_shell: String::new(),
+                work_dir: String::new(),
+                extra_info: ExtendedClientInfo {
+                    address_family: AddressFamily::INET,
+                    address: "127.0.0.1".to_owned(),
+                    dir: "C:\\".to_owned(),
+                    optional_data: ExtendedClientOptionalInfo::default(),
+                },
+            },
+        };
+        let request = SendDataRequest {
+            initiator_id: 1007,
+            channel_id: 1003,
+            user_data: encode_vec(&info).unwrap().into(),
+        };
+        encode_vec(&X224(request)).unwrap()
+    }
+
+    fn decode_info(pdu: &[u8]) -> (u16, u16, RdpClientInfo) {
+        let X224(data) = decode::<X224<SendDataRequest<'_>>>(pdu).unwrap();
+        let info = decode::<ClientInfoPdu>(&data.user_data).unwrap();
+        (data.initiator_id, data.channel_id, info.client_info)
+    }
+
+    #[test]
+    fn client_info_gets_the_stored_credentials() {
+        let settings = settings(&[
+            ("username", "Administrator"),
+            ("password", "a much longer stored password"),
+            ("domain", "CORP"),
+        ]);
+        let pdu = client_info_pdu("relay-7f3a", "one-time");
+        let rewritten = rewrite_client_info(&pdu, &settings, &one_time())
+            .unwrap()
+            .expect("a Client Info PDU");
+        let (initiator, channel, info) = decode_info(&rewritten);
+        assert_eq!((initiator, channel), (1007, 1003));
+        assert_eq!(info.credentials.username, "Administrator");
+        assert_eq!(info.credentials.password, "a much longer stored password");
+        assert_eq!(info.credentials.domain.as_deref(), Some("CORP"));
+        assert!(info.flags.contains(ClientInfoFlags::AUTOLOGON));
+        // The lengths in the TPKT and MCS headers follow the new size.
+        assert!(rewritten.len() > pdu.len());
+        assert_eq!(
+            usize::from(u16::from_be_bytes([rewritten[2], rewritten[3]])),
+            rewritten.len()
+        );
+    }
+
+    #[test]
+    fn without_a_stored_password_the_server_shows_its_login() {
+        let settings = settings(&[("username", "Administrator")]);
+        let pdu = client_info_pdu("relay-7f3a", "one-time");
+        let rewritten = rewrite_client_info(&pdu, &settings, &one_time())
+            .unwrap()
+            .unwrap();
+        let (_, _, info) = decode_info(&rewritten);
+        assert_eq!(info.credentials.username, "Administrator");
+        assert_eq!(info.credentials.password, "");
+        assert!(!info.flags.contains(ClientInfoFlags::AUTOLOGON));
+    }
+
+    #[test]
+    fn client_info_of_another_user_is_refused() {
+        let settings = settings(&[("username", "Administrator"), ("password", "secret")]);
+        let pdu = client_info_pdu("someone-else", "guess");
+        let err = rewrite_client_info(&pdu, &settings, &one_time()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn other_pdus_pass_unchanged() {
+        let settings = settings(&[("username", "Administrator")]);
+        let request = SendDataRequest {
+            initiator_id: 1007,
+            channel_id: 1004,
+            user_data: vec![1, 2, 3, 4, 5, 6, 7, 8].into(),
+        };
+        let pdu = encode_vec(&X224(request)).unwrap();
+        assert!(
+            rewrite_client_info(&pdu, &settings, &one_time())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            rewrite_client_info(&[3, 0, 0, 7, 2, 0xf0, 0x80], &settings, &one_time())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn browser_request() -> Vec<u8> {
+        encode_vec(&X224(ConnectionRequest {
+            nego_data: Some(NegoRequestData::cookie("relay-7f3a".to_owned())),
+            flags: RequestFlags::empty(),
+            protocol: SecurityProtocol::SSL
+                | SecurityProtocol::HYBRID
+                | SecurityProtocol::HYBRID_EX,
+            correlation_info: None,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn server_request_follows_the_security_setting() {
+        let request =
+            server_request(&browser_request(), &settings(&[("username", "Admin")])).unwrap();
+        assert_eq!(
+            request.protocol,
+            SecurityProtocol::SSL | SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX
+        );
+        // The cookie names the stored user, not the one-time one.
+        assert_eq!(
+            request.nego_data,
+            Some(NegoRequestData::cookie("Admin".to_owned()))
+        );
+
+        let tls = server_request(&browser_request(), &settings(&[("security", "tls")])).unwrap();
+        assert_eq!(tls.protocol, SecurityProtocol::SSL);
+        assert_eq!(tls.nego_data, None);
+
+        let nla = server_request(&browser_request(), &settings(&[("security", "nla")])).unwrap();
+        assert_eq!(
+            nla.protocol,
+            SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX
+        );
+    }
+
+    #[test]
+    fn server_request_needs_a_common_protocol() {
+        let only_tls = encode_vec(&X224(ConnectionRequest {
+            nego_data: None,
+            flags: RequestFlags::empty(),
+            protocol: SecurityProtocol::SSL,
+            correlation_info: None,
+        }))
+        .unwrap();
+        assert!(server_request(&only_tls, &settings(&[("security", "nla")])).is_err());
+        assert!(server_request(b"not x224", &settings(&[])).is_err());
+    }
+
+    #[test]
+    fn rdcleanpath_hint_finds_the_request() {
+        let pdu = RDCleanPathPdu::new_request(
+            vec![1, 2, 3],
+            "host:3389".to_owned(),
+            "t".to_owned(),
+            None,
+        )
+        .unwrap()
+        .to_der()
+        .unwrap();
+        // Known as soon as the header and the version are there.
+        for cut in 0..pdu.len() {
+            let size = RDCLEANPATH_HINT.find_size(&pdu[..cut]).unwrap();
+            assert!(
+                size.is_none() || size == Some((true, pdu.len())),
+                "cut at {cut}"
+            );
+        }
+        assert_eq!(
+            RDCLEANPATH_HINT.find_size(&pdu).unwrap(),
+            Some((true, pdu.len()))
+        );
+        assert!(RDCLEANPATH_HINT.find_size(&[3, 0, 0, 19, 14]).is_err());
+    }
+
+    #[test]
+    fn certificate_key_matches_its_certificate() {
+        let certificate = certificate().unwrap();
+        assert_eq!(
+            tls::public_key(&certificate.der).unwrap(),
+            certificate.public_key
+        );
+    }
+}
