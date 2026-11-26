@@ -24,7 +24,7 @@ import CredentialsDialog from './CredentialsDialog';
 import SessionMenu, {type ScaleMode} from './SessionMenu';
 import SessionMenuButton from './SessionMenuButton';
 import TerminalKeyBar from './TerminalKeyBar';
-import {showsKeyBar} from './keyBar';
+import {isKeyboardOpen, showsKeyBar} from './keyBar';
 import {useVisibleFrame} from './useVisibleFrame';
 import SessionGuide from './SessionGuide';
 import {readPreference, writePreference} from './storage';
@@ -238,6 +238,17 @@ export default function SessionPage({connectionId, ticket}: Props) {
   const isConnected = status.kind === 'connected';
   const hasKeyBar = wantsKeyBar && isConnected;
   const visibleFrame = useVisibleFrame(hasKeyBar);
+  const keyboardOpen = visibleFrame !== null && isKeyboardOpen(visibleFrame.height, window.innerHeight);
+  // The keyboard opens for the input sink when it takes focus within a tap,
+  // and closes when it loses focus.
+  const toggleKeyboard = () => {
+    const focused = document.activeElement;
+    const isSinkFocused = focused instanceof HTMLElement && displayRef.current?.contains(focused) === true;
+    if (isSinkFocused) focused.blur();
+    // Android's Back key closes the keyboard and leaves the input focused,
+    // and focusing it again does not reopen it: it has to lose focus first.
+    if (!keyboardOpen) client()?.focus();
+  };
 
   const canPaste = !restrictions.disablePaste && !restrictions.readOnly;
   const paste = async () => {
@@ -287,6 +298,8 @@ export default function SessionPage({connectionId, ticket}: Props) {
             onKey={keysym => client()?.press_key(keysym)}
             onPaste={canPaste ? paste : null}
             onOpenMenu={() => setMenuOpen(true)}
+            isKeyboardOpen={keyboardOpen}
+            onToggleKeyboard={toggleKeyboard}
             link={session.link}
           />
         )}

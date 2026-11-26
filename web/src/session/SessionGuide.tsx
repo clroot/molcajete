@@ -65,8 +65,8 @@ function TouchWays({hasLinks}: {hasLinks: boolean}) {
       <Way lead={<Icon icon={ArrowsPointingOutIcon} />}>Pinch to make the text smaller or larger.</Way>
       {hasLinks && <Way lead={<Icon icon={LinkIcon} />}>Tap a link, then Open, to open it in a new tab.</Way>}
       <Way lead={<Icon icon={Bars3Icon} />}>
-        The bar under the terminal has Esc, Tab, Ctrl and the arrow keys. Its last button opens the session
-        menu.
+        The bar under the terminal has Esc, Tab, Ctrl and the arrow keys. Its last two buttons show or hide
+        the keyboard and open the session menu.
       </Way>
     </VStack>
   );

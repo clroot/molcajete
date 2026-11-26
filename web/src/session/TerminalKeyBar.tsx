@@ -21,6 +21,7 @@ import {
 import type {HeldModifiers, Hold} from './client';
 import {KEYSYM, SYMBOLS, nextHold} from './keyBar';
 import {isOpenableLink} from './terminal';
+import KeyboardIcon from './KeyboardIcon';
 
 /** How long an arrow is held before it repeats, and how often it then does. */
 const REPEAT_DELAY_MS = 400;
@@ -44,6 +45,10 @@ type Props = {
   /** Pastes into the terminal; `null` when the connection does not allow it. */
   onPaste: (() => void) | null;
   onOpenMenu: () => void;
+  /** Whether the on-screen keyboard is open. */
+  isKeyboardOpen: boolean;
+  /** Opens the on-screen keyboard, or closes it while it is open. */
+  onToggleKeyboard: () => void;
   /** Target of the link that was tapped in the terminal, or `null`. */
   link: string | null;
 };
@@ -125,7 +130,16 @@ function ArrowKey({label, icon, onPress}: {label: string; icon: typeof ArrowLeft
  * The keys an on-screen keyboard lacks, in a bar under the terminal: above
  * the keyboard while it is open, at the bottom of the window otherwise.
  */
-export default function TerminalKeyBar({modifiers, onHold, onKey, onPaste, onOpenMenu, link}: Props) {
+export default function TerminalKeyBar({
+  modifiers,
+  onHold,
+  onKey,
+  onPaste,
+  onOpenMenu,
+  isKeyboardOpen,
+  onToggleKeyboard,
+  link,
+}: Props) {
   const key = (label: string, keysym: number) => (
     <Button key={label} label={label} size="lg" variant="ghost" onClick={() => onKey(keysym)} />
   );
@@ -173,6 +187,15 @@ export default function TerminalKeyBar({modifiers, onHold, onKey, onPaste, onOpe
               {key('PgDn', KEYSYM.pageDown)}
             </HStack>
           </ScrollableArea>
+          {/* Out of the strip, so that it never scrolls out of view. */}
+          <ToggleButton
+            label={isKeyboardOpen ? 'Hide keyboard' : 'Show keyboard'}
+            size="lg"
+            isIconOnly
+            isPressed={isKeyboardOpen}
+            onPressedChange={onToggleKeyboard}
+            icon={<Icon icon={KeyboardIcon} />}
+          />
           <IconButton
             label="Session menu"
             size="lg"
