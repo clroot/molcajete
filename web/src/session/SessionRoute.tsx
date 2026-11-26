@@ -24,6 +24,7 @@ export default function SessionRoute({connectionId}: {connectionId: string}) {
       key="ironrdp"
       connectionId={connectionId}
       connectionName={connection.name}
+      display={connection.display}
       onLeave={leave}
       onSwitchClient={switchTo('molcajete')}
     />

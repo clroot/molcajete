@@ -56,3 +56,30 @@ export function describeIronRdpError(err: unknown): {title: string; detail: stri
       return {title: 'Connection error', detail: message};
   }
 }
+
+/** The remote desktop IronRDP's client asks for: a size in device pixels and a scale. */
+export type RemoteDesktop = {width: number; height: number; scalePercent: number};
+
+/**
+ * The desktop for a window of `css` CSS pixels on a screen with
+ * `pixelRatio` device pixels per CSS pixel. Windows draws it at full
+ * resolution and scales text and apps up by `scalePercent`, so the picture
+ * is not stretched by the browser. `dpi` is the chosen remote scale (96 per
+ * 100 %), `'auto'` for the screen's own.
+ */
+export function remoteDesktop(
+  css: {width: number; height: number},
+  pixelRatio: number,
+  dpi: number | 'auto',
+): RemoteDesktop {
+  const ratio = pixelRatio > 0 ? pixelRatio : 1;
+  // Display Control takes 200 to 8192 pixels each way, the width even.
+  const width = Math.min(8192, Math.max(200, Math.round(css.width * ratio)));
+  const height = Math.min(8192, Math.max(200, Math.round(css.height * ratio)));
+  const percent = dpi === 'auto' ? ratio * 100 : (dpi * 100) / 96;
+  return {
+    width: width - (width % 2),
+    height,
+    scalePercent: Math.min(500, Math.max(100, Math.round(percent))),
+  };
+}

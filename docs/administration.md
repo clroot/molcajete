@@ -173,7 +173,7 @@ What an IronRDP session does not have:
 - **Standard RDP Security** (`security=rdp`), which neither client supports. The connection's `security` still chooses between NLA and TLS.
 - **The graphics pipeline.** IronRDP's web client gets the screen as bitmap updates. Its graphics pipeline offers no H.264, and a Windows 11 host left that offer unanswered, so it is turned off.
 
-The session needs molcajeted as the connection's daemon; stock guacd refuses it. The first IronRDP session in a browser tab downloads the client, about 2.2 MB compressed.
+The remote desktop takes the window's size in the screen's own pixels and the connection's remote scale, as with molcajete's client, so text is as sharp on a high-density screen (an iPad, a Retina display). The session needs molcajeted as the connection's daemon; stock guacd refuses it. The first IronRDP session in a browser tab downloads the client, about 2.2 MB compressed.
 
 ### Stored credentials
 
