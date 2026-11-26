@@ -286,7 +286,7 @@ For molcajeted running natively on a Mac, add a static target for `host.orb.inte
 `deploy/observability/grafana-dashboard.json` (*Molcajete Performance*) expects datasources with the uids `prometheus`, `loki` and `pyroscope`. It narrows a bottleneck down in order, one row each:
 
 1. **Overview**: open tunnels, active sessions, frames sent, frame build p95, ack p95, browser lag p95.
-2. **Server frame pipeline (molcajeted)**: frame build time, CPU per flush phase, image and video encode times, encoding throughput and compression, bytes and images per frame, socket write waits, bytes received from the remote server and their decoding time, and the copies scroll and move detection found.
+2. **Server frame pipeline (molcajeted)**: frame build time, CPU per flush phase, image and video encode times, encoding throughput and compression, bytes and images per frame, socket write waits, bytes received from the remote server and their decoding time, the copies scroll and move detection found, and the frame cadence: frames per second from the remote server against frames sent, the time between frames, and the share of frames more than 40 ms apart.
 3. **Client and network**: the server's ack against round trip, frame arrival and browser lag; browser fps and backlog; browser lag and frame arrival by kind of client; the apply times clients report to molcajeted; and *Clients over the time range*.
 4. **Gateway**: relayed traffic, handshake time, closed tunnels by status.
 5. **CPU profiles (Pyroscope)**: molcajeted and gateway flamegraphs.
