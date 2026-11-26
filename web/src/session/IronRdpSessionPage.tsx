@@ -16,7 +16,8 @@ import StatusOverlay from './StatusOverlay';
 import SessionMenuButton from './SessionMenuButton';
 import {useMenuShortcut} from './useMenuShortcut';
 import type {ConnectionStatus} from './useSessionEvents';
-import {describeIronRdpError, ironRdpTunnelUrl} from './ironrdp';
+import {describeIronRdpError, ironRdpTunnelUrl, remoteDesktop} from './ironrdp';
+import {effectiveDisplay, readDisplayChoices, type ConnectionDisplay} from './displaySettings';
 import {blockPageScroll, installIronRdpTouch} from './ironrdpTouch';
 
 type RdpModule = typeof import('@devolutions/iron-remote-desktop-rdp');
@@ -53,15 +54,37 @@ const READY_TIMEOUT_MS = 15_000;
 /** Time without a new window size before the remote desktop follows it. */
 const RESIZE_DELAY_MS = 300;
 
+/**
+ * The desktop for this window now, in device pixels, with the remote scale
+ * this browser chose for the connection (else the connection's own `dpi`,
+ * else the screen's), as molcajete's client asks for it.
+ */
+function currentDesktop(connectionId: string, display: ConnectionDisplay) {
+  const {scale} = effectiveDisplay(readDisplayChoices(connectionId), display);
+  return remoteDesktop(
+    {width: window.innerWidth, height: window.innerHeight},
+    window.devicePixelRatio,
+    scale,
+  );
+}
+
 type Props = {
   connectionId: string;
+  /** The connection's display parameters (`dpi`). */
+  display: ConnectionDisplay;
   connectionName: string;
   onLeave: () => void;
   /** Reconnects with molcajete's client; absent when the connection does not allow switching. */
   onSwitchClient?: () => void;
 };
 
-export default function IronRdpSessionPage({connectionId, connectionName, onLeave, onSwitchClient}: Props) {
+export default function IronRdpSessionPage({
+  connectionId,
+  connectionName,
+  display,
+  onLeave,
+  onSwitchClient,
+}: Props) {
   const [rdp, setRdp] = useState<RdpModule | null>(null);
   const [ui, setUi] = useState<UserInteraction | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>({kind: 'connecting'});
@@ -131,6 +154,7 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
     let isCurrent = true;
     const run = async () => {
       const grant = await api.ironrdpGrant(connectionId);
+      const desktop = currentDesktop(connectionId, display);
       const config = ui
         .configBuilder()
         .withUsername(grant.username)
@@ -139,7 +163,8 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
         .withDestination(connectionId)
         .withProxyAddress(ironRdpTunnelUrl(location, connectionId, grant.token))
         .withAuthToken(grant.token)
-        .withDesktopSize({width: window.innerWidth, height: window.innerHeight})
+        .withDesktopSize({width: desktop.width, height: desktop.height})
+        .withExtension(rdp.desktopScaleFactor(desktop.scalePercent))
         .withExtension(rdp.displayControl(true))
         // Bitmap updates instead of the graphics pipeline: without an H.264
         // decoder the web client offers only version 8 of the pipeline, and
@@ -160,7 +185,7 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
       isCurrent = false;
       ui.shutdown();
     };
-  }, [rdp, ui, connectionId]);
+  }, [rdp, ui, connectionId, display]);
 
   // The remote desktop follows the window.
   useEffect(() => {
@@ -168,14 +193,17 @@ export default function IronRdpSessionPage({connectionId, connectionName, onLeav
     let timer: ReturnType<typeof setTimeout> | undefined;
     const onResize = () => {
       clearTimeout(timer);
-      timer = setTimeout(() => ui.resize(window.innerWidth, window.innerHeight), RESIZE_DELAY_MS);
+      timer = setTimeout(() => {
+        const desktop = currentDesktop(connectionId, display);
+        ui.resize(desktop.width, desktop.height, desktop.scalePercent);
+      }, RESIZE_DELAY_MS);
     };
     window.addEventListener('resize', onResize);
     return () => {
       clearTimeout(timer);
       window.removeEventListener('resize', onResize);
     };
-  }, [ui, status.kind]);
+  }, [ui, status.kind, connectionId, display]);
 
   const toggleMenu = useCallback(() => setIsMenuOpen(open => !open), []);
   useMenuShortcut(toggleMenu);
