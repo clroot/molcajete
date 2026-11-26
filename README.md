@@ -77,8 +77,9 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
   Authentik, Entra ID, …), with roles and group memberships that can follow
   the provider's groups.
 - **Session recordings** in Guacamole's format, for stock guacd and
-  molcajeted alike, played back in the browser with seeking, or turned into
-  video with `guacenc`.
+  molcajeted alike: every session of a connection, or the spans a user
+  starts and stops from the session menu. Played back in the browser with
+  seeking, or turned into video with `guacenc`.
 - **Active sessions and connection history**: who is connected to what
   right now, with a button to end a session; sessions end by themselves
   when their user is disabled or loses access; past sessions with their
