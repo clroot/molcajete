@@ -70,8 +70,10 @@ impl Backend {
 }
 
 /// A directory on this host. Paths are resolved one component at a time
-/// and symbolic links are refused, so a link placed in the directory
-/// cannot lead the browser outside it.
+/// and symbolic links (on Windows, junctions too) are refused, so a link
+/// placed in the directory cannot lead the browser outside it. On Windows,
+/// components that Windows would read as something else than a file name in
+/// the directory (`C:`, `a:stream`, `CON`, `a.`) are refused as well.
 pub struct LocalDirectory {
     root: PathBuf,
     uploads: VirtualPath,
@@ -88,7 +90,12 @@ impl LocalDirectory {
                 Err(err) => return Err(err),
             }
         }
-        let root = tokio::fs::canonicalize(root).await?;
+        let mut root = tokio::fs::canonicalize(root).await?;
+        if cfg!(windows)
+            && let Some(path) = root.to_str()
+        {
+            root = without_verbatim_prefix(path)?.into();
+        }
         if !tokio::fs::metadata(&root).await?.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
@@ -111,6 +118,14 @@ impl LocalDirectory {
         let mut real = self.root.clone();
         let count = path.components().len();
         for (i, component) in path.components().iter().enumerate() {
+            if cfg!(windows)
+                && let Some(reason) = windows_name_problem(component)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{component:?} {reason}"),
+                ));
+            }
             real.push(component);
             match tokio::fs::symlink_metadata(&real).await {
                 Ok(meta) if meta.file_type().is_symlink() => {
@@ -175,6 +190,78 @@ impl LocalDirectory {
     async fn remove(&self, path: &VirtualPath) -> io::Result<()> {
         tokio::fs::remove_file(self.resolve(path).await?).await
     }
+}
+
+/// `path`, a resolved Windows path, in its plain form: `C:\a` for
+/// `\\?\C:\a`, as RDP drive redirection takes it. Network shares are
+/// refused: neither drive redirection nor guacd's `drive-path` serves them.
+fn without_verbatim_prefix(path: &str) -> io::Result<&str> {
+    let unsupported = || {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{path} is not on a drive letter; network shares cannot be redirected"),
+        )
+    };
+    let Some(rest) = path.strip_prefix(r"\\?\") else {
+        return if path.starts_with(r"\\") {
+            Err(unsupported())
+        } else {
+            Ok(path)
+        };
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":\\" {
+        Ok(rest)
+    } else {
+        Err(unsupported())
+    }
+}
+
+/// Why Windows would not read `component` as the name of a file in its
+/// directory; `None` if it would.
+///
+/// Pushing `C:` onto a path replaces it, `a:b` names a stream of `a`,
+/// device names (`CON`, `nul.txt`) open the device wherever they are, and
+/// trailing dots and spaces are stripped, so `a.` is `a`.
+fn windows_name_problem(component: &str) -> Option<&'static str> {
+    if component
+        .chars()
+        .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+    {
+        return Some("contains a character Windows does not allow in file names");
+    }
+    if component.ends_with(['.', ' ']) {
+        return Some("ends with a dot or a space");
+    }
+    // `nul.txt` and `NUL .txt` are the device too: the part before the
+    // first dot, without trailing spaces.
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ');
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        stem.get(..3)
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+            && matches!(
+                &stem[3..],
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{b9}"
+                    | "\u{b2}"
+                    | "\u{b3}"
+            )
+    });
+    reserved.then_some("is a Windows device name")
 }
 
 fn kind_of(meta: &std::fs::Metadata) -> Option<Kind> {
@@ -351,6 +438,67 @@ mod tests {
         assert_eq!(below("/srv", "/home/u"), None);
     }
 
+    #[test]
+    fn verbatim_windows_paths_become_plain() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\C:\drive").unwrap(),
+            r"C:\drive"
+        );
+        assert_eq!(without_verbatim_prefix(r"\\?\d:\").unwrap(), r"d:\");
+        assert_eq!(without_verbatim_prefix(r"C:\drive").unwrap(), r"C:\drive");
+        for share in [
+            r"\\?\UNC\server\share",
+            r"\\server\share",
+            r"\\?\Volume{0}\",
+        ] {
+            assert_eq!(
+                without_verbatim_prefix(share).unwrap_err().kind(),
+                io::ErrorKind::Unsupported,
+                "{share}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_windows_reads_otherwise_are_refused() {
+        for name in [
+            "C:",
+            "a:stream",
+            "a<b",
+            "a|b",
+            "a?",
+            "a*",
+            "tab\t",
+            "a.",
+            "a ",
+            "..",
+            "CON",
+            "con",
+            "nul.txt",
+            "NUL .txt",
+            "Com1",
+            "lpt9.log",
+            "COM\u{b9}",
+            "CONIN$",
+            "aux.tar.gz",
+        ] {
+            assert!(windows_name_problem(name).is_some(), "{name:?}");
+        }
+        for name in [
+            "a.txt",
+            ".hidden",
+            "CONSOLE",
+            "com10",
+            "COM0",
+            "nullable",
+            "lpt",
+            "한글 파일.txt",
+            "a b",
+        ] {
+            assert_eq!(windows_name_problem(name), None, "{name:?}");
+        }
+    }
+
     #[tokio::test]
     async fn local_directory_stays_inside_its_root() {
         let dir = std::env::temp_dir().join(format!("molcajete-files-{}", uuid::Uuid::new_v4()));
@@ -361,6 +509,23 @@ mod tests {
         std::fs::write(&outside, b"secret").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        // A junction needs no privileges, unlike a symbolic link.
+        #[cfg(windows)]
+        {
+            let elsewhere = outside.with_extension("dir");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("secret.txt"), b"secret").unwrap();
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(dir.join("junction"))
+                .arg(&elsewhere)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
 
         let local = Backend::Local(LocalDirectory::open_root(&dir, false).await.unwrap());
         let root = VirtualPath::default();
@@ -374,6 +539,33 @@ mod tests {
             assert!(local.open(&link).await.is_err());
             assert!(local.create(&link).await.is_err());
             assert_eq!(std::fs::read(&outside).unwrap(), b"secret");
+        }
+        #[cfg(windows)]
+        {
+            let through = VirtualPath::parse("/junction/secret.txt").unwrap();
+            assert!(local.open(&through).await.is_err());
+            assert!(local.create(&through).await.is_err());
+            assert!(
+                local
+                    .list(&VirtualPath::parse("/junction").unwrap())
+                    .await
+                    .is_err()
+            );
+            // `C:` would replace the root.
+            let drive = VirtualPath::parse("/C:").unwrap();
+            assert!(local.list(&drive).await.is_err());
+            assert!(
+                local
+                    .open(&VirtualPath::parse("/sub/a.txt:x").unwrap())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                local
+                    .open(&VirtualPath::parse("/CON").unwrap())
+                    .await
+                    .is_err()
+            );
         }
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -395,5 +587,7 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_file(&outside).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir_all(outside.with_extension("dir")).unwrap();
     }
 }
