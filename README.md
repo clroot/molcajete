@@ -54,7 +54,10 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
   terminal is drawn by molcajeted with bundled DejaVu Sans Mono and a
   NanumGothicCoding fallback, so Korean/CJK text works without fonts
   installed (more with the `font-path` parameter), and has copy and paste
-  shortcuts and clickable links.
+  shortcuts and clickable links. On a phone or a tablet a terminal has a
+  bar with the keys an on-screen keyboard lacks, scrolls and selects by
+  touch, and stays above the keyboard; its text size changes during the
+  session.
 - **File transfer.** SFTP in SSH sessions and a shared drive in RDP
   sessions, with guacd's parameters: drag files onto the session to upload
   them, browse and download in the session menu's file panel. Large files
@@ -140,6 +143,14 @@ client on the main thread instead of a worker, `?text` to keep the tunnel on
 the Guacamole text protocol (base64), and `?png` to receive lossless updates
 as PNG instead of zstd images.
 
+On a device used by finger, a terminal session (SSH, Telnet, Kubernetes)
+shows a bar under the terminal with Esc, Tab, Ctrl, Alt, the arrow keys,
+paste, `|` `/` `-` `~`, Home, End, PgUp and PgDn; its last button opens the
+menu. A tap on Ctrl or Alt holds it for the next key, a second tap locks
+it. Drag to scroll, touch and hold to select and copy, pinch to change the
+text size, and tap a link to get a button that opens it. *Terminal* in the
+menu has the text size and a switch for the bar, for any device.
+
 ## Embedding
 
 Another application can put a molcajete session in its own pages without
@@ -220,7 +231,7 @@ Prettier and the unit tests (`bun run format` fixes formatting).
 
 ```sh
 cargo test --workspace                       # unit tests (protocol, gateway, guacd, client logic)
-scripts/build-web.sh                         # then: renderer pixel, keyboard/IME, binary tunnel and playback tests
+scripts/build-web.sh                         # then: renderer pixel, keyboard/IME/touch, binary tunnel and playback tests
 (cd tests/browser && npm install && npm test)
 (cd tests/browser && node video.test.mjs)    # video decoding (needs ffmpeg with libx264/libsvtav1)
 (cd tests/browser && node files.e2e.mjs)     # file transfer against a running gateway (see the file)
