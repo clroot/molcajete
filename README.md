@@ -68,7 +68,8 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
   animations, 3D) as a video stream, encoded by hardware encoders through
   `ffmpeg` (NVENC, QSV, VA-API, AMF), VideoToolbox on macOS, or software
   encoders. Clients that cannot decode video, and lossless or SSH sessions,
-  get images.
+  get images. For games, 3D and other screens that move most of the time,
+  the session menu switches a session to streaming the whole screen.
 - **Leaner transport.** Between our client, the gateway and molcajeted,
   image, video and audio data travel as raw bytes instead of base64 (about
   25% fewer bytes), and lossless updates as zstd images the client decodes

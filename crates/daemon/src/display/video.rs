@@ -11,6 +11,10 @@
 //! When the area calms down (or the busy area moves elsewhere), the video
 //! layer is disposed and the default layer is brought up to date losslessly
 //! in the same frame: the client never shows stale or lossy content for long.
+//!
+//! A user can ask for the whole screen instead ([`VideoMode::FullScreen`],
+//! from the session menu): the video then covers the display as soon as it
+//! moves, and restarts only when the display is resized.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -97,6 +101,45 @@ const SKIPPED_SHARE: u32 = 4;
 /// The bitrate is doubled at most this many times, to 8 times what the
 /// area's size asks for (and never beyond [`MAX_BITRATE_KBPS`]).
 const MAX_RAISES: u32 = 3;
+/// Tiles that must change in one frame for a full-screen video to start or
+/// to count as still moving: a blinking caret or a clock (one or two tiles)
+/// neither starts the stream nor keeps a settled screen lossy.
+const FULL_SCREEN_MIN_TILES: usize = MIN_TILES;
+
+/// The client parameter (`argv`) that chooses the [`VideoMode`] during a
+/// session, and the opcode of the instruction that tells the client which
+/// mode is in use. Both are molcajete extensions: only a session with video
+/// sends the instruction, and only a client that got it shows the choice.
+pub const VIDEO_MODE: &str = "video-mode";
+
+/// How a session finds what to send as video.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoMode {
+    /// The largest busy area, once it qualifies (`auto`, the default).
+    #[default]
+    Auto,
+    /// The whole display, as soon as enough of it moves (`full-screen`).
+    FullScreen,
+}
+
+impl VideoMode {
+    /// The mode named by a `video-mode` value; anything else (empty or
+    /// unknown) is [`VideoMode::Auto`].
+    pub fn from_param(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("full-screen") => Self::FullScreen,
+            _ => Self::Auto,
+        }
+    }
+
+    /// The `video-mode` value, also the `mode` label of the video metrics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::FullScreen => "full-screen",
+        }
+    }
+}
 
 // Encoders and the factory sit in a `Mutex` only to make `Display` `Sync`
 // (sessions hold `&Display` across awaits); access is always through
@@ -111,6 +154,14 @@ pub(super) struct VideoSupport {
     /// Since when a large area has been busy at [`MOTION_WARM`] without a
     /// pause.
     large_since: Option<Instant>,
+    /// Whether the user asked for full-screen video. An encoder failure
+    /// turns it off again (the client is told).
+    full_screen: bool,
+    /// Whether the client still has to be told the mode.
+    announce: bool,
+    /// The display size for which falling back to busy areas was last
+    /// logged, so that it is logged once per size.
+    too_large: Option<(u32, u32)>,
 }
 
 impl VideoSupport {
@@ -124,6 +175,11 @@ impl VideoSupport {
             .map(|(codec, _)| *codec)
             .expect("at least one codec")
     }
+
+    /// Whether some codec encodes `pixels` in real time.
+    fn realtime(&self, pixels: u64) -> bool {
+        self.codecs.iter().any(|(_, max)| pixels <= *max)
+    }
 }
 
 pub(super) struct ActiveVideo {
@@ -134,6 +190,8 @@ pub(super) struct ActiveVideo {
     width: u32,
     height: u32,
     encoder: Mutex<Box<dyn VideoEncoder>>,
+    /// Covers the whole display ([`VideoMode::FullScreen`]).
+    full_screen: bool,
     started: Instant,
     last_change: Instant,
     /// The frame given to the encoder (RGBA at the encoded size, the
@@ -256,10 +314,11 @@ fn contains(outer: &Rect, inner: &Rect) -> bool {
 }
 
 impl Display {
-    /// Enables video mode: busy areas are sent as video produced by encoders
-    /// from `factory`, using the first of `codecs` (codec, largest frame in
-    /// pixels it encodes in real time) that suits the area. Ignored for
-    /// lossless sessions.
+    /// Enables video mode: busy areas are sent as video produced by
+    /// encoders from `factory`, using the first of `codecs` (codec, largest
+    /// frame in pixels it encodes in real time) that suits the area. Ignored
+    /// for lossless sessions. The client is told at the next flush that it
+    /// may ask for the whole screen ([`Display::set_video_mode`]).
     pub fn enable_video(&mut self, codecs: Vec<(VideoCodec, u64)>, factory: EncoderFactory) {
         if self.lossless || codecs.is_empty() {
             return;
@@ -269,7 +328,52 @@ impl Display {
             factory: Mutex::new(factory),
             failures: 0,
             large_since: None,
+            full_screen: false,
+            announce: true,
+            too_large: None,
         });
+    }
+
+    /// The video mode in use, if video is enabled.
+    pub(crate) fn video_mode(&self) -> Option<VideoMode> {
+        self.video_support.as_ref().map(|s| {
+            if s.full_screen {
+                VideoMode::FullScreen
+            } else {
+                VideoMode::Auto
+            }
+        })
+    }
+
+    /// Switches between busy areas and the whole screen, as the client
+    /// asked (`argv video-mode`), and confirms the mode in use. Ignored
+    /// when the session has no video: the client was never offered it.
+    ///
+    /// A full-screen video starts with the next frame that changes enough
+    /// of the screen; one that runs ends at the next flush, which sends the
+    /// screen again losslessly.
+    pub fn set_video_mode(&mut self, mode: VideoMode, out: &mut Output) {
+        let Some(support) = &mut self.video_support else {
+            debug!(mode = mode.label(), "video mode asked for without video");
+            return;
+        };
+        support.full_screen = mode == VideoMode::FullScreen;
+        support.too_large = None;
+        info!(mode = mode.label(), "client changed the video mode");
+        self.announce_video_mode(out);
+    }
+
+    /// Tells the client the video mode in use.
+    fn announce_video_mode(&mut self, out: &mut Output) {
+        let Some(mode) = self.video_mode() else {
+            return;
+        };
+        if let Some(support) = &mut self.video_support {
+            support.announce = false;
+        }
+        *out += &InstructionBuilder::new(VIDEO_MODE)
+            .str_arg(mode.label())
+            .finish();
     }
 
     /// Whether tile (`tx`, `ty`) lies inside the video area.
@@ -283,7 +387,15 @@ impl Display {
     /// When the video should be checked even if nothing else changes (to
     /// end it once the area is idle).
     pub(super) fn video_deadline(&self) -> Option<Instant> {
-        self.video.as_ref().map(|v| v.last_change + IDLE)
+        let full_screen = self.video_support.as_ref().is_some_and(|s| s.full_screen);
+        self.video.as_ref().map(|v| {
+            if v.full_screen && !full_screen {
+                // Full-screen video was turned off: end it now.
+                Instant::now()
+            } else {
+                v.last_change + IDLE
+            }
+        })
     }
 
     /// Handles an `ack` from the client: an error for the video stream means
@@ -294,8 +406,7 @@ impl Display {
                 status = status.code(),
                 "client rejected the video stream; video mode disabled"
             );
-            self.video_support = None;
-            self.stop_video(out);
+            self.disable_video(out);
         }
     }
 
@@ -367,6 +478,58 @@ impl Display {
         (self.sampled_colors(&rect) > MIN_COLORS).then_some(rect)
     }
 
+    /// The whole display, when the session streams it as one video: the
+    /// user asked for it, no encoder failed since, and some codec encodes
+    /// the display in real time. A display too large for that falls back to
+    /// busy areas until it is resized.
+    fn full_screen(&mut self) -> Option<Rect> {
+        let (width, height) = (self.width, self.height);
+        let support = self.video_support.as_mut()?;
+        if !support.full_screen || width == 0 || height == 0 {
+            return None;
+        }
+        let pixels = width.next_multiple_of(16) as u64 * height.next_multiple_of(16) as u64;
+        if !support.realtime(pixels) {
+            if support.too_large != Some((width, height)) {
+                support.too_large = Some((width, height));
+                info!(
+                    width,
+                    height,
+                    reason = "no real-time encoder for the display size",
+                    "full-screen video falls back to busy areas"
+                );
+            }
+            return None;
+        }
+        Some(Rect::new(0, 0, width, height))
+    }
+
+    /// Whether at least `min` touched tiles differ from what the client
+    /// shows, so that a full-screen video is worth starting.
+    fn tiles_changed(&self, min: usize) -> bool {
+        let mut found = 0;
+        for ty in 0..self.tile_rows {
+            for tx in 0..self.tile_cols {
+                if !self.dirty[(ty * self.tile_cols + tx) as usize] {
+                    continue;
+                }
+                let tile =
+                    Rect::new(tx * TILE, ty * TILE, TILE, TILE).clip(self.width, self.height);
+                let differs = (tile.y..tile.bottom()).any(|y| {
+                    self.segment(&self.pixels, y, tile.x, tile.right())
+                        != self.segment(&self.sent, y, tile.x, tile.right())
+                });
+                if differs {
+                    found += 1;
+                    if found >= min {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// The busy area, if it qualifies for a video stream: at once when its
     /// tiles are sent many times per second, and after [`SUSTAINED`] when it
     /// is large and sent a few times per second.
@@ -405,10 +568,22 @@ impl Display {
     /// Starts, feeds or stops the video. Runs first in every flush; tiles
     /// inside the video area are then skipped by the image diff.
     pub(super) fn update_video(&mut self, out: &mut Output) -> FlushStats {
-        if self.video_support.is_none() {
+        let Some(support) = &self.video_support else {
             return FlushStats::default();
+        };
+        if support.announce {
+            self.announce_video_mode(out);
         }
         let now = Instant::now();
+        if let Some(screen) = self.full_screen() {
+            return self.update_full_screen(screen, now, out);
+        }
+        if self.video.as_ref().is_some_and(|v| v.full_screen) {
+            // Full-screen video was turned off, or the display is now too
+            // large for it: busy areas from here on.
+            self.stop_video(out);
+            return FlushStats::default();
+        }
         let candidate = self.video_candidate(now);
 
         let Some(active) = &mut self.video else {
@@ -437,9 +612,42 @@ impl Display {
         self.video_frame(now, false, out)
     }
 
+    /// Starts, feeds or stops a video over the whole display (`screen`).
+    /// It starts once [`FULL_SCREEN_MIN_TILES`] tiles differ from what the
+    /// client shows (at once after a resize that changed them), and ends after
+    /// [`IDLE`] without such a frame, when the screen is sent again
+    /// losslessly; smaller changes meanwhile still reach the video.
+    fn update_full_screen(&mut self, screen: Rect, now: Instant, out: &mut Output) -> FlushStats {
+        match &self.video {
+            Some(active) if active.full_screen && active.rect == screen => {
+                if now >= active.last_change + IDLE {
+                    self.stop_video(out);
+                    return FlushStats::default();
+                }
+                self.video_frame(now, false, out)
+            }
+            active => {
+                if active.is_some() {
+                    self.stop_video(out);
+                }
+                if self.tiles_changed(FULL_SCREEN_MIN_TILES) {
+                    self.start_video(screen, now, out)
+                } else {
+                    FlushStats::default()
+                }
+            }
+        }
+    }
+
     fn start_video(&mut self, rect: Rect, now: Instant, out: &mut Output) -> FlushStats {
+        let full_screen = self.full_screen() == Some(rect);
         let Some(support) = &mut self.video_support else {
             return FlushStats::default();
+        };
+        let mode = if full_screen {
+            VideoMode::FullScreen
+        } else {
+            VideoMode::Auto
         };
         let (width, height) = (rect.w.next_multiple_of(16), rect.h.next_multiple_of(16));
         let codec = support.codec_for(width as u64 * height as u64);
@@ -454,17 +662,19 @@ impl Display {
         let encoder = match factory(&config) {
             Ok(encoder) => encoder,
             Err(err) => {
-                self.video_failed(&err);
+                self.video_failed(&err, out);
                 return FlushStats::default();
             }
         };
         metrics::counter!(
             "molcajeted_video_streams_total",
             "codec" => super::metrics::codec_label(config.codec),
+            "mode" => mode.label(),
         )
         .increment(1);
         info!(
             codec = ?config.codec,
+            mode = mode.label(),
             x = rect.x,
             y = rect.y,
             width,
@@ -494,6 +704,7 @@ impl Display {
             width,
             height,
             encoder: Mutex::new(encoder),
+            full_screen,
             started: now,
             last_change: now,
             frame: Vec::new(),
@@ -538,16 +749,36 @@ impl Display {
         }
     }
 
-    fn video_failed(&mut self, err: &VideoError) {
+    fn video_failed(&mut self, err: &VideoError, out: &mut Output) {
         if let Some(support) = &mut self.video_support {
             support.failures += 1;
             metrics::counter!("molcajeted_video_failures_total").increment(1);
             warn!(error = %err, failures = support.failures, "video encoder failed");
+            let full_screen = support.full_screen;
+            support.full_screen = false;
+            if full_screen {
+                info!(
+                    width = self.width,
+                    height = self.height,
+                    reason = "encoder failed",
+                    "full-screen video falls back to busy areas"
+                );
+            }
             if support.failures >= MAX_FAILURES {
                 warn!("video mode disabled after repeated encoder failures");
-                self.video_support = None;
+                self.disable_video(out);
+            } else if full_screen {
+                self.announce_video_mode(out);
             }
         }
+    }
+
+    /// Turns video off for the session and tells the client, which then
+    /// stops offering the choice of mode.
+    fn disable_video(&mut self, out: &mut Output) {
+        self.video_support = None;
+        self.stop_video(out);
+        *out += &InstructionBuilder::new(VIDEO_MODE).str_arg("").finish();
     }
 
     /// Encodes the video area if it changed (always when `key` is set).
@@ -569,11 +800,22 @@ impl Display {
         if changed.is_empty() && !key {
             return FlushStats::default();
         }
+        // A full-screen video goes on while frames change more than a
+        // caret or a clock; anything else that changed keeps it going.
+        let moving = match &self.video {
+            Some(v) if v.full_screen => changed.len() >= FULL_SCREEN_MIN_TILES,
+            _ => true,
+        };
         // Changed tiles stay busy, which keeps the video going.
         for i in changed {
             self.motion[i] += 1.0;
         }
         let video = self.video.as_mut().expect("put back above");
+        let mode = if video.full_screen {
+            VideoMode::FullScreen
+        } else {
+            VideoMode::Auto
+        };
         let rect = video.rect;
         let encoder = video.encoder.get_mut().unwrap_or_else(|e| e.into_inner());
         let codec = encoder.codec();
@@ -583,11 +825,13 @@ impl Display {
             Ok(encoded) => encoded,
             Err(err) => {
                 self.stop_video(out);
-                self.video_failed(&err);
+                self.video_failed(&err, out);
                 return FlushStats::default();
             }
         };
-        video.last_change = now;
+        if moving || key {
+            video.last_change = now;
+        }
         let starved = video.starved(encoded.data.is_empty());
         if encoded.data.is_empty() {
             // The encoder left this frame out to hold its bitrate; what it
@@ -604,7 +848,7 @@ impl Display {
         video.frames += 1;
         video.bytes += framed.len();
         self.metrics
-            .video_frame(codec, encoded.key, encode_time, framed.len());
+            .video_frame(codec, mode, encoded.key, encode_time, framed.len());
         out.blob(VIDEO_STREAM, &framed);
         if starved {
             self.raise_bitrate(out);
@@ -822,6 +1066,9 @@ mod tests {
             factory: Mutex::new(Box::new(|c| Err(VideoError::Unavailable(c.codec)))),
             failures: 0,
             large_since: None,
+            full_screen: false,
+            announce: false,
+            too_large: None,
         };
         assert_eq!(support.codec_for(1000), VideoCodec::Av1);
         assert_eq!(support.codec_for(1001), VideoCodec::H265);
@@ -1018,6 +1265,10 @@ mod tests {
     }
 
     fn display_of(width: u32, height: u32) -> (Display, EncodeLog) {
+        display_in(VideoMode::Auto, width, height)
+    }
+
+    fn display_in(mode: VideoMode, width: u32, height: u32) -> (Display, EncodeLog) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut display = Display::new(
             ImageFormats {
@@ -1038,6 +1289,11 @@ mod tests {
         );
         let mut out = Output::text();
         display.resize(width, height, &mut out);
+        if mode == VideoMode::FullScreen {
+            // Something on the screen: the first frame starts the video.
+            display.set_video_mode(mode, &mut out);
+            display.put(0, 0, width, height, &noise(7, width, height));
+        }
         display.flush(&mut out);
         (display, log)
     }
@@ -1377,6 +1633,7 @@ mod tests {
                 log: EncodeLog::default(),
                 config,
             })),
+            full_screen: false,
             started: Instant::now(),
             last_change: Instant::now(),
             frame: Vec::new(),
@@ -1686,6 +1943,235 @@ mod tests {
                  one tile changed {old_tile:.3} ms before, {new_tile:.3} ms now (median of 40)"
             );
         }
+    }
+
+    #[test]
+    fn video_mode_parameter() {
+        assert_eq!(VideoMode::from_param(None), VideoMode::Auto);
+        assert_eq!(VideoMode::from_param(Some("auto")), VideoMode::Auto);
+        assert_eq!(VideoMode::from_param(Some("bogus")), VideoMode::Auto);
+        assert_eq!(
+            VideoMode::from_param(Some(" Full-Screen ")),
+            VideoMode::FullScreen
+        );
+        assert_eq!(VideoMode::FullScreen.label(), "full-screen");
+    }
+
+    /// A flush of one frame: (instructions, encoder calls so far).
+    fn frame(display: &mut Display, log: &EncodeLog) -> (String, usize) {
+        let mut out = Output::text();
+        display.flush(&mut out);
+        display.sync(&mut out);
+        (out.to_string(), log.lock().unwrap().len())
+    }
+
+    #[test]
+    fn full_screen_video_covers_the_display_from_the_first_frame() {
+        let mut out = Output::text();
+        let (mut display, log) = display_in(VideoMode::FullScreen, 1, 1);
+        display.resize(630, 470, &mut out);
+        display.put(0, 0, 630, 470, &noise(1, 630, 470));
+        let (out, _) = frame(&mut display, &log);
+        assert!(out.contains("4.size,1.1,3.640,3.480;"), "{out}");
+        assert!(out.contains("4.move,1.1,1.0,1.0,1.0,1.1;"), "{out}");
+        // Not AV1: 640×480 is beyond its real-time limit here.
+        assert!(out.contains("10.video/h264;"), "{out}");
+        assert!(!out.contains("3.img"), "{out}");
+        let video = display.video.as_ref().unwrap();
+        assert!(video.full_screen);
+        assert_eq!(video.rect, Rect::new(0, 0, 630, 470));
+        assert_eq!(log.lock().unwrap()[0], (640, 480, true));
+
+        // Text-like content moving around: still the same stream, no images.
+        for i in 0..20u32 {
+            let data = vec![if i % 2 == 0 { 0 } else { 255 }; 200 * 30 * 4];
+            display.put(10 + 20 * i, 10 + 15 * i, 200, 30, &data);
+            let (out, _) = frame(&mut display, &log);
+            assert!(!out.contains("5.video"), "frame {i}: {out}");
+            assert!(!out.contains("3.img") && !out.contains("4.copy"), "{out}");
+        }
+        assert_eq!(log.lock().unwrap().len(), 21);
+        assert!(log.lock().unwrap()[1..].iter().all(|f| !f.2));
+    }
+
+    #[test]
+    fn full_screen_video_restarts_on_resize_only() {
+        let (mut display, log) = display_in(VideoMode::FullScreen, 640, 480);
+        assert!(display.video.as_ref().unwrap().full_screen);
+        let mut out = Output::text();
+        display.resize(800, 600, &mut out);
+        assert!(out.to_string().contains("7.dispose,1.1;"));
+        assert!(display.video.is_none());
+        let (out, encoded) = frame(&mut display, &log);
+        // The resize changed every tile: the new size starts at once.
+        assert!(out.contains("4.size,1.1,3.800,3.608;"), "{out}");
+        assert_eq!(log.lock().unwrap()[encoded - 1], (800, 608, true));
+    }
+
+    #[test]
+    fn a_settled_full_screen_ends_losslessly_and_a_caret_does_not_restart_it() {
+        let (mut display, log) = display_in(VideoMode::FullScreen, 640, 480);
+        display.put(0, 0, 640, 480, &noise(1, 640, 480));
+        frame(&mut display, &log);
+        // A blinking caret: one tile, every 100 ms. It reaches the video,
+        // but does not keep it going.
+        let caret = |display: &mut Display, on: bool| {
+            display.put(100, 100, 2, 16, &[if on { 255 } else { 0 }; 2 * 16 * 4]);
+        };
+        let started = Instant::now();
+        let mut blink = false;
+        while display.video.is_some() {
+            assert!(started.elapsed() < 3 * IDLE, "the video never ended");
+            blink = !blink;
+            caret(&mut display, blink);
+            frame(&mut display, &log);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(started.elapsed() >= IDLE);
+        // Ended losslessly: the client shows exactly the framebuffer.
+        assert_eq!(display.pixels, display.sent);
+        assert!(display.lossy.iter().all(|l| !l));
+        // The caret goes on as images, without a new stream.
+        let before = log.lock().unwrap().len();
+        for _ in 0..5 {
+            blink = !blink;
+            caret(&mut display, blink);
+            let (out, encoded) = frame(&mut display, &log);
+            assert!(!out.contains("5.video"), "{out}");
+            assert!(out.contains("3.img") || out.contains("5.cfill"), "{out}");
+            assert_eq!(encoded, before);
+        }
+        // Motion over a larger part starts it again, with a key frame.
+        display.put(0, 0, 320, 192, &noise(2, 320, 192));
+        let (out, encoded) = frame(&mut display, &log);
+        assert!(out.contains("5.video"), "{out}");
+        assert_eq!(log.lock().unwrap()[encoded - 1], (640, 480, true));
+    }
+
+    #[test]
+    fn full_screen_falls_back_to_busy_areas_when_too_large() {
+        let log = EncodeLog::default();
+        let mut display = Display::new(ImageFormats::default(), false);
+        let factory_log = log.clone();
+        display.enable_video(
+            vec![(VideoCodec::Av1, 1280 * 736)],
+            Box::new(move |config| {
+                Ok(Box::new(FakeEncoder {
+                    log: factory_log.clone(),
+                    config: config.clone(),
+                }))
+            }),
+        );
+        display.set_video_mode(VideoMode::FullScreen, &mut Output::text());
+        let mut out = Output::text();
+        display.resize(1920, 1080, &mut out);
+        let (out, encoded) = frame(&mut display, &log);
+        assert!(!out.contains("5.video"), "{out}");
+        assert_eq!(encoded, 0);
+        // Busy areas still become videos.
+        for i in 0..20u32 {
+            display.put(64, 64, 320, 256, &noise(i, 320, 256));
+            frame(&mut display, &log);
+        }
+        let video = display.video.as_ref().expect("a video over the busy area");
+        assert!(!video.full_screen);
+        assert_eq!(video.rect, Rect::new(64, 64, 320, 256));
+        // A display the encoder handles goes full screen again.
+        let mut out = Output::text();
+        display.resize(1280, 720, &mut out);
+        let (out, _) = frame(&mut display, &log);
+        assert!(out.contains("4.size,1.1,4.1280,3.720;"), "{out}");
+        assert!(display.video.as_ref().unwrap().full_screen);
+    }
+
+    #[test]
+    fn full_screen_falls_back_to_busy_areas_when_the_encoder_fails() {
+        let log = EncodeLog::default();
+        let mut display = Display::new(ImageFormats::default(), false);
+        let factory_log = log.clone();
+        display.enable_video(
+            vec![(VideoCodec::H264, u64::MAX)],
+            Box::new(move |config| {
+                if config.width == 640 {
+                    // A hardware encoder refusing the frame size.
+                    return Err(VideoError::Unavailable(config.codec));
+                }
+                Ok(Box::new(FakeEncoder {
+                    log: factory_log.clone(),
+                    config: config.clone(),
+                }))
+            }),
+        );
+        display.set_video_mode(VideoMode::FullScreen, &mut Output::text());
+        let mut out = Output::text();
+        display.resize(640, 480, &mut out);
+        display.put(0, 0, 640, 480, &noise(1, 640, 480));
+        let (out, _) = frame(&mut display, &log);
+        assert!(!out.contains("5.video"), "{out}");
+        assert!(out.contains("3.img"), "{out}");
+        // The client is told: its menu shows the switch off again.
+        assert!(out.contains("10.video-mode,4.auto;"), "{out}");
+        assert!(display.video.is_none());
+        for i in 0..20u32 {
+            display.put(64, 64, 320, 256, &noise(i, 320, 256));
+            frame(&mut display, &log);
+        }
+        assert!(!display.video.as_ref().expect("busy area video").full_screen);
+        assert_eq!(display.video_mode(), Some(VideoMode::Auto));
+    }
+
+    #[test]
+    fn lossless_sessions_get_no_full_screen_video() {
+        let mut display = Display::new(ImageFormats::default(), true);
+        display.enable_video(
+            vec![(VideoCodec::H264, u64::MAX)],
+            Box::new(|c| Err(VideoError::Unavailable(c.codec))),
+        );
+        let mut out = Output::text();
+        display.set_video_mode(VideoMode::FullScreen, &mut out);
+        assert_eq!(display.video_mode(), None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn the_client_is_told_the_video_mode() {
+        let (mut display, log) = display_of(640, 480);
+        // `display_of` flushed once: that frame said so.
+        let (out, _) = frame(&mut display, &log);
+        assert!(!out.contains("10.video-mode"), "{out}");
+        let mut out = Output::text();
+        display.set_video_mode(VideoMode::FullScreen, &mut out);
+        assert_eq!(out.to_string(), "10.video-mode,11.full-screen;");
+        // Without video there is nothing to choose.
+        let mut images_only = Display::new(ImageFormats::default(), false);
+        let mut out = Output::text();
+        images_only.resize(64, 64, &mut out);
+        images_only.flush(&mut out);
+        images_only.set_video_mode(VideoMode::FullScreen, &mut out);
+        assert!(!out.to_string().contains("video-mode"), "{out}");
+    }
+
+    #[test]
+    fn turning_full_screen_off_ends_its_video_losslessly() {
+        let (mut display, log) = display_in(VideoMode::FullScreen, 640, 480);
+        assert!(display.video.as_ref().unwrap().full_screen);
+        let mut out = Output::text();
+        display.set_video_mode(VideoMode::Auto, &mut out);
+        assert!(display.idle_deadline().unwrap() <= Instant::now() + Duration::from_millis(200));
+        let (out, _) = frame(&mut display, &log);
+        assert!(out.contains("7.dispose,1.1;"), "{out}");
+        assert!(display.video.is_none());
+        assert_eq!(display.pixels, display.sent);
+        assert!(display.lossy.iter().all(|l| !l));
+    }
+
+    #[test]
+    fn a_rejected_stream_withdraws_the_choice_of_mode() {
+        let (mut display, _log) = display_in(VideoMode::FullScreen, 640, 480);
+        let mut out = Output::text();
+        display.stream_ack(VIDEO_STREAM, Status::CLIENT_BAD_TYPE, &mut out);
+        assert!(out.to_string().ends_with("10.video-mode,0.;"), "{out}");
+        assert_eq!(display.video_mode(), None);
     }
 
     #[test]

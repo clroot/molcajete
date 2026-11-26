@@ -31,6 +31,9 @@ export type Hold = 'off' | 'once' | 'locked';
 /** Ctrl and Alt as the terminal key bar holds them. */
 export type HeldModifiers = {ctrl: Hold; alt: Hold};
 
+/** How a session finds what to send as video (molcajeted's `video-mode`). */
+export type VideoMode = 'auto' | 'full-screen';
+
 export type SessionEvent =
   | {
       type: 'state';
@@ -43,6 +46,11 @@ export type SessionEvent =
   | {type: 'unstable'; detail: boolean}
   /** Whether the server can change the remote display during the session (molcajeted only). */
   | {type: 'display-control'; detail: boolean}
+  /**
+   * The video mode of a session that streams video (molcajeted only): busy areas (`auto`) or
+   * the whole screen; null once video is off for the session.
+   */
+  | {type: 'video-mode'; detail: VideoMode | null}
   | {type: 'stats'; detail: SessionStats}
   /** Target of the link under the pointer in a terminal, or null (molcajeted SSH only). */
   | {type: 'link'; detail: string | null}

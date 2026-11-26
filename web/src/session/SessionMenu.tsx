@@ -55,6 +55,9 @@ type Props = {
   /** Whether the terminal key bar shows; `null` when the session has none to show. */
   keyBar: boolean | null;
   onKeyBarChange: (shows: boolean) => void;
+  /** Whether the whole screen goes as video; `null` when the session streams no video. */
+  fullScreenVideo: boolean | null;
+  onFullScreenVideoChange: (isFullScreen: boolean) => void;
   showStats: boolean;
   onShowStatsChange: (show: boolean) => void;
   /** `null` when the connection has no remote input method to compose with. */
@@ -128,6 +131,20 @@ function Clipboard({restrictions, isTerminal, hasKeyboard, keyBar, clipboard, on
         </VStack>
       )}
     </>
+  );
+}
+
+type FullScreenVideoSwitchProps = {value: boolean; onChange: (isFullScreen: boolean) => void};
+
+/** Streams the whole screen as video instead of only the parts that move a lot. */
+export function FullScreenVideoSwitch({value, onChange}: FullScreenVideoSwitchProps) {
+  return (
+    <Switch
+      label="Stream the whole screen as video"
+      description="Smoother for games, 3D and full-screen video. Text looks blurry while the screen moves and sharp again once it stops."
+      value={value}
+      onChange={onChange}
+    />
   );
 }
 
@@ -230,6 +247,12 @@ export default function SessionMenu(props: Props) {
                       {value: 'native', label: 'Native (1:1)'},
                     ]}
                   />
+                  {props.fullScreenVideo !== null && (
+                    <FullScreenVideoSwitch
+                      value={props.fullScreenVideo}
+                      onChange={props.onFullScreenVideoChange}
+                    />
+                  )}
                 </VStack>
               )}
               {props.remoteComposition !== null && (

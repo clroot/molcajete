@@ -1,5 +1,5 @@
 import {useReducer} from 'react';
-import type {HeldModifiers, SessionEvent, SessionStats} from './client';
+import type {HeldModifiers, SessionEvent, SessionStats, VideoMode} from './client';
 
 export type ConnectionStatus =
   | {kind: 'connecting'}
@@ -19,6 +19,8 @@ export type SessionState = {
   canChangeDisplay: boolean;
   /** Target of the link under the pointer in a terminal. */
   link: string | null;
+  /** The session's video mode, or null when it streams no video (or the server is not molcajeted). */
+  videoMode: VideoMode | null;
   /** An audio stream is open, but the browser plays nothing until a click or key press. */
   isAudioBlocked: boolean;
   /** Ctrl and Alt as the terminal key bar holds them. */
@@ -41,6 +43,7 @@ const initialState: SessionState = {
   stats: null,
   canChangeDisplay: true,
   link: null,
+  videoMode: null,
   isAudioBlocked: false,
   modifiers: NO_MODIFIERS,
 };
@@ -78,6 +81,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
           canChangeDisplay: true,
           link: null,
           modifiers: NO_MODIFIERS,
+          videoMode: null,
         };
       if (action.detail === 'waiting') return {...state, status: {kind: 'connecting'}};
       if (action.detail === 'connected') return {...state, status: {kind: 'connected'}};
@@ -102,6 +106,8 @@ export function reduce(state: SessionState, action: Action): SessionState {
       return {...state, stats: action.detail};
     case 'display-control':
       return {...state, canChangeDisplay: action.detail};
+    case 'video-mode':
+      return {...state, videoMode: action.detail};
     case 'link':
       return {...state, link: action.detail};
     case 'audio':

@@ -10,6 +10,7 @@ const connected: SessionState = {
   stats: null,
   canChangeDisplay: true,
   link: null,
+  videoMode: null,
   isAudioBlocked: false,
   modifiers: {ctrl: 'off', alt: 'off'},
 };
@@ -41,6 +42,15 @@ describe('session events', () => {
     expect(fixed.canChangeDisplay).toBe(false);
     expect(reduce(fixed, {type: 'display-control', detail: true}).canChangeDisplay).toBe(true);
     expect(reduce(fixed, {type: 'state', detail: 'connecting'}).canChangeDisplay).toBe(true);
+  });
+
+  test('offers the video mode the server reports, until video is off or the session reconnects', () => {
+    const auto = reduce(connected, {type: 'video-mode', detail: 'auto'});
+    expect(auto.videoMode).toBe('auto');
+    const full = reduce(auto, {type: 'video-mode', detail: 'full-screen'});
+    expect(full.videoMode).toBe('full-screen');
+    expect(reduce(full, {type: 'video-mode', detail: null}).videoMode).toBeNull();
+    expect(reduce(full, {type: 'state', detail: 'connecting'}).videoMode).toBeNull();
   });
 
   test('keeps the link under the pointer until it leaves or the session reconnects', () => {
