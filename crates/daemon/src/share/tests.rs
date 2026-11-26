@@ -1,11 +1,13 @@
 use std::time::Instant as StdInstant;
 
 use molcajete_protocol::Parser;
+use molcajete_protocol::video::VideoCodec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::*;
 use crate::display::tests::Client;
+use crate::video::{EncodedFrame, VideoEncoder, VideoError};
 
 const ARGS: &[&str] = &["hostname", "read-only"];
 
@@ -123,6 +125,71 @@ async fn joined_users_get_the_whole_screen_then_the_changes() {
         .await;
     drop(owner);
     assert!(connections().get("$screen").is_none());
+}
+
+/// Encodes nothing: only the owner's client would see its frames.
+struct StubEncoder(VideoCodec);
+
+impl VideoEncoder for StubEncoder {
+    fn codec(&self) -> VideoCodec {
+        self.0
+    }
+
+    fn encode(&mut self, _rgba: &[u8], force_key: bool) -> Result<EncodedFrame, VideoError> {
+        Ok(EncodedFrame {
+            data: vec![0, 0, 0, 1],
+            key: force_key,
+        })
+    }
+}
+
+#[tokio::test]
+async fn joined_users_get_what_the_owner_sends_as_video() {
+    let owner = Owner::register("$video", "vnc", ARGS);
+    owner
+        .run(async {
+            let shared = current().expect("owner's connection");
+            let formats = ImageFormats {
+                jpeg: true,
+                zstd: false,
+            };
+            let mut display = Display::new(formats, false)
+                .with_protocol("vnc")
+                .with_pacing(Pacing::DESKTOP);
+            display.enable_video(
+                vec![(VideoCodec::H264, u64::MAX)],
+                Box::new(|config| Ok(Box::new(StubEncoder(config.codec)))),
+            );
+            display.resize(640, 480, &mut Output::text());
+            display.put(0, 0, 640, 480, &noise(640, 480, 100));
+            display.flush(&mut Output::text());
+
+            let viewer = shared.join();
+            display.ack(0, StdInstant::now());
+            let mut viewer_display = Display::new(ImageFormats::default(), true);
+            let mut client = Client::new();
+
+            // A busy area, which the owner's client gets as a video after a
+            // few frames and as nothing else from then on.
+            let mut video_frames = 0;
+            for frame in 0..40 {
+                display.put(100, 70, 300, 200, &noise(300, 200, frame));
+                let mut out = Output::text();
+                display.flush(&mut out);
+                if out.contains("4.blob,3.101,") {
+                    video_frames += 1;
+                    assert!(!out.contains("3.img"), "frame {frame}: {out}");
+                }
+                catch_up(&viewer, &mut viewer_display, &mut client);
+                assert!(
+                    client.pixels == display.framebuffer(),
+                    "frame {frame}, after {video_frames} video frames"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(video_frames > 10, "video frames: {video_frames}");
+        })
+        .await;
 }
 
 /// A client of a joined user, over TCP.

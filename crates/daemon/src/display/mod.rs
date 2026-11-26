@@ -668,8 +668,9 @@ impl Display {
     }
 
     /// Hands the framebuffer to the users who joined this connection, if
-    /// there are any: the tiles touched since the last frame, and all of it
-    /// when one of them still waits for its first frame.
+    /// there are any: the tiles touched since the last frame, whether this
+    /// display sends them as images or as video, and all of it when one of
+    /// them still waits for its first frame.
     fn share_frame(&self) {
         let Some(share) = &self.share else {
             return;
@@ -682,7 +683,9 @@ impl Display {
             lossless: self.lossless,
             video: self.video_support.is_some(),
         };
-        let regions = self.dirty_regions();
+        // The tiles under the owner's video too: it reaches the owner's
+        // client only, and the users who joined have no other way to them.
+        let regions = self.tile_regions(|tx, ty| self.dirty[(ty * self.tile_cols + tx) as usize]);
         share.publish(
             setup,
             Frame {
@@ -951,7 +954,7 @@ impl Display {
     pub fn flush(&mut self, out: &mut Output) -> FlushStats {
         let started = Instant::now();
         let mut stats = FlushStats::default();
-        // Before video mode takes tiles out of the comparison.
+        // While the touched tiles are still marked.
         self.share_frame();
         self.decay();
         self.last_flush = started;
