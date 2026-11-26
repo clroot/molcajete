@@ -79,6 +79,7 @@ fn fail_all(pending: &Pending) {
 
 pub struct VideoStream {
     pub layer: i32,
+    pub codec: VideoCodec,
     reader: FrameReader,
     decoder: JsVideoDecoder,
     /// Display slots awaiting decoder output, in decode order.
@@ -149,6 +150,7 @@ impl VideoStream {
 
         Ok(Self {
             layer,
+            codec,
             reader: FrameReader::default(),
             decoder,
             pending,

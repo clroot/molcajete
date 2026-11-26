@@ -41,6 +41,15 @@ impl VideoCodec {
         }
     }
 
+    /// The short name used in settings, metrics and the client's stats.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Av1 => "av1",
+            Self::H265 => "h265",
+            Self::H264 => "h264",
+        }
+    }
+
     pub fn from_mimetype(mimetype: &str) -> Option<Self> {
         match mimetype.split(';').next()?.trim() {
             MIMETYPE_AV1 => Some(Self::Av1),
@@ -178,6 +187,13 @@ mod tests {
             Some(VideoCodec::Av1)
         );
         assert_eq!(VideoCodec::from_mimetype("video/webm"), None);
+    }
+
+    #[test]
+    fn names_are_the_mimetype_subtypes() {
+        for codec in VideoCodec::ALL {
+            assert_eq!(format!("video/{}", codec.name()), codec.mimetype());
+        }
     }
 
     #[test]

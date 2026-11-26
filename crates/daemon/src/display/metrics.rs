@@ -386,11 +386,7 @@ impl DisplayMetrics {
 }
 
 pub(super) fn codec_label(codec: VideoCodec) -> &'static str {
-    match codec {
-        VideoCodec::Av1 => "av1",
-        VideoCodec::H265 => "h265",
-        VideoCodec::H264 => "h264",
-    }
+    codec.name()
 }
 
 /// Measures `f` and returns its result with the elapsed time.
