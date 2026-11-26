@@ -85,12 +85,20 @@ pub struct TunnelRequest {
 }
 
 /// Whether a browser may set parameter `name` to `value` for its own
-/// session. Only how the remote desktop follows the window can be set,
-/// which the session menu changes during a session anyway.
+/// session. Only how the remote desktop follows the window and the text
+/// size of a terminal can be set, which the session menu changes during a
+/// session anyway.
 pub fn valid_override(name: &str, value: &str) -> bool {
     match name {
         "dpi" => value.is_empty() || value.parse::<u32>().is_ok_and(|d| (24..=1200).contains(&d)),
         "resize-method" => matches!(value, "" | "display-update"),
+        // Points.
+        "font-size" => {
+            value.is_empty()
+                || value
+                    .parse::<f32>()
+                    .is_ok_and(|s| (4.0..=72.0).contains(&s))
+        }
         _ => false,
     }
 }
@@ -968,5 +976,18 @@ mod tests {
         // Empty: follow the client.
         let req = TunnelRequest::from_query("param.dpi=");
         assert!(!req.parameters(&connection).contains_key("dpi"));
+
+        // The text size of a terminal, within what can be read.
+        let req = TunnelRequest::from_query("param.font-size=9");
+        assert_eq!(
+            req.parameters(&connection)
+                .get("font-size")
+                .map(String::as_str),
+            Some("9")
+        );
+        for refused in ["0", "400", "NaN", "big"] {
+            let req = TunnelRequest::from_query(&format!("param.font-size={refused}"));
+            assert!(req.overrides.is_empty(), "{refused}");
+        }
     }
 }

@@ -102,6 +102,8 @@ pub struct ConnectionSummary {
     /// Display parameters the session page starts from (RDP).
     pub dpi: Option<String>,
     pub resize_method: Option<String>,
+    /// The text size a terminal starts with (`font-size`).
+    pub font_size: Option<String>,
     /// The `read-only`, `disable-copy` and `disable-paste` parameters, so
     /// the session page can say what is turned off.
     pub read_only: bool,
@@ -144,6 +146,7 @@ impl Database {
                       c.parent_id, \
                       h.parameter_value AS hostname, p.parameter_value AS port, \
                       d.parameter_value AS dpi, r.parameter_value AS resize_method, \
+                      fs.parameter_value AS font_size, \
                       ro.parameter_value AS read_only, dc.parameter_value AS disable_copy, \
                       dp.parameter_value AS disable_paste \
                       FROM molcajete_connection c \
@@ -156,6 +159,8 @@ impl Database {
                       LEFT JOIN molcajete_connection_parameter r \
                         ON r.connection_id = c.connection_id \
                         AND r.parameter_name = 'resize-method' \
+                      LEFT JOIN molcajete_connection_parameter fs \
+                        ON fs.connection_id = c.connection_id AND fs.parameter_name = 'font-size' \
                       LEFT JOIN molcajete_connection_parameter ro \
                         ON ro.connection_id = c.connection_id AND ro.parameter_name = 'read-only' \
                       LEFT JOIN molcajete_connection_parameter dc \
@@ -193,6 +198,7 @@ impl Database {
                     parent_id: row.try_get("parent_id")?,
                     dpi: row.try_get("dpi")?,
                     resize_method: row.try_get("resize_method")?,
+                    font_size: row.try_get("font_size")?,
                     read_only: flag(row, "read_only")?,
                     disable_copy: flag(row, "disable_copy")?,
                     disable_paste: flag(row, "disable_paste")?,
@@ -690,6 +696,7 @@ mod tests {
             changed
                 .parameters
                 .insert("resize-method".into(), "display-update".into());
+            changed.parameters.insert("font-size".into(), "10".into());
             assert_eq!(
                 db.update_connection(&changed).await.unwrap(),
                 as_read(changed),
@@ -744,6 +751,8 @@ mod tests {
                 (true, false, true),
                 "{name}"
             );
+            assert_eq!(summaries[1].font_size.as_deref(), Some("10"), "{name}");
+            assert_eq!(summaries[0].font_size, None, "{name}");
             assert!(!summaries[0].read_only, "{name}");
             assert_eq!(
                 (
