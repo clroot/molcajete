@@ -69,6 +69,12 @@ pub mod attributes {
     /// Let the user of a session record it from the session menu.
     pub const RECORD_ON_DEMAND: &str = "record-on-demand";
 
+    /// RDP sessions open with IronRDP's web client, molcajeted only
+    /// relaying the RDP stream (`ironrdp`).
+    pub const IRONRDP_DEFAULT: &str = "ironrdp-default";
+    /// The session menu switches between molcajete's client and IronRDP's.
+    pub const IRONRDP_SWITCH: &str = "ironrdp-switch";
+
     /// Every attribute the gateway knows.
     pub const ALL: &[&str] = &[
         RECORD,
@@ -76,6 +82,8 @@ pub mod attributes {
         RECORD_KEYS,
         RECORD_EXCLUDE_MOUSE,
         RECORD_MOLCAJETE_FORMATS,
+        IRONRDP_DEFAULT,
+        IRONRDP_SWITCH,
     ];
 }
 
@@ -109,6 +117,11 @@ pub struct ConnectionSummary {
     pub read_only: bool,
     pub disable_copy: bool,
     pub disable_paste: bool,
+    /// The [`attributes::IRONRDP_DEFAULT`] and
+    /// [`attributes::IRONRDP_SWITCH`] flags, so the session page knows
+    /// which client to start and whether it can switch.
+    pub ironrdp_default: bool,
+    pub ironrdp_switch: bool,
 }
 
 /// A boolean guacd parameter: on only when `"true"`, as guacd reads it.
@@ -148,7 +161,9 @@ impl Database {
                       d.parameter_value AS dpi, r.parameter_value AS resize_method, \
                       fs.parameter_value AS font_size, \
                       ro.parameter_value AS read_only, dc.parameter_value AS disable_copy, \
-                      dp.parameter_value AS disable_paste \
+                      dp.parameter_value AS disable_paste, \
+                      ird.attribute_value AS ironrdp_default, \
+                      irs.attribute_value AS ironrdp_switch \
                       FROM molcajete_connection c \
                       LEFT JOIN molcajete_connection_parameter h \
                         ON h.connection_id = c.connection_id AND h.parameter_name = 'hostname' \
@@ -168,7 +183,13 @@ impl Database {
                         AND dc.parameter_name = 'disable-copy' \
                       LEFT JOIN molcajete_connection_parameter dp \
                         ON dp.connection_id = c.connection_id \
-                        AND dp.parameter_name = 'disable-paste'";
+                        AND dp.parameter_name = 'disable-paste' \
+                      LEFT JOIN molcajete_connection_attribute ird \
+                        ON ird.connection_id = c.connection_id \
+                        AND ird.attribute_name = 'ironrdp-default' \
+                      LEFT JOIN molcajete_connection_attribute irs \
+                        ON irs.connection_id = c.connection_id \
+                        AND irs.attribute_name = 'ironrdp-switch'";
         let rows = if user.effective_role.can_manage_connections() {
             let sql = format!("{select} ORDER BY c.name, c.connection_id");
             query!(self, &sql).fetch_all(&self.pool).await?
@@ -202,6 +223,8 @@ impl Database {
                     read_only: flag(row, "read_only")?,
                     disable_copy: flag(row, "disable_copy")?,
                     disable_paste: flag(row, "disable_paste")?,
+                    ironrdp_default: flag(row, "ironrdp_default")?,
+                    ironrdp_switch: flag(row, "ironrdp_switch")?,
                 })
             })
             .collect::<Result<_, sqlx::Error>>()

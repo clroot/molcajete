@@ -70,6 +70,9 @@ ironrdp-rdpdr-native = "0.9"
 # compiled from source and needs a C++ compiler (`c++`, or `CXX=...`).
 openh264 = { version = "0.9", optional = true }
 ironrdp-rdpdr = "0.9"
+ironrdp-acceptor = "0.12"
+ironrdp-rdcleanpath = "0.3"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [features]
 # The same library decodes the H.264 of the RDP graphics pipeline where the

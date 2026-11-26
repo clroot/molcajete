@@ -22,6 +22,7 @@ mod graphics;
 mod keyboard;
 mod mouse;
 mod pacing;
+pub mod relay;
 mod settings;
 mod slow_path;
 mod tls;

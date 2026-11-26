@@ -184,6 +184,20 @@ describe('connection form', () => {
     });
   });
 
+  test('keeps the RDP client choice as attributes, for unrecorded RDP connections only', () => {
+    const ironrdp = {...rdp, attributes: {'ironrdp-default': 'true', 'ironrdp-switch': 'true'}};
+    const form = toConnectionForm(ironrdp);
+    expect(form.rdpClient).toEqual({client: 'ironrdp', canSwitch: true});
+    expect(toConnection(form)).toEqual({ok: true, connection: ironrdp});
+    expect(emptyConnectionForm().rdpClient).toEqual({client: 'molcajete', canSwitch: false});
+    // Recorded sessions use molcajete's client, which the gateway records.
+    const recorded = toConnection({...form, recording: {...form.recording, record: true}});
+    expect(recorded).toMatchObject({ok: true, connection: {attributes: {'record-sessions': 'true'}}});
+    // Other protocols have no choice to keep.
+    const vnc = toConnection(changeProtocol(form, 'vnc'));
+    expect(vnc).toMatchObject({ok: true, connection: {attributes: {}}});
+  });
+
   test('stored credentials are kept unless replaced or cleared', () => {
     const stored = {...rdp, storedSecrets: ['password', 'sftp-password']};
     const form = toConnectionForm(stored);

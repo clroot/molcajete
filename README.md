@@ -58,6 +58,12 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
   bar with the keys an on-screen keyboard lacks, scrolls and selects by
   touch, and stays above the keyboard; its text size changes during the
   session.
+- **IronRDP's web client for RDP.** A connection can open its sessions
+  with [IronRDP](https://github.com/Devolutions/IronRDP)'s web client
+  instead, which runs RDP in the browser while molcajeted only passes the
+  connection through, and the session menu can switch between the two.
+  The stored password stays on the server: molcajeted logs on with it and
+  the browser authenticates with a one-time credential.
 - **File transfer.** SFTP in SSH sessions and a shared drive in RDP
   sessions, with guacd's parameters: drag files onto the session to upload
   them, browse and download in the session menu's file panel. Large files

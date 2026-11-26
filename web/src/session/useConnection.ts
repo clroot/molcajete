@@ -5,11 +5,16 @@ import type {ConnectionDisplay} from './displaySettings';
 /** What the connection turns off for its users. */
 export type Restrictions = {readOnly: boolean; disableCopy: boolean; disablePaste: boolean};
 
+/** Which RDP client sessions open with, and whether the session menu switches. */
+export type RdpClientChoice = {client: 'molcajete' | 'ironrdp'; canSwitch: boolean};
+
 export type ConnectionInfo = {
   name: string;
   protocol: string | null;
   display: ConnectionDisplay;
   restrictions: Restrictions;
+  /** Older gateways, and one-time links, give molcajete's client only. */
+  rdpClient?: RdpClientChoice;
 };
 
 /**
@@ -18,7 +23,10 @@ export type ConnectionInfo = {
  * the tab title. `known` is used as it is instead of asking the API (a
  * session opened by a one-time link has no sign-in to ask with).
  */
-export function useConnection(connectionId: string, known?: ConnectionInfo) {
+export function useConnection(
+  connectionId: string,
+  known?: ConnectionInfo,
+): ConnectionInfo & {isLoaded: boolean} {
   const [connection, setConnection] = useState<ConnectionInfo>(
     () =>
       known ?? {
@@ -29,6 +37,7 @@ export function useConnection(connectionId: string, known?: ConnectionInfo) {
       },
   );
   const isKnown = known !== undefined;
+  const [isLoaded, setIsLoaded] = useState(isKnown);
   useEffect(() => {
     if (isKnown) return;
     let isCurrent = true;
@@ -50,10 +59,16 @@ export function useConnection(connectionId: string, known?: ConnectionInfo) {
               disableCopy: found.disableCopy ?? false,
               disablePaste: found.disablePaste ?? false,
             },
+            rdpClient: {
+              client: found.ironrdpDefault ? 'ironrdp' : 'molcajete',
+              canSwitch: found.ironrdpSwitch ?? false,
+            },
           });
         }
+        if (isCurrent) setIsLoaded(true);
       },
-      () => {}, // Keep showing the id.
+      // Keep showing the id, and open the session with molcajete's client.
+      () => isCurrent && setIsLoaded(true),
     );
     return () => {
       isCurrent = false;
@@ -68,5 +83,5 @@ export function useConnection(connectionId: string, known?: ConnectionInfo) {
     };
   }, [name]);
 
-  return connection;
+  return {...connection, isLoaded};
 }

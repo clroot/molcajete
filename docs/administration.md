@@ -89,6 +89,7 @@ Connection managers and administrators create and edit connections under *Connec
 - optionally **SSH jump hosts** to reach the server through ([below](#ssh-jump-hosts));
 - **clipboard and input** restrictions for every protocol, the usual controls against data leaving through a session: *Read-only* (`read-only`: keys, clicks, touches and the browser's clipboard are not sent), *Block copying from the remote side* (`disable-copy`) and *Block pasting into the remote side* (`disable-paste`). The daemon enforces them; the session shows a *Read-only* badge, and the session menu leaves out what is blocked (no clipboard field at all when both directions are);
 - for SSH and RDP, **file transfer** ([below](#file-transfer));
+- for RDP, the **client** sessions open with ([below](#ironrdps-web-client));
 - **recording** settings ([session recordings](#session-recordings));
 - the **folder** it is in.
 
@@ -110,7 +111,7 @@ security = "any"
 ignore-cert = "true"
 ```
 
-The attributes are the recording switches below: `record-sessions`, `record-exclude-mouse`, `record-keys` and `record-molcajete-formats`, each `"true"` when on. Unlike parameters they are never sent to the daemon.
+The attributes are the recording switches below, `record-sessions`, `record-on-demand`, `record-exclude-mouse`, `record-keys` and `record-molcajete-formats`, and the RDP client switches, `ironrdp-default` and `ironrdp-switch`; each is `"true"` when on. Unlike parameters they are never sent to the daemon.
 
 A password written in `[connections.parameters]` is encrypted in the database like one typed in the form, but it stays readable in `gateway.toml`. Remove it from the file once the connection is imported, or leave it out and type it in the form.
 
@@ -155,6 +156,24 @@ In a session, press Ctrl+Alt+Shift and choose **Files**: the panel lists the fol
 Large files are fine in both directions: uploads are read from disk piece by piece, and in Chrome and Edge a download is written to the file the user picks as it arrives. Firefox and Safari cannot write a download to disk as it arrives, so they keep it in memory until it is complete and the panel warns before downloading a file over 1 GiB. The session stays responsive during a transfer; on a slow link file data shares the bandwidth with the screen.
 
 Only the user who opened the session transfers files: users who [joined it](#sharing-a-session) get no file panel, as with guacd. Neither files nor folder listings end up in [session recordings](#session-recordings).
+
+### IronRDP's web client
+
+An RDP connection can open its sessions with [IronRDP](https://github.com/Devolutions/IronRDP)'s web client instead of molcajete's. IronRDP runs RDP in the browser, and molcajeted only passes the connection through: it does not decode, redraw or encode the screen, so a session reacts faster (on one Windows 11 host at 1920×1080, the Start menu opened in about 69 ms with a direct IronRDP client and in about 175 ms through molcajete). The *Client* section of the connection form sets it up:
+
+- **Open sessions with**: *molcajete* (the default) or *IronRDP* (`ironrdp-default`).
+- **Allow switching in the session menu** (`ironrdp-switch`): the session menu offers *Reconnect with IronRDP* or *Reconnect with molcajete*. Switching ends the session and connects again with the other client; Windows keeps the desktop as it was.
+
+The connection's stored password never reaches the browser. The page gets a one-time user name and password for each session, which molcajeted accepts in place of the real ones; molcajeted then signs in to the server with the stored credentials, through NLA when the server asks for it and in the logon information otherwise. A connection without a stored password shows the server's sign-in screen, unless the server requires NLA, in which case the session fails: there is nowhere to ask for the password.
+
+What an IronRDP session does not have:
+
+- **Recording.** The gateway records molcajete's own stream, so a connection with *Record sessions* cannot choose IronRDP (the form disables the section while it is on), and the session menu has no recording item.
+- **Sharing and watching** a session, the **file panel** and the **performance stats**. The session menu has *Ctrl+Alt+Del*, *Disconnect* and, where allowed, *Reconnect with molcajete*; keyboard, mouse and clipboard are IronRDP's own. On a touch screen a finger dragged scrolls, a tap clicks, a finger resting for half a second presses the left button and drags with it, and a two-finger tap right-clicks.
+- **Standard RDP Security** (`security=rdp`), which neither client supports. The connection's `security` still chooses between NLA and TLS.
+- **The graphics pipeline.** IronRDP's web client gets the screen as bitmap updates. Its graphics pipeline offers no H.264, and a Windows 11 host left that offer unanswered, so it is turned off.
+
+The session needs molcajeted as the connection's daemon; stock guacd refuses it. The first IronRDP session in a browser tab downloads the client, about 2.2 MB compressed.
 
 ### Stored credentials
 

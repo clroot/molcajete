@@ -124,6 +124,7 @@ Between molcajete components a few extensions are used. Each is offered in a way
 | SSH jump hosts (section 6.9) | `jump-hosts` and `jump-host-*` connection parameters, listed in molcajeted's `args` | molcajeted | the daemon connects to the server directly |
 | File transfer details (section 6.11) | two extra arguments of `filesystem` (downloads, uploads allowed), a `get-error` instruction, `size=` as a parameter of the listing's and the download's mimetype | molcajete web client | the panel offers both directions, a refused `get` stays unanswered, no sizes or progress totals |
 | `max-file-size` (section 6.11) | connection parameter listed in molcajeted's `args` | molcajeted | no limit |
+| RDP relay for IronRDP's web client (sections 5.10, 6.12) | `select,rdp-relay`, asked for only by a gateway whose connection chose IronRDP's client | molcajeted | stock guacd answers with an error and the session fails; there is no fallback to molcajete's client within the session |
 | Full-screen video (section 6.5) | `video-mode,<auto\|full-screen>` sent by molcajeted's sessions that stream video; the client answers with an `argv` stream `video-mode` | molcajete web UI, molcajeted | no switch in the session menu; busy areas only |
 
 How each extension behaves across component versions is tabulated in [Mixed versions](deployment.md#mixed-versions) in deployment.md.
@@ -387,6 +388,8 @@ The tunnel follows the stock contract of section 1.2, so guacamole-common-js wor
 
 The handshake, the framing and the tunnel's end are logged (`tunnel established` with `framing`, `tunnel closed` with byte counts); see [observability.md](observability.md).
 
+A tunnel opened with `ironrdp=<token>` carries RDP for IronRDP's web client instead (section 5.10).
+
 ### 5.2 Binary tunnel negotiation
 
 Each leg is negotiated on its own and falls back to the text protocol when the peer does not know the extension:
@@ -548,6 +551,20 @@ Every established tunnel registers in `sessions::Registry` (in `AppState`), in m
 - **Links** are kept in the registry next to the sessions: id, owner's tunnel id, SHA-256 of a 256-bit random token, read-only, expiry. The token is returned once. Keeping them in memory ties their lifetime to the session's, which a table could only imitate, and costs nothing at restart since no session outlives the gateway either. A link is the grant: the tunnel request needs only a signed-in user, and `policy::enforce` does not check a joined session against connection grants (only that its user exists and is enabled, and that a watching administrator still is one).
 - **Ending.** `Registry::end(id)` ends the session and everyone joined to it (`EndReason::OwnerLeft`, closing with `SUCCESS`); so does the owner's `Registration` being dropped, which also removes the session's links. Stock guacd keeps joined users connected after the owner leaves, so the gateway must do this itself. A joined tunnel registering after its owner's entry is gone ends at once. `revoke_link` removes the link and ends the sessions joined through it (`LinkRevoked`, `CLIENT_FORBIDDEN`).
 - **The page** names its tunnel with `page=<random id>`; the session's user manages sharing under `/api/my-sessions/{page}` (`Registry::by_page`), which avoids passing the tunnel id from the wasm client to the page. The page polls it every 4 s while connected to list who joined.
+
+### 5.10 IronRDP's web client (`ironrdp.rs`)
+
+A connection with `ironrdp-default` or `ironrdp-switch` (attributes, section 5.5) can be opened with [IronRDP](https://github.com/Devolutions/IronRDP)'s web client, which runs RDP in the browser. The browser cannot open TCP connections or run TLS, so it reaches the server through an RDCleanPath proxy: it sends its X.224 Connection Request in an RDCleanPath request, the proxy connects and completes the negotiation and TLS, and the browser's bytes are from then on the content of the TLS stream. molcajeted is that proxy (section 6.12); the gateway authorizes the session and carries the bytes.
+
+```
+POST /api/connections/{id}/ironrdp                       → token, username, password (one-time)
+GET  /websocket-tunnel?connection={id}&ironrdp={token}   → select,rdp-relay … ready, then binary messages both ways
+```
+
+- **One-time credential.** IronRDP's client must authenticate, and the connection's stored credentials must not reach the browser. The page asks for a random user name and password with a token (`ironrdp::Grants`, in memory): valid for 60 s, for one tunnel, of the same user to the same connection. The tunnel takes it and passes it to molcajeted as `relay-username` and `relay-password`, replacing stored parameters of those names; molcajeted accepts only it from the browser. A wrong, used or expired token closes the tunnel with `CLIENT_FORBIDDEN`.
+- **Which connections.** RDP only, and not with `record-sessions`: the gateway records the Guacamole stream, and here there is none. Saving a connection with both is refused; the grant and the tunnel check again (`ironrdp::allowed`).
+- **Relay.** After `ready`, binary WebSocket messages go to molcajeted as they are and what molcajeted sends goes out as binary messages; text messages are ignored. There are no tunnel instructions (UUID, pings): IronRDP's client offers no subprotocol and expects only RDCleanPath and RDP. The session is registered (section 5.9), so it is listed, can be ended and goes into the history; it cannot be joined, watched or recorded from the menu, since molcajeted serves no display for it.
+- **The page** (`SessionRoute.tsx`, `IronRdpSessionPage.tsx`) loads `@devolutions/iron-remote-desktop` and its RDP backend only for these sessions, and switches between the two clients by reconnecting. IronRDP's component reads only the mouse and the wheel, so on a touch screen a finger would scroll the page (and pull it down to reload); `ironrdpTouch.ts` takes the touches and sends the component mouse and wheel events instead: a drag scrolls by its distance, a tap clicks, a finger resting for 500 ms presses the left button and drags with it, a two-finger tap right-clicks. While the session is open the page itself never scrolls (`blockPageScroll`: no overscroll on the document, and touch moves outside a dialog are cancelled), so a pull that starts at an edge or on an overlay does not reload it either; the session menu still scrolls. It turns IronRDP's graphics pipeline off (`legacyGraphics`): the web build has no H.264 decoder and offers only version 8 without AVC, and a Windows 11 host never answered that offer, leaving the screen black, while bitmap updates worked.
 
 ## 6. molcajeted (`molcajete-daemon`)
 
@@ -738,6 +755,19 @@ Paths from the client are split on `/` and `\`; `..` and NUL are refused rather 
 **RDP: the drive** (`enable-drive`, `drive-path`, `create-drive-path`, `drive-name`, `disable-download`, `disable-upload`). The directory is opened (and with `create-drive-path` its last component created, mode 0700) before connecting, and announced on RDPDR as a filesystem device served by IronRDP's native backend for the platform (`ironrdp-rdpdr-native`). On Linux and macOS, `NixRdpdrBackend` resolves the server's paths one component at a time below the directory without following symbolic links, and answers directory queries only in `FileBothDirectoryInformation`, which Windows uses; `rdp/drive.rs` wraps it to answer the classes xrdp asks for (`FileDirectoryInformation`, and the full and names-only classes). On Windows, `WindowsRdpdrBackend` opens paths relative to the directory's handle without following reparse points (symbolic links, junctions) and answers every class itself; it completes waiting byte-range locks and directory change notifications on worker threads, which the session loop collects every 50 ms (`poll_deferred_messages`), so Explorer on the server refreshes when a file is uploaded. On both, the wrapper turns the `/` separators xrdp sends into `\`. The browser side of the same directory resolves paths one component at a time too and refuses symbolic links; on Windows it also refuses components Windows would not read as a plain name (a drive prefix, `:` streams, device names such as `CON`, trailing dots and spaces), since pushing `C:` onto a path replaces it. A directory that cannot be opened leaves the session without a drive.
 
 `max-file-size` (MiB, a molcajeted extension) applies to both directions; guacd has no such limit.
+
+### 6.12 RDP relay (`rdp/relay.rs`)
+
+`select,rdp-relay` serves an RDP connection for a client that runs RDP itself (section 5.10). The handshake offers the RDP and jump host parameters plus `relay-username` and `relay-password`; after `ready` the connection carries RDCleanPath and RDP bytes, and errors go to the browser as RDCleanPath error PDUs.
+
+1. Read the RDCleanPath request (at most 64 KiB). Its destination and proxy token are not used: the gateway chose the connection and authorized the user.
+2. Connect to the server, through jump hosts if configured (section 6.9), and send the browser's X.224 Connection Request with the stored user in its cookie and only the protocols both the browser and the connection's `security` allow. A failure answer goes to the browser as a negotiation error, which IronRDP explains itself; Standard RDP Security is refused.
+3. TLS with the server (section 6.8, `ignore-cert` as usual), then the RDCleanPath response: the server's X.224 Connection Confirm and a self-signed certificate of molcajeted's own (`rcgen`, one per process).
+4. **NLA** (HYBRID, HYBRID_EX). The browser binds CredSSP to the public key of the first certificate in the response, so its CredSSP ends in molcajeted. molcajeted runs IronRDP's CredSSP server (`ironrdp-acceptor`, NTLM) against the one-time credential, then its CredSSP client against the server with the stored credentials. IronRDP's client reads the server's Early User Authorization Result (HYBRID_EX) itself, so molcajeted sends the browser one of its own: success, or access denied when the server refused. NLA without a stored user name and password is refused before the response.
+5. **Client Info PDU.** The browser's PDUs are forwarded one by one until the Client Info PDU, the only one that carries the user name and password. It must name the one-time user; its credentials and domain are replaced by the stored ones, with auto-logon when a password is stored, and it is encoded again with new TPKT, X.224 and MCS lengths. Without NLA this is the only way the server learns the credentials; with NLA it keeps the logon information consistent with what CredSSP delegated.
+6. From then on both directions are copied unchanged until either side closes.
+
+The stored credentials thus stay in molcajeted, as with its own RDP client. Standard RDP Security cannot be relayed this way: its Client Info PDU is encrypted between the client and the server.
 
 ## 7. Verification
 
@@ -949,7 +979,7 @@ Tracked as issues:
 
 Not yet tracked:
 
-1. **molcajeted protocols.** Telnet and Kubernetes (the web UI already treats them as terminals for stock guacd). SSH: agent forwarding, italics and colour emoji. RDP: RemoteApp, receiving EGFX/H.264 and relaying the server's stream as is, AAC/Opus audio, Kerberos, bulk compression once IronRDP can reactivate with it.
+1. **molcajeted protocols.** Telnet and Kubernetes (the web UI already treats them as terminals for stock guacd). SSH: agent forwarding, italics and colour emoji. RDP: RemoteApp, receiving EGFX/H.264 and relaying the server's stream as is, AAC/Opus audio, Kerberos, bulk compression once IronRDP can reactivate with it. IronRDP's web client (section 5.10): its graphics pipeline, which needs H.264 decoding in the browser (WebCodecs) in IronRDP's web build, and servers that need NLA but have no stored password.
 2. **Input.** Audio input (microphone); touch and multi-touch for desktops (terminals have their own, section 4.7), an on-screen keyboard for them; function keys in the terminal key bar.
 3. **Gateway.** LDAP, TLS to the daemon, an HTTP tunnel for networks without WebSocket, temporary connections (target and credentials) created together with a one-time session link and deleted after the session. A general per-address rate limit for the API and for opening tunnels (only failed sign-ins are limited; the nginx example limits requests and connections per address), failed-sign-in counters shared between replicas, and connection credentials kept in HashiCorp Vault or OpenBao (KV) and referenced from a parameter, instead of encrypted in the database.
 4. **Recordings.** Checkpoints (copies of the layers every so often) so that seeking backward does not replay from the start, at the price of GPU memory and of video streams whose decoder state cannot be copied; playing audio; showing the key log of a recording with keys; recording in molcajeted for deployments without the gateway.

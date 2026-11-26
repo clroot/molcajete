@@ -64,6 +64,8 @@ type Props = {
   remoteComposition: boolean | null;
   onRemoteCompositionChange: (isRemote: boolean) => void;
   onCtrlAltDel: () => void;
+  /** Reconnects with IronRDP's client; `null` when the connection does not allow it. */
+  onSwitchClient: (() => void) | null;
   onDisconnect: () => void;
   /** Starting and stopping a recording, when the gateway knows the session. */
   recording?: ReactNode;
@@ -262,6 +264,15 @@ export default function SessionMenu(props: Props) {
                   value={props.remoteComposition}
                   onChange={props.onRemoteCompositionChange}
                 />
+              )}
+              {props.onSwitchClient && (
+                <VStack gap={2}>
+                  <Button label="Reconnect with IronRDP" variant="secondary" onClick={props.onSwitchClient} />
+                  <Text type="supporting" color="secondary">
+                    Runs RDP in this browser for less delay. Recording, sharing and the file panel are not
+                    available there.
+                  </Text>
+                </VStack>
               )}
               <Switch
                 label="Show performance stats"

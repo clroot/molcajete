@@ -13,6 +13,7 @@ mod client_report;
 mod config;
 mod db;
 mod guacd;
+mod ironrdp;
 mod oidc;
 mod proxy;
 mod recording;
@@ -99,6 +100,8 @@ pub struct AppState {
     pub oidc: Option<oidc::Oidc>,
     /// Failed password sign-ins and the Argon2 verification slots.
     pub throttle: throttle::LoginThrottle,
+    /// One-time credentials for IronRDP's web client.
+    pub ironrdp: ironrdp::Grants,
 }
 
 impl AppState {
@@ -243,6 +246,7 @@ fn router(state: Arc<AppState>) -> Router {
         )
         .route("/connections/{id}/parent", put(api::move_connection))
         .route("/connections/{id}/tickets", post(tickets::create))
+        .route("/connections/{id}/ironrdp", post(ironrdp::create))
         .route("/tickets/{ticket}", get(tickets::info))
         .route("/tokens", get(tokens::list).post(tokens::create))
         .route("/tokens/{id}", delete(tokens::revoke))
@@ -451,6 +455,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         throttle: throttle::LoginThrottle::new(&config.auth.throttle),
+        ironrdp: ironrdp::Grants::default(),
         config,
         db,
         client_reports: cli.client_reports,
@@ -482,6 +487,8 @@ mod tests {
 
     use super::*;
 
+    /// IronRDP's web client and the RDP relay (src/tests/ironrdp.rs).
+    mod ironrdp;
     /// Live sessions and the connection history (src/tests/live_sessions.rs).
     mod live_sessions;
     /// Recording sessions from the session menu (src/tests/on_demand_recording.rs).
@@ -531,6 +538,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(AppState {
             throttle: throttle::LoginThrottle::new(&config.auth.throttle),
+            ironrdp: crate::ironrdp::Grants::default(),
             config,
             db,
             client_reports: false,

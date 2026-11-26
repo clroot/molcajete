@@ -24,6 +24,12 @@ impl<R: AsyncRead + Unpin> GuacReader<R> {
         }
     }
 
+    /// The socket and the bytes read from it that no instruction has
+    /// taken yet, for a connection that stops speaking Guacamole.
+    pub fn into_parts(self) -> (R, Vec<u8>) {
+        (self.socket, self.parser.pending().to_vec())
+    }
+
     /// Next instruction, or `None` at end of stream.
     pub async fn next(&mut self) -> std::io::Result<Option<Instruction>> {
         loop {
@@ -181,6 +187,13 @@ impl<W: AsyncWrite + Unpin> GuacWriter<W> {
             bytes: metrics::Counter::noop(),
             write_time: metrics::Histogram::noop(),
         }
+    }
+
+    /// The socket, for a connection that stops speaking Guacamole.
+    /// Everything pushed must have been flushed.
+    pub fn into_inner(self) -> W {
+        debug_assert!(self.buf.is_empty());
+        self.socket
     }
 
     /// Starts recording output metrics labelled with `protocol`.

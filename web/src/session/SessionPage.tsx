@@ -83,9 +83,13 @@ type Props = {
    * and no reconnecting (the ticket is used up).
    */
   ticket?: {ticket: string; connection: ConnectionInfo};
+  /** The connection as already loaded, instead of asking the API again. */
+  connection?: ConnectionInfo;
+  /** Reconnects with IronRDP's client; absent when the connection does not allow switching. */
+  onSwitchClient?: () => void;
 };
 
-export default function SessionPage({connectionId, ticket}: Props) {
+export default function SessionPage({connectionId, ticket, connection, onSwitchClient}: Props) {
   const displayRef = useRef<HTMLDivElement>(null);
   const [session, dispatch] = useSessionEvents();
   const [files, dispatchFiles] = useFiles();
@@ -96,7 +100,7 @@ export default function SessionPage({connectionId, ticket}: Props) {
     protocol,
     display: connectionDisplay,
     restrictions,
-  } = useConnection(connectionId, ticket?.connection);
+  } = useConnection(connectionId, ticket?.connection ?? connection);
   const ticketId = ticket?.ticket;
   const [remoteComposition, setRemoteComposition] = useRemoteComposition(connectionId);
   const displayChoices = useDisplayChoices(connectionId);
@@ -400,6 +404,7 @@ export default function SessionPage({connectionId, ticket}: Props) {
         remoteComposition={hasRemoteIme(protocol) ? remoteComposition : null}
         onRemoteCompositionChange={setRemoteComposition}
         onCtrlAltDel={() => client()?.send_ctrl_alt_del()}
+        onSwitchClient={onSwitchClient ?? null}
         onDisconnect={
           isTicket
             ? () => {

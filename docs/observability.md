@@ -56,10 +56,10 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `molcajeted_connections_active` | gauge | protocol | Open connections |
-| `molcajeted_connections_total` | counter | protocol, result | Connections by how they ended: `ok`, `error`, `handshake_failed`, `unsupported` (protocol `unknown` for the last two when the handshake did not get that far) |
+| `molcajeted_connections_total` | counter | protocol, result | Connections by how they ended: `ok`, `error`, `handshake_failed`, `unsupported` (protocol `unknown` for the last two when the handshake did not get that far). The relay for IronRDP's web client counts as protocol `rdp-relay`, here and in the two metrics around this one |
 | `molcajeted_session_duration_seconds` | histogram | protocol | Session length |
 | `molcajeted_joined_users_active` | gauge | protocol | Users who joined a connection (share links, administrators watching); each also counts in the frame and image metrics, since it gets frames of its own |
-| `molcajeted_remote_received_bytes_total` | counter | protocol | Bytes read from the remote server's socket (`rdp`: TLS records, handshake included; `vnc`) |
+| `molcajeted_remote_received_bytes_total` | counter | protocol | Bytes read from the remote server's socket (`rdp`: TLS records, handshake included; `rdp-relay`: the same for IronRDP's client; `vnc`) |
 | `molcajeted_remote_frames_total` | counter | protocol | `rdp` only: frames the server marked the end of with Frame Marker surface commands (graphics pipeline frames are counted by `molcajeted_rdp_gfx_frames_total`). Zero for a server that sends classic bitmap updates; molcajeted then cannot keep its updates whole |
 | `molcajeted_remote_decode_seconds` | histogram | protocol | `rdp` only: decoding one PDU from the server (IronRDP, bitmap decompression) and copying its graphics updates into the display, on the session loop. The graphics pipeline decodes on a thread of its own (`molcajeted_rdp_gfx_frame_decode_seconds`); here its frames only count with the time to copy them into the display, one observation per batch of frames |
 | `molcajeted_remote_writes_total` | counter | protocol, cause | `rdp` only: writes to the server's connection, each a TLS record and a system call of its own, by `cause`: `response` (answers to what the server sent: frame acknowledgements, channel replies, network measurements), `input` (keys and pointer events), `other` (clipboard, resizing, redraw requests) |
@@ -95,7 +95,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | --- | --- | --- | --- |
 | `molcajete_gateway_handshake_seconds` | histogram | connection, protocol | Handshake with molcajeted or guacd, including its connection to the remote server |
 | `molcajete_gateway_handshake_failures_total` | counter | connection, protocol | Failed handshakes |
-| `molcajete_gateway_tunnels_rejected_total` | counter | reason | Tunnels refused before a handshake: `unknown_connection` (no such connection, or the user may not open it), `join` (an unknown, expired or revoked share link, or watching refused) |
+| `molcajete_gateway_tunnels_rejected_total` | counter | reason | Tunnels refused before a handshake: `unknown_connection` (no such connection, or the user may not open it), `join` (an unknown, expired or revoked share link, or watching refused), `ironrdp_grant` (an IronRDP tunnel without a valid one-time credential: unknown, used, expired, another user's or connection's, or the connection no longer allows IronRDP), `credentials` (the stored credentials could not be decrypted) |
 | `molcajete_gateway_recording_failures_total` | counter | connection, protocol | Sessions refused because their recording could not be started |
 | `molcajete_gateway_tunnels_active` | gauge | connection, protocol | Open tunnels |
 | `molcajete_gateway_tunnels_total` | counter | connection, protocol, status | Closed tunnels by Guacamole status code |
@@ -144,11 +144,14 @@ Both processes log to stdout. With `--log-format json`, every line is one JSON o
 | `message` | Source | Main fields |
 | --- | --- | --- |
 | `opening tunnel` | gateway | `connection`, `protocol`, `width`, `height`, `overrides` (display parameters the browser asked for), `record` |
-| `tunnel established` | gateway | `guacd_id`, `version`, `framing` (`text`, `transcoded`, `binary`), `handshake_ms` |
+| `tunnel established` | gateway | `guacd_id`, `version`, `framing` (`text`, `transcoded`, `binary`, or `rdp` for IronRDP's client), `handshake_ms` |
 | `tunnel closed` | gateway | `status`, `duration_s`, `bytes_to_browser`, `bytes_to_guacd`, and for a session the gateway ended `ended_for` (`admin`, `user_disabled`, `user_deleted`, `access_revoked`) and `ended_by` |
 | `ending session` | gateway | `session` (tunnel id), `user`, `connection`, `reason`, `by` |
 | `client report` | gateway | `session`, `tunnel_id`, `guacd_id`, `connection`, `mode`, `browser`, `device`, `samples`, `fps_avg`, `fps_min`, `frame_lag_ms_avg`, `frame_lag_ms_max`, `frame_receive_ms_max`, `images_per_s`, `image_decode_ms_max`, `frame_present_ms_avg`, `frame_present_ms_max`, `rtt_ms_avg`, `queued_ops_max`, `recv_bytes_per_s`, `send_buffered_max`, `display_width`, `display_height` |
 | `guacd handshake failed`, `tunnel requested for unknown or forbidden connection` | gateway | `error`, `connection` |
+| `opening tunnel` with `client="ironrdp"`, `RDP relay handshake failed`, `IronRDP tunnel without a valid one-time credential` | gateway | A session of IronRDP's web client ([administration](administration.md#ironrdps-web-client)); a failed handshake usually means the daemon is stock guacd or an older molcajeted |
+| `relay established`, `RDP relay negotiated`, `relay closed` | molcajeted | The relay for IronRDP's client: `protocol` (`SSL`, `HYBRID`, `HYBRID_EX`) the server chose. With `RUST_LOG=…,molcajete_daemon::rdp=debug` also when the credentials went into the Client Info PDU and how many bytes each direction carried |
+| `relay refused`, `relay failed` | molcajeted | `error`: missing parameters, the server unreachable, a refused negotiation (Standard RDP Security, or NLA without a stored password), TLS, the browser's one-time credential, or the server's sign-in |
 | `connection established` | molcajeted | `width`, `height`, `dpi`, `image` (mimetypes the client announced), `video`, `binary` |
 | `connection closed` | molcajeted | `duration_s` |
 | `display summary` | molcajeted | Whole-session `frames`, `fps_avg`, `encoded_bytes`, `flush_ms_avg/max`, `scroll_ms_avg`, `moves_ms_avg`, `pixels_ms_avg`, `frame_images_max`, `scroll_copies`, `move_copies`, `client_ack_ms_avg/max`, `client_ack_wait_ms_avg/max`, `png_*`, `jpeg_*`, `zstd_*` (`images`, `bytes`, `ms_avg`, `ms_max`), `video_frames`, `video_bytes`, `video_encode_ms_avg/max` |

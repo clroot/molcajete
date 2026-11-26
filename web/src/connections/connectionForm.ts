@@ -25,6 +25,7 @@ export type ConnectionForm = {
   /** Every other guacd parameter, edited as free name/value pairs. */
   extras: ExtraParameter[];
   recording: RecordingChoices;
+  rdpClient: RdpClientChoices;
   /**
    * Credentials the gateway has stored. Their values never reach the form:
    * a value typed into `fields` replaces one, and saving without keeps it.
@@ -111,6 +112,36 @@ function toAttributes(r: RecordingChoices): Record<string, string> {
   return Object.fromEntries(flags.filter(([, on]) => on).map(([name]) => [name, 'true']));
 }
 
+/** Which client RDP sessions open with, and whether the session menu switches. */
+export type RdpClientChoices = {client: 'molcajete' | 'ironrdp'; canSwitch: boolean};
+
+const MOLCAJETE_CLIENT: RdpClientChoices = {client: 'molcajete', canSwitch: false};
+
+function toRdpClientChoices(attributes: Record<string, string> = {}): RdpClientChoices {
+  return {
+    client: attributes[ATTRIBUTES.ironrdpDefault] === 'true' ? 'ironrdp' : 'molcajete',
+    canSwitch: attributes[ATTRIBUTES.ironrdpSwitch] === 'true',
+  };
+}
+
+/**
+ * Whether IronRDP's client can be chosen: for RDP only, and not for
+ * recorded sessions, which the gateway records from molcajete's stream.
+ */
+function offersIronRdp(form: Pick<ConnectionForm, 'protocol' | 'recording'>) {
+  return form.protocol === 'rdp' && !form.recording.record;
+}
+
+/** The IronRDP attributes, left out where the client cannot be chosen. */
+function rdpClientAttributes(form: ConnectionForm): Record<string, string> {
+  if (!offersIronRdp(form)) return {};
+  const {client, canSwitch} = form.rdpClient;
+  return {
+    ...(client === 'ironrdp' ? {[ATTRIBUTES.ironrdpDefault]: 'true'} : {}),
+    ...(canSwitch ? {[ATTRIBUTES.ironrdpSwitch]: 'true'} : {}),
+  };
+}
+
 let nextExtraKey = 1;
 export const extraParameter = (name = '', value = ''): ExtraParameter => ({key: nextExtraKey++, name, value});
 
@@ -154,6 +185,7 @@ export function emptyConnectionForm(parentId: string | null = null): ConnectionF
     fields: {},
     extras: [],
     recording: NO_RECORDING,
+    rdpClient: MOLCAJETE_CLIENT,
     storedSecrets: [],
     clearedSecrets: [],
   };
@@ -170,6 +202,7 @@ export function toConnectionForm(c: Connection): ConnectionForm {
     parentId: c.parentId ?? '',
     ...splitParameters(c.protocol, c.parameters),
     recording: toRecordingChoices(c.attributes),
+    rdpClient: toRdpClientChoices(c.attributes),
     storedSecrets: c.storedSecrets ?? [],
     clearedSecrets: [],
   };
@@ -240,7 +273,7 @@ export function toConnection(form: ConnectionForm): FormResult {
       parameters,
       ...(clearSecrets.length > 0 ? {clearSecrets} : {}),
       ...(form.parentId ? {parentId: form.parentId} : {}),
-      attributes: toAttributes(form.recording),
+      attributes: {...toAttributes(form.recording), ...rdpClientAttributes(form)},
     },
   };
 }

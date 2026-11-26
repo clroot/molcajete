@@ -21,6 +21,7 @@ import ParameterInput, {type StoredSecret} from './ParameterInput';
 import AdvancedSettings from './AdvancedSettings';
 import {folderOptions} from './tree';
 import RecordingSettings from './RecordingSettings';
+import RdpClientSettings from './RdpClientSettings';
 import JumpHostSettings from './JumpHostSettings';
 import FileTransferSettings from './FileTransferSettings';
 import {fileTransferSwitch} from './fileTransfer';
@@ -179,6 +180,17 @@ export default function ConnectionFormView({isNew, initial, folders, onClose, on
           />
 
           <Divider />
+
+          {form.protocol === 'rdp' && (
+            <>
+              <RdpClientSettings
+                rdpClient={form.rdpClient}
+                isRecorded={form.recording.record}
+                onChange={rdpClient => update({rdpClient})}
+              />
+              <Divider />
+            </>
+          )}
 
           <RecordingSettings recording={form.recording} onChange={recording => update({recording})} />
 

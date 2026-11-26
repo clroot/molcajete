@@ -7,6 +7,8 @@
       "dependencies": {
         "@astryxdesign/core": "^0.7.17",
         "@astryxdesign/theme-neutral": "^0.7.17",
+        "@devolutions/iron-remote-desktop": "0.12.0",
+        "@devolutions/iron-remote-desktop-rdp": "0.8.0",
         "@heroicons/react": "^2.2.0",
         "@stylexjs/stylex": "^0.19.2",
         "react": "^19.3.1",
@@ -119,6 +121,10 @@
     "@cacheable/utils": ["@cacheable/utils@2.5.0", "", { "dependencies": { "hashery": "^1.5.1", "keyv": "^5.6.0" } }, "sha512-buipgOVDkkPXNR5+xBpDw7Zk2n1EvU7qBJCNUcL7rhQ//kfpOXPAvQ511Os0vpLYJ1pZnvudNytkQt2hst3wqA=="],
 
     "@csstools/css-syntax-patches-for-csstree": ["@csstools/css-syntax-patches-for-csstree@1.1.6", "", { "peerDependencies": { "css-tree": "^3.2.1" }, "optionalPeers": ["css-tree"] }, "sha512-TcJCWFbXLPpJYq6z7bfOyjWYJDiDg2/I4gyUC9pqPNqHFRIey0EB0q0L5cSnQDfWJg8Jd6VadakxdIez/3zkqQ=="],
+
+    "@devolutions/iron-remote-desktop": ["@devolutions/iron-remote-desktop@0.12.0", "", {}, "sha512-QdSJjec1t2Mu9dmUupF1ofpk5rhzr7FnPOcyfvuu4plVPywZtXE/jvkPTKYHhVrl6oXnPMjBftWh4H8fa7bbrw=="],
+
+    "@devolutions/iron-remote-desktop-rdp": ["@devolutions/iron-remote-desktop-rdp@0.8.0", "", {}, "sha512-NlXHd1MvL/lq1yrrzJNQUIPWK89iwsqOpf2avzvGfmNdCKWxQuos50UzU2s8WcF88pxIq+bii7hcdFzT59AwQQ=="],
 
     "@dual-bundle/import-meta-resolve": ["@dual-bundle/import-meta-resolve@4.2.1", "", {}, "sha512-id+7YRUgoUX6CgV0DtuhirQWodeeA7Lf4i2x71JS/vtA5pRb/hIGWlw+G6MeXvsM+MXrz0VAydTGElX1rAfgPg=="],
 

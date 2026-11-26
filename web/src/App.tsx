@@ -8,7 +8,7 @@ import LoginPage from './auth/LoginPage';
 import ConnectionsPage from './connections/ConnectionsPage';
 import UsersPage from './users/UsersPage';
 import GroupsPage from './groups/GroupsPage';
-import SessionPage from './session/SessionPage';
+import SessionRoute from './session/SessionRoute';
 import TicketSessionPage from './session/TicketSessionPage';
 import TokensPage from './tokens/TokensPage';
 import JoinedSessionPage from './session/JoinedSessionPage';
@@ -69,7 +69,7 @@ function SignInGate() {
 function SignedInApp({user, onSignOut}: {user: Me; onSignOut: () => void}) {
   const route = useRoute();
   if (route.name === 'session') {
-    return <SessionPage key={route.connectionId} connectionId={route.connectionId} />;
+    return <SessionRoute key={route.connectionId} connectionId={route.connectionId} />;
   }
   if (route.name === 'join') {
     return <JoinedSessionPage key={route.token} kind="link" id={route.token} />;
