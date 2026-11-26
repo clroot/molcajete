@@ -496,6 +496,8 @@ mod tests {
     mod live_sessions;
     /// Recording sessions from the session menu (src/tests/on_demand_recording.rs).
     mod on_demand_recording;
+    /// Sessions resumed by the tab that opened them (src/tests/resume.rs).
+    mod resume;
     /// Share links and administrators watching sessions (src/tests/sharing.rs).
     mod sharing;
 
