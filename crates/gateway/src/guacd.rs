@@ -13,12 +13,17 @@
 //! stream data, the gateway answers it with the framing version and
 //! molcajeted sends records after `ready` instead of text. Stock guacd does
 //! not list the parameter and is never asked.
+//!
+//! It also lists [`molcajete_protocol::resume::HANDSHAKE_ARG`], which the
+//! gateway answers with a resume key (`crate::resume`) when the tunnel may
+//! get a held session back; molcajeted then answers `ready,<id>,resumed`
+//! when it did.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use molcajete_protocol::{
-    Instruction, InstructionBuilder, Limits, Parser, ProtocolVersion, Status, binary,
+    Instruction, InstructionBuilder, Limits, Parser, ProtocolVersion, Status, binary, resume,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -94,6 +99,8 @@ pub struct GuacdSession {
     /// (`molcajete_protocol::binary`) from here on. The bytes left in
     /// `parser` are then the start of the first records.
     pub binary: bool,
+    /// molcajeted gave a session it held back instead of starting one.
+    pub resumed: bool,
 }
 
 /// Connects and performs the handshake. With `want_binary`, a daemon that
@@ -106,7 +113,22 @@ pub async fn connect(
     want_binary: bool,
     timeout: Duration,
 ) -> Result<GuacdSession, HandshakeError> {
-    let handshake = connect_inner(addr, select, parameters, info, want_binary);
+    connect_resumable(addr, select, parameters, info, want_binary, None, timeout).await
+}
+
+/// [`connect`] for a session molcajeted may hold under `resume` (a key
+/// from `crate::resume::key`) when the tunnel ends, and give back to a
+/// later handshake with the same key ([`GuacdSession::resumed`]).
+pub async fn connect_resumable(
+    addr: (&str, u16),
+    select: &str,
+    parameters: &BTreeMap<String, String>,
+    info: &ClientInfo,
+    want_binary: bool,
+    resume: Option<&str>,
+    timeout: Duration,
+) -> Result<GuacdSession, HandshakeError> {
+    let handshake = connect_inner(addr, select, parameters, info, want_binary, resume);
     match tokio::time::timeout(timeout, handshake).await {
         Ok(result) => result,
         Err(_) => Err(HandshakeError::Timeout),
@@ -119,6 +141,7 @@ async fn connect_inner(
     parameters: &BTreeMap<String, String>,
     info: &ClientInfo,
     want_binary: bool,
+    resume_key: Option<&str>,
 ) -> Result<GuacdSession, HandshakeError> {
     let mut stream = TcpStream::connect(addr)
         .await
@@ -163,6 +186,11 @@ async fn connect_inner(
             values.push(value.to_owned());
             continue;
         }
+        // Likewise the resume key.
+        if name == resume::HANDSHAKE_ARG {
+            values.push(resume_key.unwrap_or_default().to_owned());
+            continue;
+        }
         values.push(parameters.get(name).cloned().unwrap_or_default());
     }
 
@@ -194,6 +222,7 @@ async fn connect_inner(
         .first()
         .cloned()
         .ok_or_else(|| HandshakeError::Protocol("`ready` without connection id".into()))?;
+    let resumed = resume_key.is_some() && ready.arg(1) == resume::READY_RESUMED;
 
     Ok(GuacdSession {
         stream,
@@ -201,6 +230,7 @@ async fn connect_inner(
         id,
         version,
         binary,
+        resumed,
     })
 }
 
@@ -363,6 +393,39 @@ mod tests {
             let received = server.await.unwrap();
             let connect = received.last().unwrap();
             assert_eq!(connect.args, ["VERSION_1_5_0", "example", value]);
+        }
+    }
+
+    #[tokio::test]
+    async fn passes_the_resume_key_and_learns_of_a_resume() {
+        // Stored under the same name, the parameter is not passed on.
+        let params = BTreeMap::from([(resume::HANDSHAKE_ARG.to_owned(), "stored".to_owned())]);
+        for (key, ready, value, resumed) in [
+            (Some("k1"), "5.ready,5.$abcd,7.resumed;", "k1", true),
+            (Some("k1"), "5.ready,5.$abcd;", "k1", false),
+            (None, "5.ready,5.$abcd,7.resumed;", "", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(fake_guacd(
+                listener,
+                "4.args,13.VERSION_1_5_0,16.molcajete-resume,16.molcajete-binary;",
+                ready,
+            ));
+            let session = connect_resumable(
+                ("127.0.0.1", port),
+                "ssh",
+                &params,
+                &ClientInfo::default(),
+                false,
+                key,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(session.resumed, resumed, "{ready}");
+            let received = server.await.unwrap();
+            assert_eq!(received.last().unwrap().args, ["VERSION_1_5_0", value, ""]);
         }
     }
 

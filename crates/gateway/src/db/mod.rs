@@ -178,6 +178,20 @@ impl Database {
         self.secrets.as_deref().map(SecretKeys::current_id)
     }
 
+    /// The key resume keys are made with (`crate::resume`): derived from
+    /// the secret key, or random for the life of the process when there is
+    /// none (tests).
+    pub fn resume_key(&self) -> [u8; 32] {
+        static RANDOM: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+            let mut key = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
+            key
+        });
+        self.secrets
+            .as_deref()
+            .map_or(*RANDOM, |keys| *keys.resume_key())
+    }
+
     fn secrets(&self) -> Result<&SecretKeys, SecretError> {
         self.secrets.as_deref().ok_or(SecretError::NoKey)
     }

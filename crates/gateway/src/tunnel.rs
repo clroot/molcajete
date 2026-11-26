@@ -37,6 +37,7 @@ use tracing::{Instrument as _, debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::audit;
 use crate::db::{ConnectionRecord, attributes, now_millis};
 use crate::guacd::{self, ClientInfo, GuacdSession};
 use crate::recording::{self, Origin, RecordedUser, Recorder};
@@ -73,6 +74,10 @@ pub struct TunnelRequest {
     /// A one-time credential's token (`ironrdp=`): the browser runs
     /// IronRDP's client and molcajeted relays RDP (`crate::ironrdp`).
     pub ironrdp: Option<String>,
+    /// The page's id for this tab and connection (`resume=`): the session
+    /// may be resumed by the next tunnel with the same one
+    /// (`crate::resume`).
+    pub resume: Option<String>,
     /// Address of the browser, as seen by the gateway or reported by a
     /// trusted reverse proxy (`X-Forwarded-For`).
     pub peer: Option<String>,
@@ -121,6 +126,7 @@ impl TunnelRequest {
                 "join" => req.join = Some(value.chars().take(128).collect()),
                 "shadow" => req.shadow = Some(value.chars().take(64).collect()),
                 "ironrdp" => req.ironrdp = Some(value.chars().take(128).collect()),
+                "resume" if crate::resume::valid_id(&value) => req.resume = Some(value),
                 "width" | "GUAC_WIDTH" => {
                     if let Ok(v) = value.parse() {
                         req.info.width = clamp_dimension(v);
@@ -252,6 +258,18 @@ async fn serve_tunnel(
         }
     }
     let parameters = request.parameters(&stored);
+    // The key covers the connection's own parameters, not this browser's
+    // overrides, which the session menu changes during a session anyway.
+    let resume_key = match (&request.resume, &request.user) {
+        (Some(id), Some(user)) => Some(crate::resume::key(
+            &state.db.resume_key(),
+            &user.id,
+            &connection.id,
+            id,
+            &stored,
+        )),
+        _ => None,
+    };
     let record = recording::wanted(&state.config.recordings, &connection);
     if record && !connection.flag(attributes::RECORD_MOLCAJETE_FORMATS) {
         recording::stock_formats_only(&mut request.info);
@@ -263,16 +281,18 @@ async fn serve_tunnel(
         height = request.info.height,
         overrides = ?request.overrides,
         record,
+        resumable = resume_key.is_some(),
         "opening tunnel"
     );
 
     let handshake_started = Instant::now();
-    let session = match guacd::connect(
+    let session = match guacd::connect_resumable(
         (guacd_host, guacd_port),
         &connection.protocol,
         &parameters,
         &request.info,
         request.binary,
+        resume_key.as_deref(),
         Duration::from_secs(handshake_timeout),
     )
     .await
@@ -315,9 +335,25 @@ async fn serve_tunnel(
         version = %session.version,
         framing = Framing::of(request.binary, &session).as_str(),
         handshake_ms = handshake.as_millis() as u64,
+        resumed = session.resumed,
         "tunnel established"
     );
     let user = request.user.clone().unwrap_or_default();
+    if session.resumed {
+        counter!("molcajete_gateway_tunnels_resumed_total", &labels).increment(1);
+        let address = crate::auth::ClientAddress(request.peer.clone().unwrap_or_default());
+        let entry = audit::Entry::new(audit::action::SESSION_RESUME)
+            .by_id(&user.id, &user.username)
+            .from(&address)
+            .target(
+                audit::target::SESSION,
+                &tunnel_id.to_string(),
+                &connection.name,
+            )
+            .detail("connection", connection.id.as_str())
+            .detail("guacdId", session.id.as_str());
+        audit::record(&state.db, entry).await;
+    }
     let registration = state.sessions.register(
         tunnel_id,
         SessionStart {
@@ -656,13 +692,22 @@ pub async fn relay(
                 Framing::Transcoded => upstream.transcoded(parser).await,
             }
         };
-        tokio::select! {
-            status = to_browser => status,
-            status = browser_to_guacd(&mut ws_rx, guacd_wr, &out_tx, &counters.to_guacd, &traffic.to_guacd, recording) => status,
-            status = ended => {
+        let mut guacd_wr = guacd_wr;
+        let ended_here = tokio::select! {
+            status = to_browser => Err(status),
+            status = browser_to_guacd(&mut ws_rx, &mut guacd_wr, &out_tx, &counters.to_guacd, &traffic.to_guacd, recording) => Err(status),
+            status = ended => Ok(status),
+        };
+        match ended_here {
+            Ok(status) => {
                 debug!(%status, "session ended by the gateway");
+                // Ends it in molcajeted too, which would otherwise hold it
+                // for the tab to come back.
+                let farewell = guacd_wr.write_all(b"10.disconnect;");
+                let _ = tokio::time::timeout(Duration::from_secs(2), farewell).await;
                 status
             }
+            Err(status) => status,
         }
     };
 
@@ -863,7 +908,7 @@ fn push_record(message: &mut RecordWriter, raw: &RawInstruction<'_>, scratch: &m
 
 async fn browser_to_guacd(
     ws_rx: &mut futures_util::stream::SplitStream<WebSocket>,
-    mut wr: OwnedWriteHalf,
+    wr: &mut OwnedWriteHalf,
     out: &mpsc::Sender<Message>,
     counter: &Counter,
     total: &AtomicU64,
@@ -952,6 +997,14 @@ mod tests {
         assert_eq!(req.connection.as_deref(), Some("x"));
         assert_eq!(req.info.width, 800);
         assert_eq!(req.info.image, ["image/png", "image/jpeg"]);
+    }
+
+    #[test]
+    fn takes_a_plain_resume_id() {
+        let req = TunnelRequest::from_query("connection=c&resume=2f1c9a6e-8f0b-4d55");
+        assert_eq!(req.resume.as_deref(), Some("2f1c9a6e-8f0b-4d55"));
+        let req = TunnelRequest::from_query("connection=c&resume=a%3Bb");
+        assert_eq!(req.resume, None);
     }
 
     #[test]
