@@ -824,6 +824,44 @@ impl Display {
         self.touch(&rect);
     }
 
+    /// How much a `w`×`h` rectangle of RGBA pixels differs from what the
+    /// framebuffer holds at (`x`, `y`), from one pixel in `step` per axis:
+    /// (pixels sampled, of those changed by more than 8 in a channel, sum of
+    /// the largest channel difference per pixel). For the frame trace.
+    pub fn difference(
+        &self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+        step: usize,
+    ) -> (u64, u64, u64) {
+        let rect = Rect::new(x, y, w, h).clip(self.width, self.height);
+        if rect.is_empty() || rgba.len() < (w * h * 4) as usize {
+            return (0, 0, 0);
+        }
+        let (mut sampled, mut changed, mut sum) = (0, 0, 0);
+        for dy in (0..rect.h as usize).step_by(step) {
+            let src = dy * w as usize * 4;
+            let dst = self.offset(rect.x, rect.y + dy as u32);
+            for dx in (0..rect.w as usize).step_by(step) {
+                let new = &rgba[src + dx * 4..src + dx * 4 + 3];
+                let old = &self.pixels[dst + dx * 4..dst + dx * 4 + 3];
+                let diff = new
+                    .iter()
+                    .zip(old)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
+                sampled += 1;
+                changed += u64::from(diff > 8);
+                sum += u64::from(diff);
+            }
+        }
+        (sampled, changed, sum)
+    }
+
     /// Writes a `w`×`h` rectangle of `source` into the framebuffer at
     /// (`x`, `y`) as opaque RGBA, converting the channels in the same pass
     /// (one copy, unlike converting into a buffer for [`Self::put`]). The

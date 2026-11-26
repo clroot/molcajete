@@ -168,6 +168,9 @@ impl Frames {
     /// coordinates (the surface's position on the output is already
     /// applied) and RGBA, top row first.
     pub fn draw(&self, display: &mut Display) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            self.trace_difference(display);
+        }
         for update in &self.updates {
             let region = &update.region;
             display.put(
@@ -178,6 +181,41 @@ impl Frames {
                 &update.data,
             );
         }
+    }
+}
+
+impl Frames {
+    /// Logs how much these frames change of what the display holds: a
+    /// server that sends a picture it sent before shows as a frame that
+    /// changes nothing.
+    fn trace_difference(&self, display: &Display) {
+        let (mut pixels, mut sampled, mut changed, mut sum) = (0u64, 0u64, 0u64, 0u64);
+        for update in &self.updates {
+            let region = &update.region;
+            let (w, h) = (
+                u32::from(region.right.saturating_sub(region.left)),
+                u32::from(region.bottom.saturating_sub(region.top)),
+            );
+            let (s, c, d) = display.difference(
+                u32::from(region.left),
+                u32::from(region.top),
+                w,
+                h,
+                &update.data,
+                4,
+            );
+            pixels += u64::from(w) * u64::from(h);
+            sampled += s;
+            changed += c;
+            sum += d;
+        }
+        debug!(
+            regions = self.updates.len(),
+            pixels,
+            changed_share = changed as f64 / sampled.max(1) as f64,
+            mean_diff = sum as f64 / sampled.max(1) as f64,
+            "pipeline frame content"
+        );
     }
 }
 
