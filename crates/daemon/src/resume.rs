@@ -109,6 +109,8 @@ pub struct Attach(Arc<Attachment>);
 struct Attachment {
     info: ClientInfo,
     socket: Mutex<Option<OwnedWriteHalf>>,
+    /// The previous client was still attached.
+    took_over: bool,
 }
 
 impl Attach {
@@ -466,6 +468,7 @@ impl Hub {
         let attach = Attach(Arc::new(Attachment {
             info,
             socket: Mutex::new(Some(socket)),
+            took_over,
         }));
         if tx
             .send(input(
@@ -496,7 +499,8 @@ pub async fn take_over(writer: &mut GuacWriter, attach: &Attach) -> bool {
     let Some(socket) = attach.take_socket() else {
         return false;
     };
-    if writer.is_attached() {
+    // A client that detached left a socket that is closed or about to be.
+    if attach.0.took_over && writer.is_attached() {
         writer.buffer().clear();
         writer.push(
             &InstructionBuilder::new("error")
