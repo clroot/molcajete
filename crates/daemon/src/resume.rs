@@ -512,3 +512,5 @@ pub async fn take_over(writer: &mut GuacWriter, attach: &Attach) -> bool {
     true
 }
 
+#[cfg(test)]
+mod tests;
