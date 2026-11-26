@@ -36,7 +36,9 @@ zstd = "0.13"
 # SSH
 ab_glyph = "0.2"
 alacritty_terminal = "0.26"
-russh = "0.65"
+# ring instead of the default aws-lc-rs: same algorithms, already used by
+# rustls, and no aws-lc build (which needs NASM for Windows targets).
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
 # SFTP file transfer over the SSH connection
 russh-sftp = "4"
 
