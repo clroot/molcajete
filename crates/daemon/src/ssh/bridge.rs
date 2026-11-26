@@ -20,7 +20,7 @@ use super::keys::{self, KeyOptions, Modifiers};
 use super::link::{self, Link};
 use super::mouse::{self, MouseAction};
 use super::render::{Pointer, Renderer};
-use super::settings::Settings;
+use super::settings::{self, Settings};
 use super::terminal::{Size, Terminal};
 use crate::display::Display;
 use crate::files::{self, Transfers};
@@ -336,6 +336,7 @@ impl Bridge {
             ClientEvent::Key { keysym, pressed } => self.key(keysym, pressed),
             ClientEvent::Mouse { x, y, mask } => self.pointer(x, y, mask),
             ClientEvent::Size { width, height } => self.resize(width, height),
+            ClientEvent::Argv { name, value } if name == "font-size" => self.set_font_size(&value),
             ClientEvent::Clipboard(text) if !self.settings.disable_paste => self.clipboard = text,
             ClientEvent::Sync {
                 timestamp,
@@ -619,6 +620,30 @@ impl Bridge {
             &p.rgba,
             self.writer.buffer(),
         );
+    }
+
+    /// Changes the text size during the session (guacd's `font-size`, sent
+    /// as `argv`): the display keeps its size and holds more or fewer
+    /// cells.
+    fn set_font_size(&mut self, value: &str) {
+        let Some(size_pt) = settings::font_size(value) else {
+            return;
+        };
+        if !self.renderer.set_font_size(size_pt) {
+            return;
+        }
+        let size = self
+            .renderer
+            .grid_size(self.display.width(), self.display.height());
+        if size != self.terminal.size() {
+            self.terminal.resize(size);
+        }
+        // The cells have a new size in pixels even where their number stayed.
+        let _ = self
+            .ssh
+            .send(Outgoing::Resize(Self::pty_size(&self.renderer, size)));
+        self.renderer.invalidate(size);
+        self.mark_dirty();
     }
 
     fn resize(&mut self, width: u32, height: u32) {

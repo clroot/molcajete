@@ -90,9 +90,7 @@ impl Settings {
             passphrase: owned("passphrase"),
             command: owned("command"),
             font_name: owned("font-name"),
-            font_size: parse::<f32>(get("font-size"))
-                .filter(|s| s.is_finite() && *s > 0.0)
-                .unwrap_or(12.0),
+            font_size: get("font-size").and_then(font_size).unwrap_or(12.0),
             font_path: get("font-path")
                 .map(|v| {
                     v.split(':')
@@ -126,6 +124,11 @@ impl Settings {
     pub fn linux_keys(&self) -> bool {
         self.terminal_type.starts_with("linux")
     }
+}
+
+/// A `font-size` value: points, more than none.
+pub fn font_size(value: &str) -> Option<f32> {
+    parse::<f32>(Some(value)).filter(|s| s.is_finite() && *s > 0.0)
 }
 
 fn parse<T: std::str::FromStr>(value: Option<&str>) -> Option<T> {
