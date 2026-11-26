@@ -5,8 +5,11 @@
 //! processed (the socket would block), no earlier than the display's shared
 //! pacing allows (`Display::next_frame_at` with `Pacing::DESKTOP`: up to
 //! ~60 fps, less for a lagging client, an unacknowledged heavy frame or a
-//! used-up byte budget) and never more often than [`MIN_FRAME_INTERVAL`],
-//! which is the same floor counted from when the frame was written out.
+//! used-up byte budget) and never more often than [`MIN_FRAME_INTERVAL`].
+//! Both intervals count from when building the last frame began, so that
+//! they bound the frame rate whatever a frame takes to encode. A frame in
+//! which everything came whole ([`FramePacer::pending_is_whole`]) does not
+//! wait for the socket: it goes out when it is due.
 //! A server that never pauses (video) still gets a frame every
 //! [`MAX_FRAME_DELAY`], and one that ends its frames (the graphics pipeline,
 //! Frame Marker surface commands) gets one where it ends a frame, as soon as
@@ -37,6 +40,9 @@ pub struct FramePacer {
     /// Graphics arrived after the server's last frame end: it is inside a
     /// frame.
     in_server_frame: bool,
+    /// Graphics arrived from a server that marks no frames: what is pending
+    /// may be a part of an update.
+    partial: bool,
 }
 
 impl FramePacer {
@@ -46,6 +52,7 @@ impl FramePacer {
             last_frame: now.checked_sub(MIN_FRAME_INTERVAL).unwrap_or(now),
             marks_frames: false,
             in_server_frame: false,
+            partial: false,
         }
     }
 
@@ -58,12 +65,14 @@ impl FramePacer {
     pub fn graphics_updated(&mut self, now: Instant) {
         self.mark_dirty(now);
         self.in_server_frame = self.marks_frames;
+        self.partial = !self.marks_frames;
     }
 
     /// The server ended a frame: what it sent so far belongs together.
     pub fn server_frame_ended(&mut self) {
         self.marks_frames = true;
         self.in_server_frame = false;
+        self.partial = false;
     }
 
     /// Whether the server has been seen to mark its frames.
@@ -85,6 +94,15 @@ impl FramePacer {
         }
     }
 
+    /// Whether everything that is pending came whole: frames the server
+    /// ended (the graphics pipeline's, or marked ones) and changes that are
+    /// whole in themselves (the cursor). Such a frame can go out when it is
+    /// due, whatever the server is sending meanwhile; one that may be a part
+    /// of an update waits until the PDUs that are ready have been read.
+    pub fn pending_is_whole(&self) -> bool {
+        self.is_dirty() && !self.partial && !self.in_server_frame
+    }
+
     /// Whether the pending frame should be sent now that the server has
     /// ended a frame of its own: what is pending is whole, so it need not
     /// wait for the socket to fall silent.
@@ -103,9 +121,12 @@ impl FramePacer {
             && now >= self.earliest(display_due)
     }
 
-    pub fn frame_sent(&mut self, now: Instant) {
+    /// The pending frame was sent; building it began at `started`, from
+    /// where the shortest interval to the next one counts.
+    pub fn frame_sent(&mut self, started: Instant) {
         self.dirty_since = None;
-        self.last_frame = now;
+        self.last_frame = started;
+        self.partial = false;
     }
 }
 
@@ -135,6 +156,30 @@ mod tests {
         pacer.frame_sent(t0);
         pacer.mark_dirty(t0 + Duration::from_millis(1));
         assert_eq!(pacer.earliest(t_any()), t0 + MIN_FRAME_INTERVAL);
+    }
+
+    #[test]
+    fn only_frames_that_came_whole_go_out_while_the_server_sends() {
+        let t0 = Instant::now();
+        let mut pacer = FramePacer::new(t0);
+        assert!(!pacer.pending_is_whole(), "nothing pending");
+        // The cursor, or a frame of the graphics pipeline.
+        pacer.mark_dirty(t0);
+        assert!(pacer.pending_is_whole());
+        // A bitmap update of a server that marks no frames.
+        pacer.graphics_updated(t0);
+        assert!(!pacer.pending_is_whole());
+        pacer.frame_sent(t0);
+        pacer.mark_dirty(t0);
+        assert!(pacer.pending_is_whole());
+        // A server that marks its frames: whole from one end to the next
+        // frame's first update.
+        pacer.server_frame_ended();
+        assert!(pacer.pending_is_whole());
+        pacer.graphics_updated(t0);
+        assert!(!pacer.pending_is_whole());
+        pacer.server_frame_ended();
+        assert!(pacer.pending_is_whole());
     }
 
     #[test]

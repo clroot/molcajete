@@ -109,8 +109,13 @@ pub(super) struct FrameClock {
     applies: VecDeque<(Instant, Duration)>,
     /// The client reports apply times: they set the interval, not the lag.
     reports: bool,
-    /// When the last frame was sent, and its encoded size.
+    /// When the last frame was started (see [`Self::frame_started`]), and
+    /// its encoded size. Intervals count from here.
     last_frame: Option<(Instant, usize)>,
+    /// When building the frame under way began.
+    started: Option<Instant>,
+    /// When the last frame was sent.
+    last_sent: Option<Instant>,
     /// Bytes sent that the budget has not covered yet, as of the last frame.
     /// It shrinks at the budget's rate.
     backlog: usize,
@@ -125,6 +130,8 @@ impl FrameClock {
             applies: VecDeque::with_capacity(APPLY_SAMPLES),
             reports: false,
             last_frame: None,
+            started: None,
+            last_sent: None,
             backlog: 0,
         }
     }
@@ -137,12 +144,26 @@ impl FrameClock {
         self.pacing
     }
 
+    /// Building a frame begins (the display is flushed).
+    ///
+    /// The interval to the next frame counts from here, not from when the
+    /// frame is sent: it bounds how often frames follow each other, and
+    /// counted from the end it would add the time every frame takes to
+    /// encode. A 4K video frame takes 21 ms, after which another 16 ms held
+    /// a desktop to 27 frames per second where the profile means 60.
+    pub(super) fn frame_started(&mut self, at: Instant) {
+        self.started = Some(at);
+    }
+
     /// A frame of `bytes` encoded bytes was ended with `sync(timestamp)`.
     pub(super) fn frame_sent(&mut self, timestamp: i64, now: Instant, bytes: usize) {
+        // A frame nobody announced started when it was sent.
+        let started = self.started.take().map_or(now, |started| started.min(now));
+        self.last_sent = Some(now);
         self.pending.push_back((timestamp, now));
         if let Some(budget) = self.pacing.budget {
             let since_last = self.last_frame.map_or(Duration::MAX, |(last, _)| {
-                now.saturating_duration_since(last)
+                started.saturating_duration_since(last)
             });
             // Beyond this the wait would exceed MAX_LAG_COMPENSATION anyway.
             let most = within(budget, BUDGET_BURST + MAX_LAG_COMPENSATION);
@@ -152,7 +173,7 @@ impl FrameClock {
                 .saturating_add(bytes)
                 .min(most);
         }
-        self.last_frame = Some((now, bytes));
+        self.last_frame = Some((started, bytes));
     }
 
     /// The client's reply to `sync(timestamp)` arrived.
@@ -189,8 +210,8 @@ impl FrameClock {
 
     /// How long ago the last frame was sent, if there was one.
     pub(super) fn since_last_frame(&self, now: Instant) -> Option<Duration> {
-        self.last_frame
-            .map(|(last, _)| now.saturating_duration_since(last))
+        self.last_sent
+            .map(|last| now.saturating_duration_since(last))
     }
 
     pub(super) fn unacked(&self) -> usize {
@@ -486,6 +507,24 @@ mod tests {
             clock.next_frame_at(),
             Some(t0 + 20 * MS + LARGE_FRAME_INTERVAL)
         );
+    }
+
+    #[test]
+    fn the_interval_counts_from_when_a_frame_was_started() {
+        let t0 = Instant::now();
+        let mut clock = FrameClock::new(Pacing::DESKTOP);
+        // The frame took 21 ms to encode.
+        clock.frame_started(t0);
+        clock.frame_sent(1, t0 + 21 * MS, 2_000);
+        assert_eq!(clock.next_frame_at(), Some(t0 + 16 * MS));
+        // The acknowledgement is timed from when the frame was sent.
+        assert_eq!(clock.acked(1, t0 + 30 * MS), Some(9 * MS));
+        // The time between frames, for the metrics, is between sends.
+        assert_eq!(clock.since_last_frame(t0 + 50 * MS), Some(29 * MS));
+        // A frame that was not announced counts from when it was sent.
+        let t1 = t0 + 100 * MS;
+        clock.frame_sent(2, t1, 2_000);
+        assert_eq!(clock.next_frame_at(), Some(t1 + 16 * MS));
     }
 
     #[test]

@@ -270,6 +270,14 @@ impl<'a> Session<'a> {
                         Flow::Continue
                     }
                 },
+                // A frame that came whole goes out when it is due, whatever
+                // the server is sending meanwhile: on a large desktop PDUs
+                // are almost always ready, and the frame would wait for the
+                // server's next one and go out merged with it.
+                _ = sleep_until(flush_at), if can_flush && self.pacer.pending_is_whole() => {
+                    self.send_frame().await?;
+                    Flow::Continue
+                }
                 pdu = self.rdp_reader.read_pdu() => match pdu {
                     Ok((action, payload)) => self.server_pdu(action, &payload).await?,
                     Err(err) => {
@@ -326,6 +334,7 @@ impl<'a> Session<'a> {
 
     /// Encodes pending display changes and ends the frame.
     async fn send_frame(&mut self) -> std::io::Result<()> {
+        let started = Instant::now();
         let display = &mut self.display;
         let out = self.writer.buffer();
         let stats = tokio::task::block_in_place(|| display.flush(out));
@@ -333,7 +342,7 @@ impl<'a> Session<'a> {
             display.sync(out);
         }
         self.writer.flush().await?;
-        self.pacer.frame_sent(Instant::now());
+        self.pacer.frame_sent(started);
         debug!(
             images = stats.images,
             fills = stats.fills,

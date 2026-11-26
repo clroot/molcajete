@@ -917,6 +917,7 @@ impl Display {
         self.share_frame();
         self.decay();
         self.last_flush = started;
+        self.clock.frame_started(started);
         // Busy areas may be covered by a video stream instead of images.
         stats.add(self.update_video(out));
         let mut mark = Instant::now();
