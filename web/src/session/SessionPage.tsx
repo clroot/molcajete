@@ -62,6 +62,10 @@ const styles = stylex.create({
   // What the on-screen keyboard leaves in view, instead of the whole window.
   visible: (top: number, height: number) => ({top, bottom: 'auto', height}),
   display: {position: 'relative', flexGrow: 1, minHeight: 0, overflow: 'hidden'},
+  // Text that starts at the very edge of the window is hard to read. A
+  // margin, unlike a padding, is left out of the size the client gives the
+  // terminal, and shows the frame's black.
+  terminalDisplay: {marginInline: 6},
 });
 
 const leave = () => navigate(href.connections);
@@ -290,7 +294,7 @@ export default function SessionPage({connectionId, ticket}: Props) {
           styles.frame,
           visibleFrame && styles.visible(visibleFrame.top, visibleFrame.height),
         )}>
-        <div ref={displayRef} {...stylex.props(styles.display)} />
+        <div ref={displayRef} {...stylex.props(styles.display, terminal && styles.terminalDisplay)} />
         {hasKeyBar && (
           <TerminalKeyBar
             modifiers={session.modifiers}
