@@ -155,6 +155,30 @@ for (const mode of ["worker", "main"]) {
   assert.deepEqual(await sent(() => cdp.send("Input.insertText", { text: "ㄱ" })), tap(hangul("ㄱ")));
   assert.deepEqual(await sent(() => press("a", "KeyA")), typed("a"));
 
+  // Ctrl follows the flags of the key events (CDP's modifier 2 is Ctrl). A
+  // stray `keyup` while Ctrl is held, as iPadOS Safari sends now and then:
+  // the next key still reports Ctrl, so Ctrl goes down again before it.
+  assert.deepEqual(
+    await sent(async () => {
+      await key("rawKeyDown", "Control", "ControlLeft", 2);
+      await press("d", "KeyD", 2);
+      await key("keyUp", "Control", "ControlLeft");
+      await press("d", "KeyD", 2);
+      await key("keyUp", "Control", "ControlLeft");
+    }),
+    [`${CTRL} down`, ...typed("d"), `${CTRL} up`, `${CTRL} down`, ...typed("d"), `${CTRL} up`],
+    `${mode}: Ctrl is pressed again for a key that reports it`,
+  );
+  // A lost `keyup`: the next key no longer reports Ctrl, so Ctrl goes up first.
+  assert.deepEqual(
+    await sent(async () => {
+      await key("rawKeyDown", "Control", "ControlLeft", 2);
+      await press("a", "KeyA");
+    }),
+    [`${CTRL} down`, `${CTRL} up`, ...typed("a")],
+    `${mode}: Ctrl is let go for a key that does not report it`,
+  );
+
   // Remote composition: every key goes out as it is pressed.
   await remote(true);
   assert.equal(await page.evaluate(() => document.querySelector("textarea").readOnly), true);
