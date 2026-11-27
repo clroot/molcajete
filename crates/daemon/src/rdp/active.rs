@@ -201,9 +201,16 @@ impl<'a> Session<'a> {
         decoder: &mut InputDecoder,
         early: EarlyInput,
     ) {
-        if let Err(err) = self.event_loop(inputs, decoder, early).await {
-            warn!(error = %err, "RDP session ended with an error");
-            send_error(self.writer, "RDP connection error", Status::UPSTREAM_ERROR).await;
+        match self.event_loop(inputs, decoder, early).await {
+            Ok(()) => {}
+            // A closed tab or browser: nobody to tell.
+            Err(err) if crate::io::is_client_gone(&err) => {
+                info!(reason = %err, "RDP session ended");
+            }
+            Err(err) => {
+                warn!(error = %err, "RDP session ended with an error");
+                send_error(self.writer, "RDP connection error", Status::UPSTREAM_ERROR).await;
+            }
         }
     }
 

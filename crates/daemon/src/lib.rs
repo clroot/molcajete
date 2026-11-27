@@ -230,6 +230,11 @@ async fn session(
         .record(duration);
     match result {
         Ok(()) => connection_done(protocol, "ok"),
+        // A closed tab or browser: an ordinary end.
+        Err(err) if io::is_client_gone(&err) => {
+            connection_done(protocol, "ok");
+            info!(reason = %err, "session ended");
+        }
         Err(err) => {
             connection_done(protocol, "error");
             warn!(error = %err, "session ended with error");
