@@ -440,6 +440,13 @@ mod tests {
         let mut writer = GuacWriter::new(server);
         drop(client);
         writer.push("3.nop;");
-        assert!(writer.flush().await.is_err());
+        let err = writer.flush().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        // Known as a client that went away, through what the session adds.
+        let err = anyhow::Error::from(err).context("sending a frame");
+        assert!(is_client_gone(&err));
+        assert!(!is_client_gone(&anyhow::Error::from(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        ))));
     }
 }
