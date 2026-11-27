@@ -15,12 +15,17 @@
 //!   byte-range locks and directory change notifications on worker
 //!   threads; the session collects them with
 //!   [`RdpdrBackend::poll_deferred_messages`] (see
-//!   [`DriveBackend::DEFERS_COMPLETIONS`]).
+//!   [`DriveBackend::DEFERS_COMPLETIONS`]). A notification is started on
+//!   the calling thread, and Windows cancels I/O whose thread exits, so
+//!   notifications are started on a thread the backend keeps for that
+//!   (see [`Notifier`]) rather than on the session's, which tokio may end.
 //! - xrdp separates path components with `/` when it opens files, where
 //!   Windows uses `\`; both native backends only take `\`. A `/` cannot be
 //!   part of a Windows file name, so it is turned into `\`.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::thread::JoinHandle;
 
 use ironrdp_core::{ReadCursor, impl_as_any};
 use ironrdp_pdu::PduResult;
@@ -47,7 +52,12 @@ const ONLY_BOTH_DIRECTORY_CLASS: bool = !cfg!(windows);
 
 #[derive(Debug)]
 pub struct DriveBackend {
-    native: NativeBackend,
+    /// Shared with the notifier's thread, which uses it while the caller
+    /// waits.
+    native: Arc<Mutex<NativeBackend>>,
+    /// Where directory change notifications are started, when the native
+    /// backend keeps them open.
+    notifier: Option<Notifier>,
 }
 
 impl_as_any!(DriveBackend);
@@ -62,8 +72,37 @@ impl DriveBackend {
     /// on a drive letter, without the `\\?\` prefix.
     pub fn new(device_id: u32, name: &str, root: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            native: native_backend(device_id, name, root)?,
+            native: Arc::new(Mutex::new(native_backend(device_id, name, root)?)),
+            notifier: if Self::DEFERS_COMPLETIONS {
+                Some(Notifier::spawn()?)
+            } else {
+                None
+            },
         })
+    }
+
+    fn native(&self) -> MutexGuard<'_, NativeBackend> {
+        self.native.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Starts a directory change notification on the notifier's thread,
+    /// which outlives it: Windows would cancel it when the thread that
+    /// started it exits, and the session's thread can be one of tokio's
+    /// blocking threads, which exit after ten idle seconds.
+    fn notify_change(&mut self, request: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
+        if let Some(notifier) = &self.notifier {
+            let native = Arc::clone(&self.native);
+            let request = request.clone();
+            if let Some(result) = notifier.run(move || {
+                native
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .handle_drive_io_request(request)
+            }) {
+                return result;
+            }
+        }
+        self.native().handle_drive_io_request(request)
     }
 
     /// Answers a directory query in another class than the native
@@ -74,7 +113,7 @@ impl DriveBackend {
         wanted: FileInformationClassLevel,
     ) -> PduResult<Vec<SvcMessage>> {
         request.file_info_class_lvl = FileInformationClassLevel::FILE_BOTH_DIRECTORY_INFORMATION;
-        let messages = self.native.handle_drive_io_request(
+        let messages = self.native().handle_drive_io_request(
             ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(request),
         )?;
         Ok(messages
@@ -190,30 +229,30 @@ fn windows_separators(req: ServerDriveIoRequest) -> ServerDriveIoRequest {
 
 impl RdpdrBackend for DriveBackend {
     fn supports_drive_security(&self) -> bool {
-        self.native.supports_drive_security()
+        self.native().supports_drive_security()
     }
 
     fn reset(&mut self) -> PduResult<()> {
-        self.native.reset()
+        self.native().reset()
     }
 
     fn restore_drive(&mut self, device_id: u32) -> PduResult<()> {
-        self.native.restore_drive(device_id)
+        self.native().restore_drive(device_id)
     }
 
     fn add_drive(&mut self, device_id: u32) -> PduResult<()> {
-        self.native.add_drive(device_id)
+        self.native().add_drive(device_id)
     }
 
     fn remove_drive(&mut self, device_id: u32) -> PduResult<Vec<SvcMessage>> {
-        self.native.remove_drive(device_id)
+        self.native().remove_drive(device_id)
     }
 
     fn handle_server_device_announce_response(
         &mut self,
         pdu: ServerDeviceAnnounceResponse,
     ) -> PduResult<()> {
-        self.native.handle_server_device_announce_response(pdu)
+        self.native().handle_server_device_announce_response(pdu)
     }
 
     fn handle_scard_call(
@@ -221,7 +260,7 @@ impl RdpdrBackend for DriveBackend {
         req: DeviceControlRequest<ScardIoCtlCode>,
         call: ScardCall,
     ) -> PduResult<Vec<SvcMessage>> {
-        self.native.handle_scard_call(req, call)
+        self.native().handle_scard_call(req, call)
     }
 
     fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
@@ -238,7 +277,10 @@ impl RdpdrBackend for DriveBackend {
                 let wanted = request.file_info_class_lvl.clone();
                 self.query_directory_as(request, wanted)
             }
-            other => self.native.handle_drive_io_request(other),
+            request @ ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(_) => {
+                self.notify_change(request)
+            }
+            other => self.native().handle_drive_io_request(other),
         }
     }
 
@@ -246,27 +288,76 @@ impl RdpdrBackend for DriveBackend {
         &mut self,
         req: DecodedDeviceControlRequest<AnyIoCtlCode>,
     ) -> PduResult<Vec<SvcMessage>> {
-        self.native.handle_drive_device_control(req)
+        self.native().handle_drive_device_control(req)
     }
 
     fn poll_deferred_messages(&mut self) -> PduResult<Vec<SvcMessage>> {
-        self.native.poll_deferred_messages()
+        self.native().poll_deferred_messages()
     }
 
     fn handle_user_logged_on(&mut self, rdpdr: &mut Rdpdr) -> PduResult<Vec<SvcMessage>> {
-        self.native.handle_user_logged_on(rdpdr)
+        self.native().handle_user_logged_on(rdpdr)
     }
 
     fn handle_printer_io_request(&mut self, req: PrinterIoRequest) -> PduResult<Vec<SvcMessage>> {
-        self.native.handle_printer_io_request(req)
+        self.native().handle_printer_io_request(req)
     }
 
     fn handle_port_io_request(&mut self, req: PortIoRequest) -> PduResult<Vec<SvcMessage>> {
-        self.native.handle_port_io_request(req)
+        self.native().handle_port_io_request(req)
     }
 
     fn reject_printer_write(&mut self, req: DeviceIoRequest) -> PduResult<Vec<SvcMessage>> {
-        self.native.reject_printer_write(req)
+        self.native().reject_printer_write(req)
+    }
+}
+
+/// A thread that runs jobs one at a time for as long as the backend
+/// lives, so that I/O they start is not cancelled with their thread.
+#[derive(Debug)]
+struct Notifier {
+    jobs: Option<mpsc::Sender<Job>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+impl Notifier {
+    fn spawn() -> std::io::Result<Self> {
+        let (jobs, received) = mpsc::channel::<Job>();
+        let thread = std::thread::Builder::new()
+            .name("molcajete-rdpdr-notify".into())
+            .spawn(move || {
+                for job in received {
+                    job();
+                }
+            })?;
+        Ok(Self {
+            jobs: Some(jobs),
+            thread: Some(thread),
+        })
+    }
+
+    /// Runs `job` on the thread and waits for its result; `None` if the
+    /// thread is gone.
+    fn run<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static) -> Option<R> {
+        let (result, received) = mpsc::sync_channel(1);
+        self.jobs
+            .as_ref()?
+            .send(Box::new(move || {
+                let _ = result.send(job());
+            }))
+            .ok()?;
+        received.recv().ok()
+    }
+}
+
+impl Drop for Notifier {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -600,38 +691,92 @@ mod tests {
         if DriveBackend::DEFERS_COMPLETIONS {
             let watched =
                 open(&mut backend, "/folder", CreateDisposition::FILE_OPEN, true).unwrap();
-            let mut request = header(watched, MajorFunction::DirectoryControl);
-            request.minor_function = MinorFunction::IRP_MN_NOTIFY_CHANGE_DIRECTORY;
-            let scheduled = backend
-                .handle_drive_io_request(
-                    ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(
-                        ironrdp_rdpdr::pdu::efs::ServerDriveNotifyChangeDirectoryRequest {
-                            device_io_request: request,
-                            watch_tree: 0,
-                            // FILE_NOTIFY_CHANGE_FILE_NAME
-                            completion_filter: 1,
-                        },
-                    ),
-                )
-                .unwrap();
-            assert!(scheduled.is_empty());
+            assert!(watch(&mut backend, watched).is_empty());
             assert!(backend.poll_deferred_messages().unwrap().is_empty());
             std::fs::write(root.join("folder").join("uploaded.txt"), b"x").unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let completed = loop {
-                let messages = backend.poll_deferred_messages().unwrap();
-                if !messages.is_empty() {
-                    break messages;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "no change notification"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            };
+            let completed = completion(&mut backend);
             assert_eq!(status(&completed), NtStatus::SUCCESS);
             close(&mut backend, watched);
         }
+
+        backend.reset().unwrap();
+        drop(backend);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Asks for a notification when a file name changes in the directory
+    /// `file_id`; what the backend answers at once.
+    fn watch(backend: &mut DriveBackend, file_id: u32) -> Vec<SvcMessage> {
+        let mut request = header(file_id, MajorFunction::DirectoryControl);
+        request.minor_function = MinorFunction::IRP_MN_NOTIFY_CHANGE_DIRECTORY;
+        backend
+            .handle_drive_io_request(
+                ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(
+                    ironrdp_rdpdr::pdu::efs::ServerDriveNotifyChangeDirectoryRequest {
+                        device_io_request: request,
+                        watch_tree: 0,
+                        // FILE_NOTIFY_CHANGE_FILE_NAME
+                        completion_filter: 1,
+                    },
+                ),
+            )
+            .unwrap()
+    }
+
+    /// The deferred completions, once there are some.
+    fn completion(backend: &mut DriveBackend) -> Vec<SvcMessage> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let messages = backend.poll_deferred_messages().unwrap();
+            if !messages.is_empty() {
+                return messages;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no change notification"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A notification asked for on a thread that then exits, as tokio's
+    /// blocking threads do, stays open until the folder changes.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_notification_outlives_the_thread_that_asked_for_it() {
+        use ironrdp_rdpdr::pdu::efs::CreateDisposition;
+
+        let base = std::env::temp_dir().join(format!("molcajete-rdpdr-{}", uuid::Uuid::new_v4()));
+        let drive = crate::files::Drive::open(crate::files::DriveSettings {
+            path: base.clone(),
+            name: "Drive".into(),
+            create: true,
+            policy: crate::files::Policy {
+                download: true,
+                upload: true,
+                max_size: None,
+            },
+        })
+        .await
+        .unwrap();
+        let root = drive.root().to_owned();
+        let mut backend = DriveBackend::new(1, "Drive", &root).unwrap();
+        backend.restore_drive(1).unwrap();
+        let watched = open(&mut backend, "\\", CreateDisposition::FILE_OPEN, true).unwrap();
+
+        let mut backend = std::thread::spawn(move || {
+            assert!(watch(&mut backend, watched).is_empty());
+            backend
+        })
+        .join()
+        .unwrap();
+        // Long enough for Windows to cancel the I/O of the exited thread.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(backend.poll_deferred_messages().unwrap().is_empty());
+
+        std::fs::write(root.join("new.txt"), b"x").unwrap();
+        assert_eq!(status(&completion(&mut backend)), NtStatus::SUCCESS);
+        close(&mut backend, watched);
 
         backend.reset().unwrap();
         drop(backend);
