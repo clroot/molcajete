@@ -103,6 +103,23 @@ describe('session events', () => {
     expect(gaveUp.status.kind === 'failed' && gaveUp.status.detail).toContain('UPSTREAM_NOT_FOUND');
   });
 
+  test('retries a tunnel that closed before the session was up, keeping its error', () => {
+    // A reload while the gateway restarts: the first tunnel closes on the way.
+    let state = reduce(
+      {...connected, status: {kind: 'connecting'}},
+      {
+        type: 'error',
+        detail: {message: 'tunnel closed: UPSTREAM_NOT_FOUND', name: 'UPSTREAM_NOT_FOUND', code: 0x0207},
+      },
+    );
+    expect(state.status.kind).toBe('failed');
+    state = reduce(state, {type: 'resuming'});
+    expect(state.status.kind).toBe('reconnecting');
+    expect(reduce(state, {type: 'state', detail: 'connected'}).status).toEqual({kind: 'connected'});
+    const gaveUp = reduce(state, {type: 'gave-up'});
+    expect(gaveUp.status.kind === 'failed' && gaveUp.status.detail).toContain('UPSTREAM_NOT_FOUND');
+  });
+
   test('says so when another window took the session', () => {
     const state = reduce(connected, {
       type: 'error',
