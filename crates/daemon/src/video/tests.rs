@@ -330,9 +330,17 @@ fn check_codec(codec: VideoCodec) {
             let summary = round_trip(&ffmpeg, backend, size, FRAMES, &FORCED_KEYS, 30.0);
             eprintln!("{summary}");
         }
-        // Sizes that are not multiples of 16, and tiny ones (where the
-        // patch edges dominate and quality settles lower).
-        for size in [(202, 130), (48, 32)] {
+        // A size that is not a multiple of 16, and a tiny one (where the
+        // patch edges dominate and quality settles lower). Hardware
+        // encoders have a smallest frame (Quick Sync refuses 48×32), so
+        // they get the smallest video the display makes instead: a square
+        // of `MIN_SIDE` (display/video.rs), 3 tiles of 64.
+        let tiny = if backend.rank() == 0 {
+            (192, 192)
+        } else {
+            (48, 32)
+        };
+        for size in [(202, 130), tiny] {
             round_trip(&ffmpeg, backend, size, 6, &[3], 25.0);
         }
     }
