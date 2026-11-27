@@ -166,10 +166,14 @@ export default function IronRdpSessionPage({
         .withDesktopSize({width: desktop.width, height: desktop.height})
         .withExtension(rdp.desktopScaleFactor(desktop.scalePercent))
         .withExtension(rdp.displayControl(true))
-        // Bitmap updates instead of the graphics pipeline: without an H.264
-        // decoder the web client offers only version 8 of the pipeline, and
-        // a Windows 11 host left that offer unanswered (a black screen).
-        .withExtension(rdp.legacyGraphics(true))
+        // The graphics pipeline stays on (version 8: progressive RemoteFX and
+        // ClearCodec), at 32 bpp as molcajeted asks for it. Without it the
+        // screen comes as lossless bitmap tiles, too much for a 4K desktop
+        // over a remote line. The pipeline needs the vendored build of the
+        // package (web/vendor/iron-remote-desktop-rdp): the published one
+        // loses the server's first dynamic channel PDU, and a Windows 11 host
+        // then never starts the pipeline.
+        .withExtension(rdp.colorDepth(32))
         .build();
       const session = await ui.connect(config);
       if (!isCurrent) return;
