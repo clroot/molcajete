@@ -19,6 +19,7 @@ use super::color::{ColorScheme, Rgb};
 use super::font::{CellMetrics, Fonts, Mask};
 use super::terminal::Size;
 use crate::display::Display;
+use crate::display::pointer::PointerImage;
 
 /// How the text cursor is drawn over a cell (a block cursor is drawn by
 /// swapping the cell's colours instead).
@@ -101,6 +102,11 @@ impl Renderer {
 
     pub fn metrics(&self) -> CellMetrics {
         self.fonts.metrics()
+    }
+
+    /// The resolution (pixels per inch) the terminal is drawn for.
+    pub fn dpi(&self) -> u32 {
+        self.fonts.dpi()
     }
 
     /// Changes the font size (points). Returns whether the cells changed
@@ -388,16 +394,12 @@ fn draw_cell(
     }
 }
 
-/// Mouse pointer images (RGBA) with their hotspots.
-pub struct Pointer {
-    pub hotspot: (u32, u32),
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
+/// The terminal's mouse pointers, drawn for 96 dpi
+/// ([`PointerImage::for_dpi`] enlarges them).
+pub struct Pointer;
 
 impl Pointer {
-    fn from_art(art: &[&str], hotspot: (u32, u32)) -> Self {
+    fn from_art(art: &[&str], hotspot: (u32, u32)) -> PointerImage {
         let height = art.len() as u32;
         let width = art.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
         let mut rgba = vec![0u8; (width * height * 4) as usize];
@@ -412,8 +414,9 @@ impl Pointer {
                 rgba[i..i + 4].copy_from_slice(&color);
             }
         }
-        Self {
-            hotspot,
+        PointerImage {
+            hotspot_x: hotspot.0,
+            hotspot_y: hotspot.1,
             width,
             height,
             rgba,
@@ -421,7 +424,7 @@ impl Pointer {
     }
 
     /// Text-selection I-beam, shown while the pointer selects text.
-    pub fn ibeam() -> Self {
+    pub fn ibeam() -> PointerImage {
         const ART: &[&str] = &[
             "###.###", "#..#..#", "###.###", "  #.#  ", "  #.#  ", "  #.#  ", "  #.#  ", "  #.#  ",
             "  #.#  ", "  #.#  ", "  #.#  ", "  #.#  ", "  #.#  ", "###.###", "#..#..#", "###.###",
@@ -430,7 +433,7 @@ impl Pointer {
     }
 
     /// Pointing hand, shown over a link.
-    pub fn hand() -> Self {
+    pub fn hand() -> PointerImage {
         const ART: &[&str] = &[
             "     ##",
             "    #..#",
@@ -456,7 +459,7 @@ impl Pointer {
     }
 
     /// Arrow, shown while the application receives mouse events.
-    pub fn arrow() -> Self {
+    pub fn arrow() -> PointerImage {
         const ART: &[&str] = &[
             "#",
             "##",
@@ -598,9 +601,15 @@ mod tests {
 
     #[test]
     fn pointers_are_well_formed() {
-        for p in [Pointer::ibeam(), Pointer::arrow()] {
-            assert_eq!(p.rgba.len(), (p.width * p.height * 4) as usize);
-            assert!(p.hotspot.0 < p.width && p.hotspot.1 < p.height);
+        for dpi in [96, 144, 192] {
+            for p in [Pointer::ibeam(), Pointer::arrow(), Pointer::hand()] {
+                let p = p.for_dpi(dpi);
+                assert_eq!(p.rgba.len(), (p.width * p.height * 4) as usize);
+                assert!(p.hotspot_x < p.width && p.hotspot_y < p.height);
+            }
         }
+        // The I-beam is as tall as it was drawn, per 96 dpi.
+        assert_eq!(Pointer::ibeam().height, 16);
+        assert_eq!(Pointer::ibeam().for_dpi(192).height, 32);
     }
 }

@@ -244,7 +244,7 @@ The client is a Rust crate compiled to wasm (`MolcajeteClient`), plus three Java
 By default the whole client (WebSocket tunnel, parser, image decoding, WebGL2 rendering, compositing) runs in a dedicated worker. The visible canvas is an `OffscreenCanvas` handed over with `transferControlToOffscreen()`. Only this stays on the main thread:
 
 - receiving pointer, wheel, keyboard and IME events (on a hidden `textarea`, the input sink) and posting them to the worker
-- applying the worker's `layout` (canvas CSS size) and `cursor` (RGBA turned into a CSS cursor) events to the DOM
+- applying the worker's `layout` (canvas CSS size) and `cursor` (RGBA turned into a CSS cursor at the display's scale) events to the DOM
 - playing audio (Web Audio does not exist in workers) and the UI itself
 
 Browsers without OffscreenCanvas run the same wasm client on the main thread (`MolcajeteClient::new` instead of `new_offscreen`); `?main` on the session page forces this. The reason for the split is the measurement in section 7.2: in Chromium, uploading CPU-backed images into WebGL is synchronous on the calling thread, so a main-thread WebGL client was slower than the stock 2D-canvas client, while the worker cut main-thread time to a third to a sixth of it.
@@ -269,7 +269,7 @@ All browser callbacks go through one `with_inner` borrow of the client state, so
 | `lfill`/`lstroke` | Pattern shader repeating the source surface |
 | `push`/`pop`/`reset`/`transform` | Per-layer drawing state stack (transform, clip, composite mode, miter limit) |
 | `move`/`shade`/`distort`/`dispose` | Layer tree properties, applied when compositing |
-| `cursor` | Copied into a cursor texture and read back **asynchronously** with a PBO and a fence (`Readback`), so the pipeline never stalls. The CSS cursor is updated only when the pixels changed, and the readback is skipped when the source did not change. The server's `mouse` position is drawn as a software cursor. |
+| `cursor` | Copied into a cursor texture and read back **asynchronously** with a PBO and a fence (`Readback`), so the pipeline never stalls. The CSS cursor is updated only when the pixels changed, and the readback is skipped when the source did not change. The image gets the resolution of the display on the page, `image-set(url(…) 2x)` where two remote pixels cover one CSS pixel, and its hotspot is divided by it, so the pointer has the size of everything else on the remote screen; a browser that takes no resolution in `cursor` gets the image shrunk instead (`cursor.rs`, and `cssCursor` in `molcajete.js` for the worker). It is applied again when the display scale changes. The server's `mouse` position is drawn as a software cursor. |
 
 **Compositing.** Once per animation frame the layer tree is walked and each layer drawn with its transform (`translate`, then `distort` about its centre), opacity and the parent's clip. A translucent layer with children is first rendered offscreen and blended with the group opacity, like CSS `opacity`. The canvas is created with `desynchronized: true` (low latency), and linear filtering is used only for non-integer scale factors.
 
@@ -699,6 +699,7 @@ An RFB client of its own (`vnc/rfb`): RFB 3.3/3.7/3.8, None and VNC authenticati
 - **Selection and clipboard.** Drag and double-click select; releasing sends the text as a `clipboard` stream; a click that clears the selection sends `selection,0`. Ctrl+Shift+V and right-click paste. Wheel scrolls back.
 - **Size.** The terminal has as many cells as fit the display. A `size` from the client is always followed by the end of a frame, also when the resize changed no pixel (a terminal that only got shorter below its last line), because the client applies a new size at the end of a frame. `font-size` sent as `argv` during the session rescales the loaded faces (`Fonts::set_size`), keeps the display's size and gives the terminal the cells that fit now.
 - **Links** (`ssh/link.rs`). The cell under the pointer is checked for an OSC 8 hyperlink or an `http://`, `https://` or `mailto:` URL in the line's text, followed across wrapped lines (at most 16 each way) and without trailing punctuation or unbalanced closing brackets. Links are looked for when the pointer moves, a modifier changes and before every frame; not while the application takes mouse events (Shift bypasses it) or a button is held. The link is underlined, the pointer becomes a hand, and the client gets `link,<url>` or a bare `link`.
+- **Pointers** (`display/pointer.rs`). The I-beam, the arrow and the hand are pixel art for 96 dpi. The client shows a pointer at one image pixel per pixel of the display, so they are enlarged for the client's resolution (twice at 192 dpi, pixels repeated), like the text. The arrow an RDP server asks for as its default pointer is enlarged for the desktop scale in the same way.
 
 Parameter names match guacd's SSH plugin.
 
@@ -796,6 +797,7 @@ The stored credentials thus stay in molcajeted, as with its own RDP client. Stan
 - **Browser tests** (`tests/browser`, headless Chromium, `npm test`):
   - `renderer.test.mjs`: pixels of the WebGL2 renderer against what the HTML-canvas reference client produces, including zstd images at every index depth, through clips, transforms and composite modes, damaged images, and frames where zstd, PNG and JPEG images overlap.
   - `input.test.mjs`: keyboard and IME handling of the page-side client (Korean composition driven over CDP), keys and held modifiers sent from the page, and touch in terminals (drag, long press, tap and pinch driven over CDP), in worker and main-thread mode.
+  - `cursor.test.mjs`: the remote pointer as a CSS cursor: its resolution and hotspot at one and at two remote pixels per CSS pixel, after the display scale changes, and in a browser that takes no resolution in `cursor`, in worker and main-thread mode.
   - `binary.test.mjs`: a stand-in gateway sends one frame (a PNG larger than a record, a PNG with transparency, a JPEG, zstd images, PCM audio and an H.264 stream cut at arbitrary points) as records to a client offering the binary subprotocol and as base64 to one that does not, in worker and main-thread mode; all four must show the same pixels, and `sync` replies must carry the apply time only when asked.
   - `audio.test.mjs`: PCM streams under a browser's autoplay policy, in worker and main-thread mode: without a gesture the page is told that sound waits and a click lets it play; a context made in the click that opened the session plays the stream at once.
   - `playback.test.mjs`: seeking and playing recordings; a frame decoded by the browser and in wasm must give the same pixels.

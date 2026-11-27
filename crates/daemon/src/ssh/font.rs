@@ -207,6 +207,11 @@ impl Fonts {
         self.metrics
     }
 
+    /// The resolution (pixels per inch) text is drawn for.
+    pub fn dpi(&self) -> u32 {
+        self.dpi as u32
+    }
+
     /// Changes the font size (points) of the loaded faces. Returns whether
     /// the size differs from before: the cells then have new metrics, and
     /// glyphs are rasterised again as they are needed.

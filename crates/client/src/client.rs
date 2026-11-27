@@ -17,11 +17,13 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
     AddEventListenerOptions, AudioContext, AudioContextState, CanvasRenderingContext2d,
-    CompositionEvent, Event, EventTarget, HtmlCanvasElement, HtmlElement, HtmlTextAreaElement,
-    ImageData, InputEvent, KeyboardEvent, PointerEvent, ResizeObserver, WheelEvent,
+    CompositionEvent, CssStyleDeclaration, Event, EventTarget, HtmlCanvasElement, HtmlElement,
+    HtmlTextAreaElement, ImageData, InputEvent, KeyboardEvent, PointerEvent, ResizeObserver,
+    WheelEvent,
 };
 
 use crate::audio::{RawAudioPlayer, RawFormat};
+use crate::cursor;
 use crate::display::{DisplayEvent, DrawOp, ImageSlot, ImageState, Op, QueuedImage};
 use crate::geom::Rect;
 use crate::gl::CanvasTarget;
@@ -202,6 +204,15 @@ struct Dom {
     resize_observer: Option<(ResizeObserver, ResizeCallback)>,
 }
 
+/// The remote pointer's image (un-premultiplied RGBA, top row first).
+struct CursorImage {
+    hotspot_x: i32,
+    hotspot_y: i32,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
 pub struct Inner {
     self_ref: WeakShared,
     /// Strong self-reference held while a connection is active, so that a
@@ -240,6 +251,11 @@ pub struct Inner {
     /// Whether the zstd image type is announced to the server.
     zstd_images: bool,
     scale_mode: ScaleMode,
+    /// The pointer shown as the canvas's CSS cursor, kept to show it again
+    /// when the display scale changes, and the density it was shown at
+    /// (see [`cursor::density`]). Only with a DOM.
+    cursor: Option<CursorImage>,
+    cursor_density: f64,
     auto_resize: bool,
     pending_resize: Option<(u32, u32)>,
     /// Draw to the canvas as soon as something changed instead of in the
@@ -308,6 +324,74 @@ fn object(entries: &[(&str, JsValue)]) -> JsValue {
         let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(k), v);
     }
     obj.into()
+}
+
+/// Sets `image` as a CSS cursor of `density` image pixels per CSS pixel.
+fn set_css_cursor(
+    style: &CssStyleDeclaration,
+    image: &CursorImage,
+    density: f64,
+) -> Result<(), JsValue> {
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("no document")?;
+    let canvas = |width: u32, height: u32| -> Result<_, JsValue> {
+        let canvas: HtmlCanvasElement = document.create_element("canvas")?.dyn_into()?;
+        canvas.set_width(width);
+        canvas.set_height(height);
+        let ctx: CanvasRenderingContext2d = canvas
+            .get_context("2d")?
+            .ok_or("no 2d context")?
+            .dyn_into()?;
+        Ok((canvas, ctx))
+    };
+    let (full, ctx) = canvas(image.width, image.height)?;
+    let data = ImageData::new_with_u8_clamped_array_and_sh(
+        Clamped(&image.rgba),
+        image.width,
+        image.height,
+    )?;
+    ctx.put_image_data(&data, 0.0, 0.0)?;
+    if density == 1.0 {
+        let (x, y) = (image.hotspot_x, image.hotspot_y);
+        return style.set_property(
+            "cursor",
+            &format!("url({}) {x} {y}, auto", full.to_data_url()?),
+        );
+    }
+    let css = cursor::css_cursor(
+        image.width,
+        image.height,
+        image.hotspot_x,
+        image.hotspot_y,
+        density,
+    );
+    let (x, y) = (css.hotspot_x, css.hotspot_y);
+    // A browser that takes no resolution in a cursor drops the value.
+    style.remove_property("cursor")?;
+    style.set_property(
+        "cursor",
+        &format!(
+            "image-set(url({}) {density}x) {x} {y}, auto",
+            full.to_data_url()?
+        ),
+    )?;
+    if !style.get_property_value("cursor")?.is_empty() {
+        return Ok(());
+    }
+    // There the image is shrunk to its size in CSS pixels instead.
+    let (small, ctx) = canvas(css.width, css.height)?;
+    ctx.draw_image_with_html_canvas_element_and_dw_and_dh(
+        &full,
+        0.0,
+        0.0,
+        f64::from(css.width),
+        f64::from(css.height),
+    )?;
+    style.set_property(
+        "cursor",
+        &format!("url({}) {x} {y}, auto", small.to_data_url()?),
+    )
 }
 
 /// The modifier flags of a key event as [`Modifiers`] bits.
@@ -423,6 +507,8 @@ impl Inner {
                 binary_tunnel: true,
                 zstd_images: true,
                 scale_mode: ScaleMode::Fit,
+                cursor: None,
+                cursor_density: 1.0,
                 auto_resize: true,
                 pending_resize: None,
                 early_composite: false,
@@ -2045,6 +2131,9 @@ impl Inner {
                 let style = dom.canvas.style();
                 let _ = style.set_property("width", &format!("{css_w}px"));
                 let _ = style.set_property("height", &format!("{css_h}px"));
+                if cursor::density(scale) != self.cursor_density {
+                    self.apply_cursor();
+                }
             }
             None => self.emit(
                 "layout",
@@ -2065,7 +2154,7 @@ impl Inner {
         height: u32,
         rgba: &[u8],
     ) {
-        let Some(dom) = &self.dom else {
+        if self.dom.is_none() {
             // Without a DOM the page applies the cursor itself.
             let pixels = js_sys::Uint8ClampedArray::from(rgba);
             self.emit(
@@ -2079,37 +2168,33 @@ impl Inner {
                 ]),
             );
             return;
+        }
+        self.cursor = Some(CursorImage {
+            hotspot_x,
+            hotspot_y,
+            width,
+            height,
+            rgba: rgba.to_vec(),
+        });
+        self.apply_cursor();
+    }
+
+    /// Shows the remote pointer as the canvas's CSS cursor, at the size
+    /// the display has on the page.
+    fn apply_cursor(&mut self) {
+        let density = cursor::density(self.display.scale());
+        self.cursor_density = density;
+        let (Some(dom), Some(image)) = (&self.dom, &self.cursor) else {
+            return;
         };
         let style = dom.canvas.style();
-        if width == 0 || height == 0 || rgba.iter().skip(3).step_by(4).all(|&a| a == 0) {
+        let CursorImage { width, height, .. } = *image;
+        if width == 0 || height == 0 || image.rgba.iter().skip(3).step_by(4).all(|&a| a == 0) {
             let _ = style.set_property("cursor", "none");
             return;
         }
-        let url = (|| -> Result<String, JsValue> {
-            let document = web_sys::window()
-                .and_then(|w| w.document())
-                .ok_or("no document")?;
-            let canvas: HtmlCanvasElement = document.create_element("canvas")?.dyn_into()?;
-            canvas.set_width(width);
-            canvas.set_height(height);
-            let ctx: CanvasRenderingContext2d = canvas
-                .get_context("2d")?
-                .ok_or("no 2d context")?
-                .dyn_into()?;
-            let data = ImageData::new_with_u8_clamped_array_and_sh(Clamped(rgba), width, height)?;
-            ctx.put_image_data(&data, 0.0, 0.0)?;
-            canvas.to_data_url()
-        })();
-        match url {
-            Ok(url) => {
-                let _ = style.set_property(
-                    "cursor",
-                    &format!("url({url}) {hotspot_x} {hotspot_y}, auto"),
-                );
-            }
-            Err(_) => {
-                let _ = style.set_property("cursor", "default");
-            }
+        if set_css_cursor(&style, image, density).is_err() {
+            let _ = style.set_property("cursor", "default");
         }
     }
 

@@ -5,6 +5,7 @@ use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::geometry::InclusiveRectangle;
 
+use crate::display::pointer::PointerImage;
 use crate::display::{ChannelOrder, SourceImage};
 
 /// A rectangle in desktop pixels.
@@ -122,8 +123,9 @@ impl Cursor {
         })
     }
 
-    /// The standard arrow, shown when the server asks for its default pointer.
-    pub fn arrow() -> Self {
+    /// The standard arrow, shown when the server asks for its default
+    /// pointer, at the size it has at a desktop scale of `scale` percent.
+    pub fn arrow(scale: u32) -> Self {
         // '#' black, '.' white, ' ' transparent.
         const ARROW: [&str; 19] = [
             "#           ",
@@ -155,12 +157,20 @@ impl Cursor {
                 _ => [0, 0, 0, 0],
             })
             .collect();
-        Self {
+        let arrow = PointerImage {
             hotspot_x: 0,
             hotspot_y: 0,
             width: ARROW[0].len() as u32,
             height: ARROW.len() as u32,
             rgba,
+        }
+        .for_dpi(scale.saturating_mul(96) / 100);
+        Self {
+            hotspot_x: arrow.hotspot_x,
+            hotspot_y: arrow.hotspot_y,
+            width: arrow.width,
+            height: arrow.height,
+            rgba: arrow.rgba,
         }
     }
 }
@@ -317,10 +327,13 @@ mod tests {
 
     #[test]
     fn arrow_cursor_is_well_formed() {
-        let arrow = Cursor::arrow();
-        assert_eq!(arrow.rgba.len() as u32, arrow.width * arrow.height * 4);
-        // Tip is black and opaque; the far corner is transparent.
-        assert_eq!(&arrow.rgba[..4], &[0, 0, 0, 255]);
-        assert_eq!(arrow.rgba[arrow.rgba.len() - 1], 0);
+        for (scale, size) in [(100, (12, 19)), (200, (24, 38))] {
+            let arrow = Cursor::arrow(scale);
+            assert_eq!((arrow.width, arrow.height), size, "{scale} %");
+            assert_eq!(arrow.rgba.len() as u32, arrow.width * arrow.height * 4);
+            // Tip is black and opaque; the far corner is transparent.
+            assert_eq!(&arrow.rgba[..4], &[0, 0, 0, 255]);
+            assert_eq!(arrow.rgba[arrow.rgba.len() - 1], 0);
+        }
     }
 }
