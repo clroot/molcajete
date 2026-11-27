@@ -103,6 +103,20 @@ function isMac() {
   return /mac/i.test(platform);
 }
 
+/**
+ * The modifier flags of a key event as the bits `key_down` and `key_up`
+ * take, which keep Ctrl, Alt, Shift and Meta in step with the keyboard.
+ */
+function modifierFlags(e) {
+  return (
+    (e.ctrlKey ? 1 : 0) |
+    (e.altKey ? 2 : 0) |
+    (e.shiftKey ? 4 : 0) |
+    (e.metaKey ? 8 : 0) |
+    (e.getModifierState("AltGraph") ? 16 : 0)
+  );
+}
+
 /** Link schemes the page opens; the daemon offers no others either. */
 function isOpenableLink(url) {
   return typeof url === "string" && /^(https?:\/\/|mailto:)./i.test(url);
@@ -615,12 +629,12 @@ export class MolcajeteSession {
       const composing = e.isComposing || e.key === "Process";
       if (e.key === "Dead" || (composing && !this.#remoteComposition)) return;
       e.preventDefault();
-      this.#post("key_down", e.key, e.code, e.location, composing, e.getModifierState("CapsLock"));
+      this.#post("key_down", e.key, e.code, e.location, composing, e.getModifierState("CapsLock"), modifierFlags(e));
     });
     this.#listen(sink, "keyup", (e) => {
       if ((e.isComposing || e.key === "Process") && !this.#remoteComposition) return;
       e.preventDefault();
-      this.#post("key_up", e.key, e.code, e.location, e.getModifierState("CapsLock"));
+      this.#post("key_up", e.key, e.code, e.location, e.getModifierState("CapsLock"), modifierFlags(e));
     });
     this.#listen(sink, "compositionend", (e) => {
       if (e.data && !this.#remoteComposition) this.#post("type_text", e.data);

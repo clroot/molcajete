@@ -39,6 +39,49 @@ pub struct Keyboard {
 /// A key press (`true`) or release (`false`).
 pub type KeyEvent = (u32, bool);
 
+/// The modifier flags of a key event (`ctrlKey`, `altKey`, `shiftKey`,
+/// `metaKey`, `getModifierState("AltGraph")`) as a bit set.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Modifiers(u32);
+
+impl Modifiers {
+    pub const CTRL: u32 = 1;
+    pub const ALT: u32 = 2;
+    pub const SHIFT: u32 = 4;
+    pub const META: u32 = 8;
+    pub const ALT_GRAPH: u32 = 16;
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    fn has(self, bit: u32) -> bool {
+        self.0 & bit != 0
+    }
+}
+
+/// The modifiers kept in step with the event flags: the flag, the code a
+/// press that only the flags reported is filed under, and the keysyms of
+/// the left and the right key.
+const SYNCED_MODIFIERS: [(u32, &str, [u32; 2]); 4] = [
+    (
+        Modifiers::CTRL,
+        "ControlLeft",
+        [keysym::CONTROL_L, keysym::CONTROL_R],
+    ),
+    (Modifiers::ALT, "AltLeft", [keysym::ALT_L, keysym::ALT_R]),
+    (
+        Modifiers::SHIFT,
+        "ShiftLeft",
+        [keysym::SHIFT_L, keysym::SHIFT_R],
+    ),
+    (
+        Modifiers::META,
+        "MetaLeft",
+        [keysym::SUPER_L, keysym::SUPER_R],
+    ),
+];
+
 fn tap(keysym: u32) -> Vec<KeyEvent> {
     vec![(keysym, true), (keysym, false)]
 }
@@ -109,9 +152,52 @@ impl Keyboard {
             .or_else(|| keysym::editing_key_by_code(code))
     }
 
+    /// Brings Ctrl, Alt, Shift and Meta in line with the flags of a key
+    /// event, as `Guacamole.Keyboard` does: a modifier the flags report but
+    /// no `keydown` pressed is pressed, one pressed that the flags no
+    /// longer report is released. A browser sends a modifier's `keydown`
+    /// once, so a stray `keyup` (iPadOS Safari sends one now and then while
+    /// the key is held) or a lost one would otherwise last until the key is
+    /// pressed again. `own` is the keysym of the event's key, whose flag
+    /// describes the key itself and is left alone. With AltGr down the
+    /// browser also reports Ctrl and Alt (on Windows), which are left alone
+    /// too. `None` (a caller that does not pass the flags) changes nothing.
+    fn sync_modifiers(&mut self, flags: Option<Modifiers>, own: Option<u32>) -> Vec<KeyEvent> {
+        let Some(flags) = flags else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        for (bit, code, keysyms) in SYNCED_MODIFIERS {
+            if own.is_some_and(|k| keysyms.contains(&k))
+                || (flags.has(Modifiers::ALT_GRAPH)
+                    && bit & (Modifiers::CTRL | Modifiers::ALT) != 0)
+            {
+                continue;
+            }
+            let held: Vec<String> = self
+                .pressed
+                .iter()
+                .filter(|(_, k)| keysyms.contains(k))
+                .map(|(id, _)| id.clone())
+                .collect();
+            if flags.has(bit) && held.is_empty() {
+                self.pressed.insert(code.to_owned(), keysyms[0]);
+                events.push((keysyms[0], true));
+            } else if !flags.has(bit) {
+                for id in held {
+                    if let Some(k) = self.pressed.remove(&id) {
+                        events.push((k, false));
+                    }
+                }
+            }
+        }
+        events
+    }
+
     /// Handles `keydown`. Returns the events to send, or `None` when the
     /// event should be left to the browser (IME composition, dead keys).
-    /// `caps_lock` is the lock state the event reports.
+    /// `caps_lock` is the lock state the event reports, `modifiers` its
+    /// modifier flags (see [`Keyboard::sync_modifiers`]).
     pub fn key_down(
         &mut self,
         key: &str,
@@ -119,9 +205,12 @@ impl Keyboard {
         location: u32,
         composing: bool,
         caps_lock: bool,
+        modifiers: Option<Modifiers>,
     ) -> Option<Vec<KeyEvent>> {
         if code == "CapsLock" && self.caps_lock_toggles() {
-            return Some(self.caps_lock_event(true, caps_lock));
+            let mut events = self.sync_modifiers(modifiers, None);
+            events.extend(self.caps_lock_event(true, caps_lock));
+            return Some(events);
         }
         self.caps_locked = caps_lock;
         let keysym = match self.physical_keysym(key, code, composing) {
@@ -130,7 +219,7 @@ impl Keyboard {
             None => keysym::keysym_for_event(key, code, location)?,
         };
         let id = if code.is_empty() { key } else { code };
-        let mut events = Vec::with_capacity(2);
+        let mut events = self.sync_modifiers(modifiers, Some(keysym));
         if let Some(previous) = self.pressed.insert(id.to_owned(), keysym)
             && previous != keysym
         {
@@ -140,27 +229,31 @@ impl Keyboard {
         Some(events)
     }
 
+    /// Handles `keyup`, with the event's lock state and modifier flags as
+    /// for [`Keyboard::key_down`].
     pub fn key_up(
         &mut self,
         key: &str,
         code: &str,
         location: u32,
         caps_lock: bool,
+        modifiers: Option<Modifiers>,
     ) -> Vec<KeyEvent> {
         if code == "CapsLock" && self.caps_lock_toggles() {
-            return self.caps_lock_event(false, caps_lock);
+            let mut events = self.sync_modifiers(modifiers, None);
+            events.extend(self.caps_lock_event(false, caps_lock));
+            return events;
         }
         let id = if code.is_empty() { key } else { code };
-        match self.pressed.remove(id) {
-            Some(keysym) => vec![(keysym, false)],
-            None => {
-                // Release without a matching press (e.g. focus moved in while
-                // the key was held). Releasing an unpressed key is harmless.
-                keysym::keysym_for_event(key, code, location)
-                    .map(|k| vec![(k, false)])
-                    .unwrap_or_default()
-            }
-        }
+        // Release without a matching press (e.g. focus moved in while the
+        // key was held). Releasing an unpressed key is harmless.
+        let release = self
+            .pressed
+            .remove(id)
+            .or_else(|| keysym::keysym_for_event(key, code, location));
+        let mut events = self.sync_modifiers(modifiers, release);
+        events.extend(release.map(|k| (k, false)));
+        events
     }
 
     /// Releases everything (on blur or disconnect).
@@ -359,19 +452,22 @@ mod tests {
     fn release_uses_pressed_keysym() {
         let mut kb = Keyboard::default();
         assert_eq!(
-            kb.key_down("Shift", "ShiftLeft", 1, false, false),
+            kb.key_down("Shift", "ShiftLeft", 1, false, false, None),
             Some(vec![(keysym::SHIFT_L, true)])
         );
         assert_eq!(
-            kb.key_down("A", "KeyA", 0, false, false),
+            kb.key_down("A", "KeyA", 0, false, false, None),
             Some(vec![('A' as u32, true)])
         );
         assert_eq!(
-            kb.key_up("Shift", "ShiftLeft", 1, false),
+            kb.key_up("Shift", "ShiftLeft", 1, false, None),
             vec![(keysym::SHIFT_L, false)]
         );
         // Shift is up now, but the release must still be "A".
-        assert_eq!(kb.key_up("a", "KeyA", 0, false), vec![('A' as u32, false)]);
+        assert_eq!(
+            kb.key_up("a", "KeyA", 0, false, None),
+            vec![('A' as u32, false)]
+        );
         assert!(!kb.any_pressed());
     }
 
@@ -425,18 +521,18 @@ mod tests {
     #[test]
     fn tells_held_keys() {
         let mut kb = Keyboard::default();
-        kb.key_down("Control", "ControlRight", 2, false, false);
+        kb.key_down("Control", "ControlRight", 2, false, false, None);
         assert!(kb.is_down(&[keysym::CONTROL_L, keysym::CONTROL_R]));
         assert!(!kb.is_down(&[keysym::SHIFT_L, keysym::SHIFT_R]));
-        kb.key_up("Control", "ControlRight", 2, false);
+        kb.key_up("Control", "ControlRight", 2, false, None);
         assert!(!kb.is_down(&[keysym::CONTROL_L, keysym::CONTROL_R]));
     }
 
     #[test]
     fn composition_is_left_to_the_browser() {
         let mut kb = Keyboard::default();
-        assert_eq!(kb.key_down("Process", "KeyG", 0, true, false), None);
-        assert_eq!(kb.key_down("ㅎ", "KeyG", 0, true, false), None);
+        assert_eq!(kb.key_down("Process", "KeyG", 0, true, false, None), None);
+        assert_eq!(kb.key_down("ㅎ", "KeyG", 0, true, false, None), None);
     }
 
     fn remote(caps_lock_toggles: bool) -> Keyboard {
@@ -450,42 +546,45 @@ mod tests {
         let mut kb = remote(false);
         // A composing IME reports "Process"; an inactive one the jamo.
         assert_eq!(
-            kb.key_down("Process", "KeyG", 0, true, false),
+            kb.key_down("Process", "KeyG", 0, true, false, None),
             Some(vec![('g' as u32, true)])
         );
         assert_eq!(
-            kb.key_up("Process", "KeyG", 0, false),
+            kb.key_up("Process", "KeyG", 0, false, None),
             vec![('g' as u32, false)]
         );
         assert_eq!(
-            kb.key_down("ㅏ", "KeyK", 0, false, false),
+            kb.key_down("ㅏ", "KeyK", 0, false, false, None),
             Some(vec![('k' as u32, true)])
         );
-        assert_eq!(kb.key_up("ㅏ", "KeyK", 0, false), vec![('k' as u32, false)]);
-        // Shift selects the double consonants on the remote side.
-        kb.key_down("Shift", "ShiftLeft", 1, false, false);
         assert_eq!(
-            kb.key_down("ㅃ", "KeyQ", 0, false, false),
+            kb.key_up("ㅏ", "KeyK", 0, false, None),
+            vec![('k' as u32, false)]
+        );
+        // Shift selects the double consonants on the remote side.
+        kb.key_down("Shift", "ShiftLeft", 1, false, false, None);
+        assert_eq!(
+            kb.key_down("ㅃ", "KeyQ", 0, false, false, None),
             Some(vec![('Q' as u32, true)])
         );
-        kb.key_up("ㅃ", "KeyQ", 0, false);
-        kb.key_up("Shift", "ShiftLeft", 1, false);
+        kb.key_up("ㅃ", "KeyQ", 0, false, None);
+        kb.key_up("Shift", "ShiftLeft", 1, false, None);
         // Editing keys claimed by the IME are forwarded too.
         assert_eq!(
-            kb.key_down("Process", "Backspace", 0, true, false),
+            kb.key_down("Process", "Backspace", 0, true, false, None),
             Some(vec![(0xFF08, true)])
         );
         // Latin text and named keys are unchanged.
         assert_eq!(
-            kb.key_down("é", "KeyE", 0, false, false),
+            kb.key_down("é", "KeyE", 0, false, false, None),
             Some(vec![(0xE9, true)])
         );
         assert_eq!(
-            kb.key_down("HangulMode", "Lang1", 0, false, false),
+            kb.key_down("HangulMode", "Lang1", 0, false, false, None),
             Some(vec![(keysym::HANGUL, true)])
         );
         // Dead keys still compose locally.
-        assert_eq!(kb.key_down("Dead", "Quote", 0, false, false), None);
+        assert_eq!(kb.key_down("Dead", "Quote", 0, false, false, None), None);
     }
 
     #[test]
@@ -496,34 +595,34 @@ mod tests {
         // Press and release both reported: one toggle.
         let mut kb = remote(true);
         assert_eq!(
-            kb.key_down("CapsLock", "CapsLock", 0, false, false),
+            kb.key_down("CapsLock", "CapsLock", 0, false, false, None),
             Some(toggle.clone())
         );
         assert_eq!(
-            kb.key_down("CapsLock", "CapsLock", 0, false, false),
+            kb.key_down("CapsLock", "CapsLock", 0, false, false, None),
             Some(vec![])
         );
-        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false), vec![]);
+        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false, None), vec![]);
         // Only the release reported.
-        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false), toggle);
+        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false, None), toggle);
         // A press that locks capitals is Caps Lock, and so is its unlock.
         assert_eq!(
-            kb.key_down("CapsLock", "CapsLock", 0, false, true),
+            kb.key_down("CapsLock", "CapsLock", 0, false, true, None),
             Some(caps.clone())
         );
-        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false), caps);
+        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false, None), caps);
         assert!(!kb.any_pressed());
 
         // Capitals already locked when the session started.
         let mut kb = remote(true);
-        kb.key_down("A", "KeyA", 0, false, true);
-        kb.key_up("A", "KeyA", 0, true);
-        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false), caps);
+        kb.key_down("A", "KeyA", 0, false, true, None);
+        kb.key_up("A", "KeyA", 0, true, None);
+        assert_eq!(kb.key_up("CapsLock", "CapsLock", 0, false, None), caps);
 
         // Without the option, and when composing locally, it stays Caps Lock.
         for mut kb in [remote(false), Keyboard::default()] {
             assert_eq!(
-                kb.key_down("CapsLock", "CapsLock", 0, false, true),
+                kb.key_down("CapsLock", "CapsLock", 0, false, true, None),
                 Some(vec![(keysym::CAPS_LOCK, true)])
             );
         }

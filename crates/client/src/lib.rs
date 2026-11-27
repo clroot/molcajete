@@ -87,6 +87,12 @@ mod wasm_api {
 
         /// `keydown`; returns whether the default action should be prevented.
         /// `caps_lock` is `getModifierState("CapsLock")` of the event.
+        /// `modifiers` are its modifier flags as bits: 1 `ctrlKey`, 2
+        /// `altKey`, 4 `shiftKey`, 8 `metaKey`, 16
+        /// `getModifierState("AltGraph")`. With them Ctrl, Alt, Shift and
+        /// Meta follow the flags even when the browser loses or invents a
+        /// modifier's `keyup`; without them (`undefined`) only their own key
+        /// events count.
         pub fn key_down(
             &self,
             key: &str,
@@ -94,16 +100,27 @@ mod wasm_api {
             location: u32,
             composing: bool,
             caps_lock: bool,
+            modifiers: Option<u32>,
         ) -> bool {
             let mut consumed = false;
-            self.run(|inner| consumed = inner.key_down(key, code, location, composing, caps_lock));
+            self.run(|inner| {
+                consumed = inner.key_down(key, code, location, composing, caps_lock, modifiers)
+            });
             consumed
         }
 
         /// `keyup`; returns whether the default action should be prevented.
-        pub fn key_up(&self, key: &str, code: &str, location: u32, caps_lock: bool) -> bool {
+        /// `caps_lock` and `modifiers` as for [`MolcajeteClient::key_down`].
+        pub fn key_up(
+            &self,
+            key: &str,
+            code: &str,
+            location: u32,
+            caps_lock: bool,
+            modifiers: Option<u32>,
+        ) -> bool {
             let mut consumed = false;
-            self.run(|inner| consumed = inner.key_up(key, code, location, caps_lock));
+            self.run(|inner| consumed = inner.key_up(key, code, location, caps_lock, modifiers));
             consumed
         }
 

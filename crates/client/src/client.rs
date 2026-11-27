@@ -25,7 +25,7 @@ use crate::audio::{RawAudioPlayer, RawFormat};
 use crate::display::{DisplayEvent, DrawOp, ImageSlot, ImageState, Op, QueuedImage};
 use crate::geom::Rect;
 use crate::gl::CanvasTarget;
-use crate::input::{self, Composition, HeldModifiers, Hold, Keyboard, WheelAccumulator};
+use crate::input::{self, Composition, HeldModifiers, Hold, Keyboard, Modifiers, WheelAccumulator};
 use crate::scope;
 use crate::tunnel::{Tunnel, TunnelHandlers, TunnelMessage};
 use crate::{display::Display, gl::Renderer};
@@ -308,6 +308,20 @@ fn object(entries: &[(&str, JsValue)]) -> JsValue {
         let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(k), v);
     }
     obj.into()
+}
+
+/// The modifier flags of a key event as [`Modifiers`] bits.
+fn event_modifiers(event: &KeyboardEvent) -> u32 {
+    [
+        (event.ctrl_key(), Modifiers::CTRL),
+        (event.alt_key(), Modifiers::ALT),
+        (event.shift_key(), Modifiers::SHIFT),
+        (event.meta_key(), Modifiers::META),
+        (event.get_modifier_state("AltGraph"), Modifiers::ALT_GRAPH),
+    ]
+    .into_iter()
+    .filter(|(set, _)| *set)
+    .fold(0, |bits, (_, bit)| bits | bit)
 }
 
 impl Inner {
@@ -1748,7 +1762,9 @@ impl Inner {
     }
 
     /// `keydown`; returns whether the event was consumed (and should have
-    /// its default action prevented).
+    /// its default action prevented). `modifiers` are the event's modifier
+    /// flags ([`input::Modifiers`] bits), which keep Ctrl, Alt, Shift and
+    /// Meta in step; `None` leaves them to their own key events.
     pub fn key_down(
         &mut self,
         key: &str,
@@ -1756,12 +1772,17 @@ impl Inner {
         location: u32,
         composing: bool,
         caps_lock: bool,
+        modifiers: Option<u32>,
     ) -> bool {
         self.resume_audio();
-        match self
-            .keyboard
-            .key_down(key, code, location, composing, caps_lock)
-        {
+        match self.keyboard.key_down(
+            key,
+            code,
+            location,
+            composing,
+            caps_lock,
+            modifiers.map(Modifiers::from_bits),
+        ) {
             Some(events) => {
                 let mut typed = false;
                 for (keysym, pressed) in events {
@@ -1830,8 +1851,23 @@ impl Inner {
         self.emit("modifiers", detail);
     }
 
-    pub fn key_up(&mut self, key: &str, code: &str, location: u32, caps_lock: bool) -> bool {
-        let events = self.keyboard.key_up(key, code, location, caps_lock);
+    /// `keyup`, with the lock state and modifier flags as for
+    /// [`Inner::key_down`].
+    pub fn key_up(
+        &mut self,
+        key: &str,
+        code: &str,
+        location: u32,
+        caps_lock: bool,
+        modifiers: Option<u32>,
+    ) -> bool {
+        let events = self.keyboard.key_up(
+            key,
+            code,
+            location,
+            caps_lock,
+            modifiers.map(Modifiers::from_bits),
+        );
         // In remote composition every key belongs to the remote host, even
         // one that sends nothing (the release of a Caps Lock toggle).
         let consumed = !events.is_empty() || self.composes_remotely();
@@ -1848,6 +1884,7 @@ impl Inner {
             event.location(),
             event.is_composing(),
             event.get_modifier_state("CapsLock"),
+            Some(event_modifiers(&event)),
         ) {
             event.prevent_default();
         }
@@ -1859,6 +1896,7 @@ impl Inner {
             &event.code(),
             event.location(),
             event.get_modifier_state("CapsLock"),
+            Some(event_modifiers(&event)),
         ) {
             event.prevent_default();
         }
