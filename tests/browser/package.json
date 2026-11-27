@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Pixel-level tests of the WebGL2 renderer in headless Chromium",
   "scripts": {
-    "test": "node renderer.test.mjs && node input.test.mjs && node binary.test.mjs && node audio.test.mjs && node playback.test.mjs && node tunnel.test.mjs"
+    "test": "node renderer.test.mjs && node input.test.mjs && node cursor.test.mjs && node binary.test.mjs && node audio.test.mjs && node playback.test.mjs && node tunnel.test.mjs"
   },
   "dependencies": {
     "playwright-core": "1.56.1"
