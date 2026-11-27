@@ -691,38 +691,92 @@ mod tests {
         if DriveBackend::DEFERS_COMPLETIONS {
             let watched =
                 open(&mut backend, "/folder", CreateDisposition::FILE_OPEN, true).unwrap();
-            let mut request = header(watched, MajorFunction::DirectoryControl);
-            request.minor_function = MinorFunction::IRP_MN_NOTIFY_CHANGE_DIRECTORY;
-            let scheduled = backend
-                .handle_drive_io_request(
-                    ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(
-                        ironrdp_rdpdr::pdu::efs::ServerDriveNotifyChangeDirectoryRequest {
-                            device_io_request: request,
-                            watch_tree: 0,
-                            // FILE_NOTIFY_CHANGE_FILE_NAME
-                            completion_filter: 1,
-                        },
-                    ),
-                )
-                .unwrap();
-            assert!(scheduled.is_empty());
+            assert!(watch(&mut backend, watched).is_empty());
             assert!(backend.poll_deferred_messages().unwrap().is_empty());
             std::fs::write(root.join("folder").join("uploaded.txt"), b"x").unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let completed = loop {
-                let messages = backend.poll_deferred_messages().unwrap();
-                if !messages.is_empty() {
-                    break messages;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "no change notification"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            };
+            let completed = completion(&mut backend);
             assert_eq!(status(&completed), NtStatus::SUCCESS);
             close(&mut backend, watched);
         }
+
+        backend.reset().unwrap();
+        drop(backend);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Asks for a notification when a file name changes in the directory
+    /// `file_id`; what the backend answers at once.
+    fn watch(backend: &mut DriveBackend, file_id: u32) -> Vec<SvcMessage> {
+        let mut request = header(file_id, MajorFunction::DirectoryControl);
+        request.minor_function = MinorFunction::IRP_MN_NOTIFY_CHANGE_DIRECTORY;
+        backend
+            .handle_drive_io_request(
+                ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(
+                    ironrdp_rdpdr::pdu::efs::ServerDriveNotifyChangeDirectoryRequest {
+                        device_io_request: request,
+                        watch_tree: 0,
+                        // FILE_NOTIFY_CHANGE_FILE_NAME
+                        completion_filter: 1,
+                    },
+                ),
+            )
+            .unwrap()
+    }
+
+    /// The deferred completions, once there are some.
+    fn completion(backend: &mut DriveBackend) -> Vec<SvcMessage> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let messages = backend.poll_deferred_messages().unwrap();
+            if !messages.is_empty() {
+                return messages;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no change notification"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A notification asked for on a thread that then exits, as tokio's
+    /// blocking threads do, stays open until the folder changes.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_notification_outlives_the_thread_that_asked_for_it() {
+        use ironrdp_rdpdr::pdu::efs::CreateDisposition;
+
+        let base = std::env::temp_dir().join(format!("molcajete-rdpdr-{}", uuid::Uuid::new_v4()));
+        let drive = crate::files::Drive::open(crate::files::DriveSettings {
+            path: base.clone(),
+            name: "Drive".into(),
+            create: true,
+            policy: crate::files::Policy {
+                download: true,
+                upload: true,
+                max_size: None,
+            },
+        })
+        .await
+        .unwrap();
+        let root = drive.root().to_owned();
+        let mut backend = DriveBackend::new(1, "Drive", &root).unwrap();
+        backend.restore_drive(1).unwrap();
+        let watched = open(&mut backend, "\\", CreateDisposition::FILE_OPEN, true).unwrap();
+
+        let mut backend = std::thread::spawn(move || {
+            assert!(watch(&mut backend, watched).is_empty());
+            backend
+        })
+        .join()
+        .unwrap();
+        // Long enough for Windows to cancel the I/O of the exited thread.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(backend.poll_deferred_messages().unwrap().is_empty());
+
+        std::fs::write(root.join("new.txt"), b"x").unwrap();
+        assert_eq!(status(&completion(&mut backend)), NtStatus::SUCCESS);
+        close(&mut backend, watched);
 
         backend.reset().unwrap();
         drop(backend);
