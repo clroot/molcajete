@@ -49,7 +49,7 @@ import FilesDrawer from './FilesDrawer';
 import {ActiveTransfers} from './TransferList';
 import DropOverlay from './DropOverlay';
 import {useFileDrop} from './useFileDrop';
-import {RECONNECT_DELAYS, resumeId, shouldReconnect} from './resume';
+import {claimResumeId, RECONNECT_DELAYS, shouldReconnect, type ResumeClaim} from './resume';
 
 const styles = stylex.create({
   // The remote screen, and under it the terminal key bar when it shows.
@@ -154,15 +154,26 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
   // Names this page's tunnel for sharing it; a new one for every connect.
   const [pageId, setPageId] = useState(newPageId);
   // Read at every connect, so a reconnect starts with the latest choices.
-  const tunnelParameters = useCallback(() => {
+  // The id the session is resumed by: claimed at the first connect, the
+  // same for every reconnect, and free for another tab once this page leaves.
+  const resumeClaim = useRef<Promise<ResumeClaim | null> | null>(null);
+  useEffect(
+    () => () => {
+      void resumeClaim.current?.then(claim => claim?.release());
+      resumeClaim.current = null;
+    },
+    [connectionId],
+  );
+  const tunnelParameters = useCallback(async () => {
     const page = newPageId();
     setPageId(page);
     // A one-time link is used up: its session cannot be resumed.
-    const resume = ticketId === undefined ? resumeId(connectionId) : null;
+    if (ticketId === undefined) resumeClaim.current ??= claimResumeId(connectionId);
+    const resume = (await resumeClaim.current)?.id;
     return {
       ...tunnelOverrides(readDisplayChoices(connectionId)),
       ...(ticketId === undefined ? {} : {ticket: ticketId}),
-      ...(resume === null ? {} : {resume}),
+      ...(resume === undefined ? {} : {resume}),
       page,
     };
   }, [connectionId, ticketId]);
@@ -445,7 +456,7 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
         onSwitchClient={onSwitchClient ?? null}
         onDisconnect={() => {
           // Ends the session itself: a tunnel that merely closes leaves it
-          // held for this tab to come back.
+          // held for this browser to come back.
           setMenuOpen(false);
           client()?.disconnect();
           if (!isTicket) leave();
