@@ -152,3 +152,16 @@ export const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000, 15000, 15000, 1500
 export function shouldReconnect(code: number): boolean {
   return !ENDED.has(code);
 }
+
+/**
+ * How long to wait before connecting again after a tunnel ended with
+ * `code` (an `interrupted` event), the `attempts`-th time since the session
+ * was last up; undefined to give up. The session need not have been up: a
+ * tunnel that closed on the way, while the gateway restarted or could not
+ * be reached, is worth trying again too. Failures that will not go away
+ * (wrong credentials, no permission) come as an `error` from the server,
+ * which ends the session with no `interrupted`, or with a status in ENDED.
+ */
+export function reconnectDelay(code: number, attempts: number): number | undefined {
+  return shouldReconnect(code) ? RECONNECT_DELAYS[attempts] : undefined;
+}

@@ -1,5 +1,12 @@
 import {describe, expect, test} from 'bun:test';
-import {claimResumeId, shouldReconnect, type ResumeClaim, type ResumeEnv} from './resume';
+import {
+  claimResumeId,
+  RECONNECT_DELAYS,
+  reconnectDelay,
+  shouldReconnect,
+  type ResumeClaim,
+  type ResumeEnv,
+} from './resume';
 
 function storage() {
   const items = new Map<string, string>();
@@ -62,6 +69,15 @@ describe('resume', () => {
     for (const code of [0x0202, 0x0203, 0x0207, 0x0000]) expect(shouldReconnect(code)).toBe(true);
     // Ended by an administrator, access removed, signed out, taken over elsewhere.
     for (const code of [0x020b, 0x0303, 0x0301, 0x0209]) expect(shouldReconnect(code)).toBe(false);
+  });
+
+  test('waits longer at each attempt, then gives up', () => {
+    // UPSTREAM_NOT_FOUND: the gateway was restarting, before or after the session was up.
+    const delays = RECONNECT_DELAYS.map((_, attempt) => reconnectDelay(0x0207, attempt));
+    expect(delays).toEqual(RECONNECT_DELAYS);
+    expect(reconnectDelay(0x0207, RECONNECT_DELAYS.length)).toBeUndefined();
+    // Signed out: not even a first attempt.
+    expect(reconnectDelay(0x0301, 0)).toBeUndefined();
   });
 
   test('a new tab takes the id of a closed one', async () => {

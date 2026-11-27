@@ -49,7 +49,7 @@ import FilesDrawer from './FilesDrawer';
 import {ActiveTransfers} from './TransferList';
 import DropOverlay from './DropOverlay';
 import {useFileDrop} from './useFileDrop';
-import {claimResumeId, RECONNECT_DELAYS, shouldReconnect, type ResumeClaim} from './resume';
+import {claimResumeId, reconnectDelay, type ResumeClaim} from './resume';
 
 const styles = stylex.create({
   // The remote screen, and under it the terminal key bar when it shows.
@@ -126,7 +126,7 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
   // Called for a pinch on the terminal; the client's events arrive in a
   // handler that must not change, so it reaches the current one through this.
   const onZoom = useRef((delta: number) => void delta);
-  // Called when the tunnel of a session that was up drops; set further down.
+  // Called when the tunnel drops, before or after connecting; set further down.
   const onInterrupted = useRef((code: number) => void code);
 
   const onEvent = useCallback(
@@ -227,24 +227,19 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
   });
 
   const isTicket = ticketId !== undefined;
-  // Reconnecting by itself: whether the session was up since the last
-  // time the user asked to connect, the attempts since, and the next one.
-  const wasConnected = useRef(false);
+  // Reconnecting by itself: the attempts since the session was last up or
+  // the user last asked to connect, and the next one.
   const attempts = useRef(0);
   const retryTimer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(retryTimer.current), []);
   useEffect(() => {
-    if (session.status.kind === 'connected') {
-      wasConnected.current = true;
-      attempts.current = 0;
-    }
+    if (session.status.kind === 'connected') attempts.current = 0;
   }, [session.status.kind]);
   useEffect(() => {
     onInterrupted.current = code => {
-      const delay = RECONNECT_DELAYS[attempts.current];
-      if (isTicket || !wasConnected.current) return;
-      if (!shouldReconnect(code) || delay === undefined) {
-        wasConnected.current = false;
+      if (isTicket) return;
+      const delay = reconnectDelay(code, attempts.current);
+      if (delay === undefined) {
         dispatch({type: 'gave-up'});
         return;
       }
@@ -258,7 +253,6 @@ export default function SessionPage({connectionId, ticket, connection, onSwitchC
   const reconnect = () => {
     unlockAudio();
     window.clearTimeout(retryTimer.current);
-    wasConnected.current = false;
     attempts.current = 0;
     dispatch({type: 'reconnecting'});
     connect();
