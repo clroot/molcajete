@@ -67,8 +67,9 @@ struct Cli {
     #[arg(long, env = "MOLCAJETED_RESUME_TIMEOUT_SSH", default_value_t = 300)]
     resume_timeout_ssh: u64,
     /// Sessions kept without a client at once; a session whose client
-    /// leaves while this many are kept ends at once.
-    #[arg(long, env = "MOLCAJETED_RESUME_MAX_DETACHED", default_value_t = 64)]
+    /// leaves while this many are kept ends at once. A held session keeps
+    /// about the memory it had while attached.
+    #[arg(long, env = "MOLCAJETED_RESUME_MAX_DETACHED", default_value_t = 16)]
     resume_max_detached: usize,
     #[command(flatten)]
     telemetry: molcajete_telemetry::TelemetryArgs,

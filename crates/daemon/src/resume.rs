@@ -61,7 +61,7 @@ impl Default for Config {
         Self {
             desktop: Duration::from_secs(120),
             ssh: Duration::from_secs(300),
-            max_detached: 64,
+            max_detached: 16,
         }
     }
 }
