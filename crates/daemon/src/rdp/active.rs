@@ -17,7 +17,6 @@ use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_pdu::rdp::capability_sets::InputFlags;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
-use ironrdp_rdpdr::Rdpdr;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_svc::{ChannelFlags, SvcProcessorMessages};
@@ -38,6 +37,7 @@ use super::graphics::{self, Area, Cursor};
 use super::keyboard::Keyboard;
 use super::mouse::Mouse;
 use super::pacing::FramePacer;
+use super::rdpdr_channel::RdpdrChannel;
 use super::settings::{self, ResizeMethod, Settings};
 use super::slow_path;
 use crate::display::{Display, ImageFormats, Pacing, VIDEO_MODE, VideoMode};
@@ -861,10 +861,10 @@ impl<'a> Session<'a> {
     /// Sends what the drive's backend completed on its own threads: locks
     /// that had to wait, directory change notifications.
     async fn pump_drive(&mut self) -> anyhow::Result<()> {
-        let Some(rdpdr) = self.stage.get_svc_processor_mut::<Rdpdr>() else {
+        let Some(channel) = self.stage.get_svc_processor_mut::<RdpdrChannel>() else {
             return Ok(());
         };
-        let messages = match rdpdr.poll_deferred_messages() {
+        let messages = match channel.rdpdr_mut().poll_deferred_messages() {
             Ok(messages) => messages,
             Err(err) => {
                 warn!(error = %err, "drive completions failed");
@@ -876,7 +876,7 @@ impl<'a> Session<'a> {
         }
         let frame = self
             .stage
-            .process_svc_processor_messages(SvcProcessorMessages::<Rdpdr>::new(messages))?;
+            .process_svc_processor_messages(SvcProcessorMessages::<RdpdrChannel>::new(messages))?;
         self.write_rdp(&frame, WriteCause::Response).await?;
         Ok(())
     }

@@ -27,6 +27,7 @@ use tokio_rustls::client::TlsStream;
 use super::audio::SoundSink;
 use super::clipboard::GuacClipboard;
 use super::gfx::GraphicsChannel;
+use super::rdpdr_channel::RdpdrChannel;
 use super::settings::Settings;
 use super::tls;
 use crate::jump::{Chain, Upstream, UpstreamError};
@@ -219,15 +220,15 @@ fn build_connector(
     // RDPSND once RDPDR has completed its capability exchange, so sound
     // needs it even with no devices to redirect.
     if let Some(drive) = drive {
-        connector = connector.with_static_channel(
+        connector = connector.with_static_channel(RdpdrChannel::new(
             ironrdp_rdpdr::Rdpdr::new(Box::new(drive.backend), "molcajete".to_owned())
                 .with_drives(Some(vec![(DRIVE_DEVICE_ID, drive.name)])),
-        );
+        ));
     } else if sound.is_some() {
-        connector = connector.with_static_channel(ironrdp_rdpdr::Rdpdr::new(
+        connector = connector.with_static_channel(RdpdrChannel::new(ironrdp_rdpdr::Rdpdr::new(
             Box::new(ironrdp_rdpdr::NoopRdpdrBackend),
             "molcajete".to_owned(),
-        ));
+        )));
     }
     match sound {
         Some(sound) => connector.with_static_channel(sound.static_channel()),
@@ -402,7 +403,7 @@ mod tests {
         assert!(
             connector
                 .static_channels
-                .get_by_type::<ironrdp_rdpdr::Rdpdr>()
+                .get_by_type::<RdpdrChannel>()
                 .is_none()
         );
     }
@@ -445,7 +446,7 @@ mod tests {
         assert!(
             connector
                 .static_channels
-                .get_by_type::<ironrdp_rdpdr::Rdpdr>()
+                .get_by_type::<RdpdrChannel>()
                 .is_some()
         );
     }
@@ -479,9 +480,10 @@ mod tests {
         assert!(!connector.config.enable_audio_playback);
         let rdpdr = connector
             .static_channels
-            .get_by_type::<ironrdp_rdpdr::Rdpdr>()
-            .and_then(|channel| channel.channel_processor_downcast_ref::<ironrdp_rdpdr::Rdpdr>())
-            .expect("RDPDR");
+            .get_by_type::<RdpdrChannel>()
+            .and_then(|channel| channel.channel_processor_downcast_ref::<RdpdrChannel>())
+            .expect("RDPDR")
+            .rdpdr();
         assert!(
             rdpdr
                 .downcast_backend::<crate::rdp::drive::DriveBackend>()
