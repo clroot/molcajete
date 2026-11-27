@@ -20,6 +20,7 @@
 pub mod encode;
 mod metrics;
 mod pacing;
+pub mod pointer;
 mod pool;
 mod source;
 mod video;

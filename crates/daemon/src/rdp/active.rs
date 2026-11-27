@@ -227,7 +227,7 @@ impl<'a> Session<'a> {
             u32::from(self.image.height()),
             self.writer.buffer(),
         );
-        self.set_cursor(&Cursor::arrow());
+        self.set_cursor(&Cursor::arrow(self.scale));
         self.update_display_control();
         self.writer.flush().await?;
         if let Some(text) = early.clipboard {
@@ -460,7 +460,7 @@ impl<'a> Session<'a> {
                         self.pacer.graphics_updated(now);
                     }
                 }
-                ActiveStageOutput::PointerDefault => self.set_cursor(&Cursor::arrow()),
+                ActiveStageOutput::PointerDefault => self.set_cursor(&Cursor::arrow(self.scale)),
                 ActiveStageOutput::PointerHidden => self.set_cursor(&Cursor::hidden()),
                 ActiveStageOutput::PointerBitmap(pointer) => match Cursor::from_pointer(&pointer) {
                     Some(cursor) => self.set_cursor(&cursor),

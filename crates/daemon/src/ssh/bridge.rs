@@ -660,10 +660,11 @@ impl Bridge {
             PointerKind::Text => Pointer::ibeam(),
             PointerKind::Arrow => Pointer::arrow(),
             PointerKind::Hand => Pointer::hand(),
-        };
+        }
+        .for_dpi(self.renderer.dpi());
         self.display.set_cursor(
-            p.hotspot.0,
-            p.hotspot.1,
+            p.hotspot_x,
+            p.hotspot_y,
             p.width,
             p.height,
             &p.rgba,
