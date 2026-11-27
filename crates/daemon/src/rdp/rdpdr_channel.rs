@@ -131,3 +131,64 @@ fn utf16_name(data: &[u8]) -> Option<String> {
 fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironrdp_rdpdr::pdu::RdpdrPdu;
+    use ironrdp_rdpdr::pdu::efs::{ClientDeviceListAnnounce, DeviceAnnounceHeader, Devices};
+
+    fn announce(devices: Vec<DeviceAnnounceHeader>) -> Vec<u8> {
+        SvcMessage::from(RdpdrPdu::ClientDeviceListAnnounce(
+            ClientDeviceListAnnounce {
+                device_list: devices,
+            },
+        ))
+        .encode_unframed_pdu()
+        .unwrap()
+    }
+
+    fn drive(device_id: u32, name: &str) -> DeviceAnnounceHeader {
+        let mut devices = Devices::new();
+        devices.add_drive(device_id, name.to_owned());
+        devices.clone_inner().remove(0)
+    }
+
+    #[test]
+    fn a_drive_name_is_written_one_byte_per_character() {
+        let pdu = rewrite_announce(&announce(vec![drive(1, "molcajete")])).unwrap();
+        let expected: Vec<u8> = [
+            &DEVICE_LIST_ANNOUNCE[..],
+            &1u32.to_le_bytes(),
+            &FILESYSTEM.to_le_bytes(),
+            &1u32.to_le_bytes(),
+            b"molcaje\0",
+            &10u32.to_le_bytes(),
+            b"molcajete\0",
+        ]
+        .concat();
+        assert_eq!(pdu, expected);
+    }
+
+    #[test]
+    fn a_name_beyond_ascii_is_written_in_utf8() {
+        let pdu = rewrite_announce(&announce(vec![drive(1, "파일")])).unwrap();
+        assert!(pdu.ends_with(&[&7u32.to_le_bytes()[..], "파일\0".as_bytes()].concat()));
+    }
+
+    #[test]
+    fn other_devices_and_messages_stay_as_they_are() {
+        let smartcard = announce(vec![DeviceAnnounceHeader::new_smartcard(2)]);
+        assert_eq!(rewrite_announce(&smartcard), None);
+        let mixed = rewrite_announce(&announce(vec![
+            DeviceAnnounceHeader::new_smartcard(2),
+            drive(1, "Files"),
+        ]))
+        .unwrap();
+        // The smart card's entry, as it was.
+        assert_eq!(&mixed[8..28], &smartcard[8..28]);
+        assert!(mixed.ends_with(b"Files\0"));
+        assert_eq!(rewrite_announce(b"rDCC\x01\x00\x00\x00"), None);
+        assert_eq!(rewrite_announce(&DEVICE_LIST_ANNOUNCE), None);
+    }
+}
