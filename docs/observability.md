@@ -58,7 +58,7 @@ Latency histograms use buckets from 0.25 ms to 10 s; metrics ending in `_duratio
 | `molcajeted_connections_active` | gauge | protocol | Open connections |
 | `molcajeted_connections_total` | counter | protocol, result | Connections by how they ended: `ok`, `error`, `handshake_failed`, `unsupported` (protocol `unknown` for the last two when the handshake did not get that far). The relay for IronRDP's web client counts as protocol `rdp-relay`, here and in the two metrics around this one |
 | `molcajeted_session_duration_seconds` | histogram | protocol | Session length |
-| `molcajeted_sessions_detached` | gauge | protocol | Sessions held without a client after their tunnel dropped, waiting for the same tab to resume them |
+| `molcajeted_sessions_detached` | gauge | protocol | Sessions held without a client after their tunnel dropped, waiting for the same browser to resume them |
 | `molcajeted_sessions_resumed_total` | counter | protocol, from | Clients that got a held session back: `from="detached"` after a dropped tunnel, `from="attached"` when a client took over a session whose old tunnel was still open |
 | `molcajeted_sessions_expired_total` | counter | protocol | Held sessions ended because nobody came back within the grace period, or because too many were held (`--resume-max-detached`) |
 | `molcajeted_joined_users_active` | gauge | protocol | Users who joined a connection (share links, administrators watching); each also counts in the frame and image metrics, since it gets frames of its own |

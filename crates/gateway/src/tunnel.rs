@@ -74,8 +74,8 @@ pub struct TunnelRequest {
     /// A one-time credential's token (`ironrdp=`): the browser runs
     /// IronRDP's client and molcajeted relays RDP (`crate::ironrdp`).
     pub ironrdp: Option<String>,
-    /// The page's id for this tab and connection (`resume=`): the session
-    /// may be resumed by the next tunnel with the same one
+    /// The page's id for its session of this connection (`resume=`): the
+    /// session may be resumed by the next tunnel with the same one
     /// (`crate::resume`).
     pub resume: Option<String>,
     /// Address of the browser, as seen by the gateway or reported by a

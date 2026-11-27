@@ -59,10 +59,11 @@ Worker**, rendering into an `OffscreenCanvas` with WebGL2:
   touch, and stays above the keyboard; its text size changes during the
   session.
 - **Sessions that survive a reload.** With molcajeted, a session whose
-  tunnel drops (a reload, a short network outage, a restart of the
-  gateway) keeps running for a grace period, 2 minutes for RDP and VNC
-  and 5 for SSH: the page reconnects by itself and the same browser tab
-  gets the same desktop or shell back, without logging on again.
+  tunnel drops (a reload, a tab closed by mistake, a short network
+  outage, a restart of the gateway) keeps running for a grace period,
+  2 minutes for RDP and VNC and 5 for SSH: the page reconnects by itself
+  and the same browser gets the same desktop or shell back, without
+  logging on again.
 - **IronRDP's web client for RDP.** A connection can open its sessions
   with [IronRDP](https://github.com/Devolutions/IronRDP)'s web client
   instead, which runs RDP in the browser while molcajeted only passes the
@@ -161,7 +162,8 @@ as PNG instead of zstd images.
 When the connection drops, the page shows *Reconnecting…* over the last
 picture and connects again by itself; with molcajeted the session is still
 there. *Disconnect* in the menu ends the session for good, while closing
-the tab leaves it to end after the grace period.
+the tab leaves it to end after the grace period; opening the connection
+again in the same browser before that brings it back.
 
 On a device used by finger, a terminal session (SSH, Telnet, Kubernetes)
 shows a bar under the terminal with Esc, Tab, Ctrl, Alt, the arrow keys,

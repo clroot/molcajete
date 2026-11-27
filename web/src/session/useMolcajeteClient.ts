@@ -15,7 +15,7 @@ type Options = {
   displayRef: RefObject<HTMLDivElement | null>;
   connectionId: string;
   /** Extra tunnel URL parameters, read at every connect. */
-  tunnelParameters?: () => Record<string, string>;
+  tunnelParameters?: () => Record<string, string> | Promise<Record<string, string>>;
   /** Send performance reports when the gateway takes them (they need a sign-in). */
   canReport?: boolean;
   onEvent: (event: SessionEvent) => void;
@@ -49,8 +49,12 @@ export function useMolcajeteClient({
     if (reporting && (await reporting.clientReportsEnabled())) {
       reporterRef.current = new reporting.SessionReporter(connectionId, client.mode);
     }
+    // Unmounted meanwhile: the client is freed.
+    if (clientRef.current !== client) return;
+    const parameters = (await tunnelParameters?.()) ?? {};
+    if (clientRef.current !== client) return;
     let url = client.tunnel_url(tunnelBase(), connectionId);
-    for (const [name, value] of Object.entries(tunnelParameters?.() ?? {})) {
+    for (const [name, value] of Object.entries(parameters)) {
       url += `&${encodeURIComponent(name)}=${encodeURIComponent(value)}`;
     }
     if (reporterRef.current) url += `&session=${encodeURIComponent(reporterRef.current.session)}`;

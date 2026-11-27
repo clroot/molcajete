@@ -44,7 +44,7 @@ function SignInGate() {
   }, []);
 
   const signOut = useCallback(async () => {
-    // Sessions this tab could have resumed stay out of reach.
+    // Sessions this browser could have resumed stay out of reach.
     forgetResumeIds();
     const result = await api.logout().catch(() => undefined);
     if (result?.logoutUrl) {

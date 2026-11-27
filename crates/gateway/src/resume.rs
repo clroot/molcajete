@@ -1,14 +1,15 @@
 //! Resume keys: how a tunnel gets back the session molcajeted held after
-//! the previous tunnel of the same browser tab ended
+//! the previous tunnel of the same browser ended
 //! (`molcajete_protocol::resume`).
 //!
-//! The page keeps a random id per tab and connection and sends it as
-//! `resume=<id>`. The gateway keeps nothing: it answers molcajeted's
+//! The page sends a random id as `resume=<id>`: the one its browser used
+//! for the connection before, unless another tab is using it. The gateway
+//! keeps nothing: it answers molcajeted's
 //! `molcajete-resume` with an HMAC of the user, the connection, that id and
 //! the connection's parameters under a key derived from the secret key. The
-//! same tab therefore finds its session again, also after a restart of the
+//! same id therefore finds its session again, also after a restart of the
 //! gateway or on another replica, while a changed connection, another user
-//! or another tab gets a new one, and nobody can make a key without the
+//! or another id gets a new one, and nobody can make a key without the
 //! gateway's.
 //!
 //! Every resume is an ordinary tunnel request: the session cookie, the
