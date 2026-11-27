@@ -2046,9 +2046,15 @@ impl Display {
         self.frame_images = 0;
     }
 
-    #[cfg(test)]
+    /// Whether no client is attached ([`Display::detach`]).
     pub fn is_detached(&self) -> bool {
         self.detached
+    }
+
+    /// Whether users who joined the connection get its frames
+    /// ([`crate::share`]).
+    pub fn has_viewers(&self) -> bool {
+        self.share.as_ref().is_some_and(|share| share.has_viewers())
     }
 
     /// A client attached that has nothing on its screen yet: what it
