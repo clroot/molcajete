@@ -32,14 +32,48 @@ const supportsWorker = () =>
   typeof HTMLCanvasElement.prototype.transferControlToOffscreen === "function" &&
   typeof OffscreenCanvas.prototype.getContext === "function";
 
-/** Builds a CSS cursor value from un-premultiplied RGBA pixels. */
-function cssCursor({ hotspotX, hotspotY, width, height, rgba }) {
+/**
+ * Remote pixels per CSS pixel of a display shown at `scale` CSS pixels per
+ * remote pixel (the `layout` event's), as `cursor::density` of the client.
+ */
+function cursorDensity(scale) {
+  if (!Number.isFinite(scale) || scale <= 0) return 1;
+  const density = 1 / scale;
+  return Math.abs(density - 1) < 0.01 ? 1 : density;
+}
+
+let cursorImageSet;
+/** Whether this browser takes a cursor image with a resolution. */
+function supportsCursorImageSet() {
+  cursorImageSet ??= typeof CSS !== "undefined" && CSS.supports("cursor", "image-set(url(a.png) 2x) 0 0, auto");
+  return cursorImageSet;
+}
+
+/**
+ * Builds a CSS cursor value from un-premultiplied RGBA pixels, `density` of
+ * them per CSS pixel. A browser shows an image that names no resolution at
+ * one image pixel per CSS pixel, which is too large when the display is
+ * drawn finer than that (on a screen with two device pixels per CSS pixel).
+ */
+function cssCursor({ hotspotX, hotspotY, width, height, rgba }, density) {
   if (!width || !height || !rgba.some((v, i) => i % 4 === 3 && v !== 0)) return "none";
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
   canvas.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
-  return `url(${canvas.toDataURL()}) ${hotspotX} ${hotspotY}, auto`;
+  if (density === 1) return `url(${canvas.toDataURL()}) ${hotspotX} ${hotspotY}, auto`;
+  // The hotspot is in CSS pixels, and stays inside the image.
+  const cssWidth = Math.max(1, Math.round(width / density));
+  const cssHeight = Math.max(1, Math.round(height / density));
+  const x = Math.min(Math.round(Math.max(0, hotspotX) / density), cssWidth - 1);
+  const y = Math.min(Math.round(Math.max(0, hotspotY) / density), cssHeight - 1);
+  if (supportsCursorImageSet()) return `image-set(url(${canvas.toDataURL()}) ${density}x) ${x} ${y}, auto`;
+  // Without a resolution the image is shrunk to its size in CSS pixels.
+  const small = document.createElement("canvas");
+  small.width = cssWidth;
+  small.height = cssHeight;
+  small.getContext("2d").drawImage(canvas, 0, 0, cssWidth, cssHeight);
+  return `url(${small.toDataURL()}) ${x} ${y}, auto`;
 }
 
 /** Video mimetypes (molcajete `video` streams) this browser can decode. */
@@ -225,6 +259,9 @@ export class MolcajeteSession {
   /** Pointer whose events are kept from the remote side after it opened a link. */
   #heldPointer = null;
   #playback = false;
+  /** The worker's last `cursor` event, shown again when the display scale changes. */
+  #cursor = null;
+  #cursorDensity = 1;
   #player = null; // main-thread mode
   #files = null; // main-thread mode
   #nextTransfer = 1;
@@ -323,10 +360,16 @@ export class MolcajeteSession {
     if (type === "layout") {
       this.#canvas.style.width = `${detail.width}px`;
       this.#canvas.style.height = `${detail.height}px`;
+      const density = cursorDensity(detail.scale);
+      if (density !== this.#cursorDensity) {
+        this.#cursorDensity = density;
+        if (this.#cursor) this.#canvas.style.cursor = cssCursor(this.#cursor, density);
+      }
       return;
     }
     if (type === "cursor") {
-      this.#canvas.style.cursor = cssCursor(detail);
+      this.#cursor = detail;
+      this.#canvas.style.cursor = cssCursor(detail, this.#cursorDensity);
       return;
     }
     if (this.#onAudio(type, detail)) return;

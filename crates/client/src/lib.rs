@@ -5,6 +5,7 @@
 //! layer lives in GPU memory as a WebGL2 texture. See `docs/architecture.md` for the overall design.
 
 pub mod audio;
+pub mod cursor;
 pub mod display;
 pub mod geom;
 pub mod gl;
