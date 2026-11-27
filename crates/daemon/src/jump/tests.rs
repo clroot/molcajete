@@ -227,9 +227,14 @@ async fn echo_server() -> u16 {
 }
 
 /// A port nothing listens on.
-fn closed_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+/// A port nothing listens on, with the socket that keeps it so: bound but
+/// not listening, so connections to it are refused, and no listener of a
+/// test running at the same time is given the port while it lives.
+fn closed_port() -> (tokio::net::TcpSocket, u16) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    (socket, port)
 }
 
 async fn connect(chain: &Chain, port: u16) -> Result<Upstream, UpstreamError> {
@@ -320,7 +325,7 @@ async fn wrong_password_is_unauthorized() {
 
 #[tokio::test]
 async fn unreachable_hops_and_targets_are_named() {
-    let closed = closed_port();
+    let (_kept, closed) = closed_port();
     let hops = format!("jump@127.0.0.1:{closed}");
     let chain1 = chain(&[("jump-hosts", &hops), ("jump-host-password", "pw")]);
     let err = connect(&chain1, echo_server().await).await.err().unwrap();
