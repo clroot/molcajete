@@ -1103,9 +1103,8 @@ mod tests {
         pdu
     }
 
-    #[test]
-    fn a_frame_end_is_told_from_a_frame_begin() {
-        let mut stage = ActiveStageBuilder {
+    fn stage() -> ActiveStage {
+        ActiveStageBuilder {
             static_channels: StaticChannelSet::new(),
             user_channel_id: 1001,
             io_channel_id: 1003,
@@ -1115,7 +1114,12 @@ mod tests {
             enable_server_pointer: true,
             pointer_software_rendering: false,
         }
-        .build();
+        .build()
+    }
+
+    #[test]
+    fn a_frame_end_is_told_from_a_frame_begin() {
+        let mut stage = stage();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 64, 64);
         let mut process = |pdu: &[u8]| {
             let outputs = stage
@@ -1126,5 +1130,25 @@ mod tests {
         assert!(!process(&frame_marker(false, 7)));
         assert!(process(&frame_marker(true, 7)));
         assert!(!process(&frame_marker(false, 8)));
+    }
+
+    #[test]
+    fn display_updates_are_suppressed_and_allowed_for_the_whole_desktop() {
+        // The PDU ends the frame, after the Share Data Header's pduType2
+        // (Suppress Output) and its compression fields.
+        let suppress_output_pdu = |frame: &[u8], pdu: &[u8]| {
+            frame.ends_with(pdu) && frame[frame.len() - pdu.len() - 4] == 0x23
+        };
+        let stage = stage();
+        // allowDisplayUpdates off and its padding, without a rectangle.
+        let suppress = suppress_output(&stage, None).expect("encoded");
+        assert!(suppress_output_pdu(&suppress, &[0, 0, 0, 0]));
+        // On, for the inclusive rectangle of the whole desktop.
+        let allow = suppress_output(&stage, Some((3840, 2160))).expect("encoded");
+        let mut pdu = vec![1, 0, 0, 0];
+        for value in [0u16, 0, 3839, 2159] {
+            pdu.extend_from_slice(&value.to_le_bytes());
+        }
+        assert!(suppress_output_pdu(&allow, &pdu));
     }
 }
