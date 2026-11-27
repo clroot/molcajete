@@ -286,6 +286,7 @@ async fn a_slow_user_does_not_hold_up_the_owner() {
         display.flush(&mut Output::text());
 
         // A user joins and never reads what it is sent, nor acknowledges.
+        let joined = StdInstant::now();
         let mut peer = Peer::join("$slow", true).await;
         let wake = next_input(&mut inputs).await.expect("woken");
         assert_eq!((wake.opcode.as_str(), wake.from_viewer), ("sync", true));
@@ -318,14 +319,23 @@ async fn a_slow_user_does_not_hold_up_the_owner() {
             .expect("the owner is not held up");
 
         // The user got as many frames as its own window allows, the first
-        // one (the whole screen) included.
+        // one (the whole screen) included, and one more for each keep-alive
+        // that passed meanwhile, which sends a user that stopped
+        // acknowledging a frame anyway. On a busy machine the test can take
+        // longer than one.
         let mut syncs = 0;
         while let Some(ins) = peer.next().await {
             if ins.opcode == "sync" {
                 syncs += 1;
             }
         }
-        assert_eq!(syncs, MAX_UNACKED_FRAMES + 1);
+        let keepalives =
+            u32::try_from(joined.elapsed().as_millis() / KEEPALIVE.as_millis()).unwrap();
+        let window = MAX_UNACKED_FRAMES + 1;
+        assert!(
+            (window..=window + keepalives).contains(&syncs),
+            "{syncs} frames, {keepalives} keep-alives"
+        );
     });
     owner_task.await;
 }
