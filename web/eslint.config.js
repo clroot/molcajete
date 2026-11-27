@@ -7,7 +7,7 @@ import globals from 'globals';
 
 export default tseslint.config(
   // public/ is the wasm client glue, served as-is; astryx-themes.js is generated.
-  {ignores: ['dist', 'public', 'src/astryx-themes.js']},
+  {ignores: ['dist', 'public', 'vendor', 'src/astryx-themes.js']},
   {
     files: ['**/*.{ts,tsx}'],
     extends: [js.configs.recommended, ...tseslint.configs.recommended, reactHooks.configs.flat.recommended],
