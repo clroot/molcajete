@@ -471,6 +471,136 @@ mod tests {
         assert!(!kb.any_pressed());
     }
 
+    const CTRL: Option<Modifiers> = Some(Modifiers(Modifiers::CTRL));
+    const NONE: Option<Modifiers> = Some(Modifiers(0));
+
+    #[test]
+    fn stray_modifier_release_is_undone_by_the_next_key() {
+        // The keys of a recorded iPad session: Ctrl went up while held.
+        let mut kb = Keyboard::default();
+        assert_eq!(
+            kb.key_down("Control", "ControlLeft", 1, false, false, CTRL),
+            Some(vec![(keysym::CONTROL_L, true)])
+        );
+        assert_eq!(
+            kb.key_down("d", "KeyD", 0, false, false, CTRL),
+            Some(vec![('d' as u32, true)])
+        );
+        assert_eq!(
+            kb.key_up("d", "KeyD", 0, false, CTRL),
+            vec![('d' as u32, false)]
+        );
+        assert_eq!(
+            kb.key_up("Control", "ControlLeft", 1, false, NONE),
+            vec![(keysym::CONTROL_L, false)]
+        );
+        // The next key still reports Ctrl, so Ctrl goes down again first.
+        assert_eq!(
+            kb.key_down("d", "KeyD", 0, false, false, CTRL),
+            Some(vec![(keysym::CONTROL_L, true), ('d' as u32, true)])
+        );
+        assert_eq!(
+            kb.key_up("d", "KeyD", 0, false, CTRL),
+            vec![('d' as u32, false)]
+        );
+        // The real release lets it go.
+        assert_eq!(
+            kb.key_up("Control", "ControlLeft", 1, false, NONE),
+            vec![(keysym::CONTROL_L, false)]
+        );
+        assert!(!kb.any_pressed());
+    }
+
+    #[test]
+    fn lost_modifier_release_is_made_up_by_the_next_key() {
+        let mut kb = Keyboard::default();
+        kb.key_down("Control", "ControlRight", 2, false, false, CTRL);
+        kb.key_down(
+            "Shift",
+            "ShiftLeft",
+            1,
+            false,
+            false,
+            Some(Modifiers(Modifiers::CTRL | Modifiers::SHIFT)),
+        );
+        // Neither `keyup` came (the page lost focus meanwhile, say).
+        assert_eq!(
+            kb.key_down("a", "KeyA", 0, false, false, NONE),
+            Some(vec![
+                (keysym::CONTROL_R, false),
+                (keysym::SHIFT_L, false),
+                ('a' as u32, true)
+            ])
+        );
+        assert_eq!(
+            kb.key_up("a", "KeyA", 0, false, NONE),
+            vec![('a' as u32, false)]
+        );
+        assert!(!kb.any_pressed());
+    }
+
+    #[test]
+    fn a_modifier_key_is_not_synced_against_its_own_flag() {
+        let mut kb = Keyboard::default();
+        // `keydown` of Shift reports Shift, its `keyup` does not.
+        let shift = Some(Modifiers(Modifiers::SHIFT));
+        assert_eq!(
+            kb.key_down("Shift", "ShiftLeft", 1, false, false, shift),
+            Some(vec![(keysym::SHIFT_L, true)])
+        );
+        assert_eq!(
+            kb.key_up("Shift", "ShiftLeft", 1, false, NONE),
+            vec![(keysym::SHIFT_L, false)]
+        );
+        // A Meta press reported only by the flags is pressed once.
+        let meta = Some(Modifiers(Modifiers::META));
+        assert_eq!(
+            kb.key_down("c", "KeyC", 0, false, false, meta),
+            Some(vec![(keysym::SUPER_L, true), ('c' as u32, true)])
+        );
+        assert_eq!(
+            kb.key_up("c", "KeyC", 0, false, meta),
+            vec![('c' as u32, false)]
+        );
+        assert_eq!(
+            kb.key_up("Meta", "MetaLeft", 1, false, NONE),
+            vec![(keysym::SUPER_L, false)]
+        );
+        assert!(!kb.any_pressed());
+    }
+
+    #[test]
+    fn alt_graph_leaves_ctrl_and_alt_alone() {
+        // Windows reports AltGr as Ctrl and Alt down.
+        let mut kb = Keyboard::default();
+        let alt_gr = Some(Modifiers(
+            Modifiers::CTRL | Modifiers::ALT | Modifiers::ALT_GRAPH,
+        ));
+        kb.key_down("Control", "ControlLeft", 1, false, false, alt_gr);
+        assert_eq!(
+            kb.key_down("AltGraph", "AltRight", 2, false, false, alt_gr),
+            Some(vec![(0xFE03, true)])
+        );
+        assert_eq!(
+            kb.key_down("@", "KeyQ", 0, false, false, alt_gr),
+            Some(vec![('@' as u32, true)])
+        );
+    }
+
+    #[test]
+    fn caps_lock_toggle_syncs_modifiers_too() {
+        let mut kb = remote(true);
+        kb.key_down("Control", "ControlLeft", 1, false, false, CTRL);
+        assert_eq!(
+            kb.key_down("CapsLock", "CapsLock", 0, false, false, NONE),
+            Some(vec![
+                (keysym::CONTROL_L, false),
+                (keysym::HANGUL, true),
+                (keysym::HANGUL, false)
+            ])
+        );
+    }
+
     #[test]
     fn held_modifier_is_released_after_one_key() {
         let mut held = HeldModifiers::default();
