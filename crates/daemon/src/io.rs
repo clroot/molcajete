@@ -169,6 +169,36 @@ impl std::fmt::Display for Output {
     }
 }
 
+/// A write to the client's socket failed: the client (the gateway, the
+/// browser behind it) went away, which ends a session the ordinary way
+/// rather than as a failure. Wrapped in the [`std::io::Error`] the writer
+/// returns, with the same kind; see [`is_client_gone`].
+#[derive(Debug)]
+pub struct ClientGone(std::io::Error);
+
+impl std::fmt::Display for ClientGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the client went away: {}", self.0)
+    }
+}
+
+impl std::error::Error for ClientGone {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Whether `err` comes from a write to a client that went away.
+pub fn is_client_gone(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.is::<ClientGone>()
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .is_some_and(|inner| inner.is::<ClientGone>())
+    })
+}
+
 /// Accumulates encoded instructions and writes them in one go.
 ///
 /// The writer of a session that may outlive its client
@@ -285,7 +315,7 @@ impl<W: AsyncWrite + Unpin> GuacWriter<W> {
                 self.detach();
                 Ok(())
             }
-            Err(err) => Err(err),
+            Err(err) => Err(std::io::Error::new(err.kind(), ClientGone(err))),
         }
     }
 }
