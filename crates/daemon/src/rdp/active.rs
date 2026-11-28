@@ -13,10 +13,12 @@ use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp_dvc::DrdynvcClient;
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_pdu::Action;
+use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_pdu::rdp::capability_sets::InputFlags;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
+use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_svc::{ChannelFlags, SvcProcessorMessages};
@@ -92,6 +94,9 @@ pub struct Session<'a> {
     fastpath_input: bool,
     refresh_rect_support: bool,
     suppress_output_support: bool,
+    /// Whether the server was asked to stop sending graphics
+    /// ([`Session::update_display_suppression`]).
+    updates_suppressed: bool,
     resize: Option<PendingResize>,
     /// Starts as the connection's `resize-method`; the client can change it
     /// (`argv`).
@@ -176,6 +181,7 @@ impl<'a> Session<'a> {
             fastpath_input: supports_fastpath(result.input_flags),
             refresh_rect_support: result.refresh_rect_support,
             suppress_output_support: result.suppress_output_support,
+            updates_suppressed: false,
             resize: None,
             resize_method: settings.resize_method,
             dpi: settings.dpi,
@@ -323,6 +329,8 @@ impl<'a> Session<'a> {
                 }
                 _ = keepalive.tick() => {
                     self.update_display_control();
+                    // The last user who joined may have left.
+                    self.update_display_suppression().await?;
                     // A stalled client must not hold back changes forever.
                     if self.pacer.is_dirty() {
                         self.send_frame().await?;
@@ -655,6 +663,10 @@ impl<'a> Session<'a> {
                         .set_unicode_support(input_flags.contains(InputFlags::UNICODE));
                     self.refresh_rect_support = refresh_rect_support;
                     self.suppress_output_support = suppress_output_support;
+                    // What was asked of the previous activation does not
+                    // carry over.
+                    self.updates_suppressed = false;
+                    self.update_display_suppression().await?;
                     return Ok(Flow::Continue);
                 }
                 ConnectionActivationState::Redirected { .. } => {
@@ -724,7 +736,11 @@ impl<'a> Session<'a> {
             ClientEvent::Sync {
                 timestamp,
                 received,
-            } => self.display.ack(timestamp, received),
+            } => {
+                self.display.ack(timestamp, received);
+                // A user who joins wakes the session this way.
+                self.update_display_suppression().await?;
+            }
             ClientEvent::File(event) => {
                 if let Some(files) = &mut self.files {
                     files.event(event, self.writer.buffer());
@@ -740,15 +756,15 @@ impl<'a> Session<'a> {
             }
             ClientEvent::Disconnect => return Ok(Flow::End),
             ClientEvent::Detached => self.client_detached().await?,
-            ClientEvent::Attached(attach) => self.client_attached(&attach).await,
+            ClientEvent::Attached(attach) => self.client_attached(&attach).await?,
             _ => {}
         }
         Ok(Flow::Continue)
     }
 
     /// The client went away and the session is held for another
-    /// ([`crate::resume`]): what it held down is let go of, and nothing
-    /// more is encoded for it.
+    /// ([`crate::resume`]): what it held down is let go of, the server
+    /// stops sending graphics, and nothing more is encoded for it.
     async fn client_detached(&mut self) -> anyhow::Result<()> {
         if !self.settings.read_only {
             let mut events: Vec<FastPathInputEvent> = self.keyboard.release_all();
@@ -761,6 +777,7 @@ impl<'a> Session<'a> {
             self.send_input(events).await?;
         }
         self.display.detach();
+        self.update_display_suppression().await?;
         if let Some(audio) = &mut self.audio {
             audio.detach();
         }
@@ -771,11 +788,32 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Asks the server to stop sending graphics while nobody looks at the
+    /// desktop (no client attached and no user joined), and to send them
+    /// again once somebody does. A held session would otherwise decode
+    /// every frame of a changing desktop, the graphics pipeline's
+    /// included, for nobody. The server repaints the whole desktop when
+    /// updates are allowed again, which replaces what changed meanwhile.
+    /// A server that does not support it keeps sending, and the display
+    /// keeps its framebuffer current.
+    async fn update_display_suppression(&mut self) -> anyhow::Result<()> {
+        let suppress = self.display.is_detached() && !self.display.has_viewers();
+        if !self.suppress_output_support || suppress == self.updates_suppressed {
+            return Ok(());
+        }
+        let allow = (!suppress).then(|| (self.image.width(), self.image.height()));
+        let frame = suppress_output(&self.stage, allow)?;
+        self.write_rdp(&frame, WriteCause::Other).await?;
+        self.updates_suppressed = suppress;
+        info!(suppressed = suppress, "RDP display updates");
+        Ok(())
+    }
+
     /// A client attached: it gets everything a new one would, then the
     /// whole screen, and the desktop follows its size and DPI.
-    async fn client_attached(&mut self, attach: &crate::resume::Attach) {
+    async fn client_attached(&mut self, attach: &crate::resume::Attach) -> anyhow::Result<()> {
         if !crate::resume::take_over(self.writer, attach).await {
-            return;
+            return Ok(());
         }
         let info = attach.info();
         let out = self.writer.buffer();
@@ -798,6 +836,7 @@ impl<'a> Session<'a> {
             self.request_scale(info.dpi);
         }
         self.request_resize(info.width, info.height);
+        self.update_display_suppression().await
     }
 
     async fn send_input(&mut self, events: Vec<FastPathInputEvent>) -> anyhow::Result<()> {
@@ -1008,6 +1047,23 @@ fn ends_server_frame(action: Action, outputs: &[ActiveStageOutput]) -> bool {
             .any(|o| matches!(o, ActiveStageOutput::ResponseFrame(frame) if !frame.is_empty()))
 }
 
+/// A Suppress Output PDU: `None` stops the server's display updates,
+/// `Some((width, height))` lets them through again for the whole desktop.
+fn suppress_output(stage: &ActiveStage, allow: Option<(u16, u16)>) -> anyhow::Result<Vec<u8>> {
+    let desktop_rect = allow.map(|(width, height)| InclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: width.saturating_sub(1),
+        bottom: height.saturating_sub(1),
+    });
+    let mut buf = WriteBuf::new();
+    stage.encode_static(
+        &mut buf,
+        ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect }),
+    )?;
+    Ok(buf.into_inner())
+}
+
 fn millis(duration: Duration) -> f64 {
     (duration.as_secs_f64() * 10_000.0).round() / 10.0
 }
@@ -1047,9 +1103,8 @@ mod tests {
         pdu
     }
 
-    #[test]
-    fn a_frame_end_is_told_from_a_frame_begin() {
-        let mut stage = ActiveStageBuilder {
+    fn stage() -> ActiveStage {
+        ActiveStageBuilder {
             static_channels: StaticChannelSet::new(),
             user_channel_id: 1001,
             io_channel_id: 1003,
@@ -1059,7 +1114,12 @@ mod tests {
             enable_server_pointer: true,
             pointer_software_rendering: false,
         }
-        .build();
+        .build()
+    }
+
+    #[test]
+    fn a_frame_end_is_told_from_a_frame_begin() {
+        let mut stage = stage();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 64, 64);
         let mut process = |pdu: &[u8]| {
             let outputs = stage
@@ -1070,5 +1130,25 @@ mod tests {
         assert!(!process(&frame_marker(false, 7)));
         assert!(process(&frame_marker(true, 7)));
         assert!(!process(&frame_marker(false, 8)));
+    }
+
+    #[test]
+    fn display_updates_are_suppressed_and_allowed_for_the_whole_desktop() {
+        // The PDU ends the frame, after the Share Data Header's pduType2
+        // (Suppress Output) and its compression fields.
+        let suppress_output_pdu = |frame: &[u8], pdu: &[u8]| {
+            frame.ends_with(pdu) && frame[frame.len() - pdu.len() - 4] == 0x23
+        };
+        let stage = stage();
+        // allowDisplayUpdates off and its padding, without a rectangle.
+        let suppress = suppress_output(&stage, None).expect("encoded");
+        assert!(suppress_output_pdu(&suppress, &[0, 0, 0, 0]));
+        // On, for the inclusive rectangle of the whole desktop.
+        let allow = suppress_output(&stage, Some((3840, 2160))).expect("encoded");
+        let mut pdu = vec![1, 0, 0, 0];
+        for value in [0u16, 0, 3839, 2159] {
+            pdu.extend_from_slice(&value.to_le_bytes());
+        }
+        assert!(suppress_output_pdu(&allow, &pdu));
     }
 }

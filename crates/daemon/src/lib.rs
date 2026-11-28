@@ -225,6 +225,7 @@ async fn session(
     drop(held);
     drop(owner);
     active.decrement(1.0);
+    trim_heap();
     let duration = started.elapsed();
     metrics::histogram!("molcajeted_session_duration_seconds", "protocol" => protocol)
         .record(duration);
@@ -272,4 +273,24 @@ async fn attach(
     }
     .instrument(span)
     .await;
+}
+
+/// Hands memory that malloc keeps after it was freed back to the system.
+///
+/// glibc keeps freed memory in its arenas for later allocations, one arena
+/// per thread that allocated, and a session's frames leave a lot there: a
+/// daemon whose 3840×2160 RDP session had ended still had 190 MB resident
+/// instead of 14 MB (GH-163). Called when a client detaches and when a
+/// session ends; it takes a few milliseconds.
+pub(crate) fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        let started = std::time::Instant::now();
+        // SAFETY: malloc_trim has no preconditions.
+        unsafe { malloc_trim(0) };
+        tracing::debug!(elapsed = ?started.elapsed(), "heap trimmed");
+    }
 }

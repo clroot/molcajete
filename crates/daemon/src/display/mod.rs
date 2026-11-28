@@ -237,7 +237,8 @@ pub struct Display {
     height: u32,
     /// Remote framebuffer (RGBA, top row first).
     pixels: Vec<u8>,
-    /// What the client shows (mirror of its default layer).
+    /// What the client shows (mirror of its default layer). Empty while
+    /// detached: the next client starts from a blank layer.
     sent: Vec<u8>,
     tile_cols: u32,
     tile_rows: u32,
@@ -757,7 +758,9 @@ impl Display {
             buf
         };
         self.pixels = resized(&self.pixels, self.width, self.height);
-        self.sent = resized(&self.sent, self.width, self.height);
+        if !self.detached {
+            self.sent = resized(&self.sent, self.width, self.height);
+        }
         self.width = width;
         self.height = height;
         self.tile_cols = width.div_ceil(TILE);
@@ -925,7 +928,9 @@ impl Display {
             return FlushStats::default();
         }
         let src = Rect::new(sx, sy, dst.w, dst.h);
-        self.emit_copy(&src, dst.x, dst.y, out);
+        if !self.detached {
+            self.emit_copy(&src, dst.x, dst.y, out);
+        }
         copy_rect(&mut self.pixels, self.width, &src, dst.x, dst.y);
 
         // The destination is always re-compared: pending changes may have
@@ -2034,7 +2039,9 @@ impl Display {
     /// The client went away ([`crate::resume`]): changes from the remote
     /// side still go into the framebuffer, but no frame is encoded or
     /// counted until [`Display::attach`]. The video stream ends (silently:
-    /// nobody plays it).
+    /// nobody plays it). The mirror of the client is let go of, since the
+    /// next client starts from a blank layer, and so is what the client's
+    /// frames left behind in the allocator ([`crate::trim_heap`]).
     pub fn detach(&mut self) {
         if self.detached {
             return;
@@ -2044,11 +2051,19 @@ impl Display {
         self.clock = FrameClock::new(self.clock.pacing());
         self.frame_bytes = 0;
         self.frame_images = 0;
+        self.sent = Vec::new();
+        crate::trim_heap();
     }
 
-    #[cfg(test)]
+    /// Whether no client is attached ([`Display::detach`]).
     pub fn is_detached(&self) -> bool {
         self.detached
+    }
+
+    /// Whether users who joined the connection get its frames
+    /// ([`crate::share`]).
+    pub fn has_viewers(&self) -> bool {
+        self.share.as_ref().is_some_and(|share| share.has_viewers())
     }
 
     /// A client attached that has nothing on its screen yet: what it
@@ -2065,7 +2080,7 @@ impl Display {
         self.clock = FrameClock::new(self.clock.pacing());
         self.last_sync = None;
         // A new layer is transparent black, as the mirror of a new display.
-        self.sent.iter_mut().for_each(|b| *b = 0);
+        self.sent = vec![0; self.pixels.len()];
         self.dirty.iter_mut().for_each(|d| *d = true);
         self.lossy.iter_mut().for_each(|l| *l = false);
         self.heat.iter_mut().for_each(|h| *h = 0.0);
