@@ -512,7 +512,7 @@ async fn request_update(
 
 #[cfg(test)]
 mod tests {
-    use super::Settings;
+    use super::{Ask, Requests, Settings};
 
     fn settings(read_only: bool, disable_paste: bool) -> Settings {
         Settings {
@@ -528,5 +528,35 @@ mod tests {
         assert!(settings(false, false).accepts_paste());
         assert!(!settings(false, true).accepts_paste());
         assert!(!settings(true, false).accepts_paste());
+    }
+
+    #[test]
+    fn updates_follow_the_client() {
+        let mut requests = Requests::default();
+        assert_eq!(requests.update_ended(true, true), Some(Ask::Changes));
+        // Too far behind: owed until the client catches up.
+        assert_eq!(requests.update_ended(true, false), None);
+        assert_eq!(requests.retry(true, false), None);
+        assert_eq!(requests.retry(true, true), Some(Ask::Changes));
+        assert_eq!(requests.retry(true, true), None, "asked once");
+    }
+
+    #[test]
+    fn nobody_looking_stops_updates_until_the_whole_screen_is_asked_for() {
+        let mut requests = Requests::default();
+        assert_eq!(requests.update_ended(false, true), None);
+        // The keep-alive while nobody looks.
+        assert_eq!(requests.retry(false, true), None);
+        // A client attaches or a user joins.
+        assert_eq!(requests.retry(true, true), Some(Ask::Whole));
+        assert_eq!(requests.update_ended(true, true), Some(Ask::Changes));
+    }
+
+    #[test]
+    fn a_request_owed_when_the_client_leaves_waits_for_the_next() {
+        let mut requests = Requests::default();
+        assert_eq!(requests.update_ended(true, false), None);
+        assert_eq!(requests.retry(false, true), None);
+        assert_eq!(requests.retry(true, true), Some(Ask::Whole));
     }
 }
