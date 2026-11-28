@@ -206,7 +206,7 @@ async fn run_session(
             }
         }
     });
-    let mut want_update = false;
+    let mut requests = Requests::default();
     let mut frame_pending = false;
     // What the client holds down, to let go of when it goes away.
     let mut held = Held::default();
@@ -267,11 +267,11 @@ async fn run_session(
                         } else {
                             frame_timer.as_mut().reset(due.into());
                         }
-                        if display.unacked_frames() <= MAX_UNACKED_FRAMES {
-                            request_update(&mut rfb_writer, &display).await?;
-                        } else {
-                            want_update = true;
-                        }
+                        let ask = requests.update_ended(
+                            looked_at(&display),
+                            display.unacked_frames() <= MAX_UNACKED_FRAMES,
+                        );
+                        request_update(&mut rfb_writer, &display, ask).await?;
                     }
                     rfb::RfbEvent::Bell => {}
                     rfb::RfbEvent::ClipboardText(text) => {
@@ -317,10 +317,12 @@ async fn run_session(
                         if frame_pending {
                             frame_timer.as_mut().reset(display.next_frame_at().into());
                         }
-                        if want_update && display.unacked_frames() <= MAX_UNACKED_FRAMES {
-                            want_update = false;
-                            request_update(&mut rfb_writer, &display).await?;
-                        }
+                        // A user who joins wakes the session this way too.
+                        let ask = requests.retry(
+                            looked_at(&display),
+                            display.unacked_frames() <= MAX_UNACKED_FRAMES,
+                        );
+                        request_update(&mut rfb_writer, &display, ask).await?;
                     }
                     Some(ClientEvent::Clipboard(text)) if settings.accepts_paste() => {
                         rfb_writer.cut_text(&text).await?;
@@ -353,6 +355,8 @@ async fn run_session(
                         }
                         frame_pending = true;
                         frame_timer.as_mut().reset(tokio::time::Instant::now());
+                        let ask = requests.retry(looked_at(&display), true);
+                        request_update(&mut rfb_writer, &display, ask).await?;
                     }
                     _ => {}
                 }
@@ -369,10 +373,8 @@ async fn run_session(
             }
             _ = keepalive.tick() => {
                 // A stalled client must not stall the session forever.
-                if want_update {
-                    want_update = false;
-                    request_update(&mut rfb_writer, &display).await?;
-                }
+                let ask = requests.retry(looked_at(&display), true);
+                request_update(&mut rfb_writer, &display, ask).await?;
                 writer.push("3.nop;");
                 writer.flush().await?;
             }
@@ -413,13 +415,93 @@ async fn send_frame(display: &mut Display, writer: &mut GuacWriter) -> std::io::
     Ok(())
 }
 
+/// Whether anybody sees the screen: a client attached or a user who joined.
+fn looked_at(display: &Display) -> bool {
+    !display.is_detached() || display.has_viewers()
+}
+
+/// What to ask the server for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// What changed since the last update.
+    Changes,
+    /// The whole screen: what the session has is out of date.
+    Whole,
+}
+
+/// When the session asks the server for the next update.
+///
+/// After an update it asks at once, unless the client is too far behind
+/// (the request is owed until it catches up) or nobody sees the screen. A
+/// held session nobody looks at does not ask at all, so the server sends
+/// nothing and nothing is decoded for nobody (GH-176); once somebody looks
+/// again it asks for the whole screen, since the framebuffer missed what
+/// changed meanwhile.
+#[derive(Debug, Default)]
+struct Requests {
+    /// A request held back until the client catches up.
+    owed: bool,
+    /// Requests stopped while nobody looked.
+    paused: bool,
+}
+
+impl Requests {
+    /// The server ended an update. `may_send`: the client is not too far
+    /// behind.
+    fn update_ended(&mut self, looked_at: bool, may_send: bool) -> Option<Ask> {
+        if !looked_at {
+            self.pause();
+            None
+        } else if may_send {
+            Some(Ask::Changes)
+        } else {
+            self.owed = true;
+            None
+        }
+    }
+
+    /// The client caught up or attached, a user joined, or the keep-alive
+    /// ticked: what was held back, if it may go now.
+    fn retry(&mut self, looked_at: bool, may_send: bool) -> Option<Ask> {
+        if !(self.owed || self.paused) {
+            return None;
+        }
+        if !looked_at {
+            self.pause();
+            return None;
+        }
+        if !may_send {
+            return None;
+        }
+        self.owed = false;
+        if std::mem::take(&mut self.paused) {
+            info!(paused = false, "VNC screen updates");
+            Some(Ask::Whole)
+        } else {
+            Some(Ask::Changes)
+        }
+    }
+
+    fn pause(&mut self) {
+        self.owed = false;
+        if !self.paused {
+            self.paused = true;
+            info!(paused = true, "VNC screen updates");
+        }
+    }
+}
+
 async fn request_update(
     writer: &mut rfb::RfbWriter,
     display: &Display,
+    ask: Option<Ask>,
 ) -> Result<(), rfb::RfbError> {
+    let Some(ask) = ask else {
+        return Ok(());
+    };
     writer
         .request_update(
-            true,
+            ask == Ask::Changes,
             0,
             0,
             display.width().min(u16::MAX as u32) as u16,
