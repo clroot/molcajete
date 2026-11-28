@@ -2040,7 +2040,8 @@ impl Display {
     /// side still go into the framebuffer, but no frame is encoded or
     /// counted until [`Display::attach`]. The video stream ends (silently:
     /// nobody plays it). The mirror of the client is let go of, since the
-    /// next client starts from a blank layer.
+    /// next client starts from a blank layer, and so is what the client's
+    /// frames left behind in the allocator ([`crate::trim_heap`]).
     pub fn detach(&mut self) {
         if self.detached {
             return;
@@ -2051,6 +2052,7 @@ impl Display {
         self.frame_bytes = 0;
         self.frame_images = 0;
         self.sent = Vec::new();
+        crate::trim_heap();
     }
 
     /// Whether no client is attached ([`Display::detach`]).
