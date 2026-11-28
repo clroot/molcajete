@@ -1073,3 +1073,37 @@ fn an_attached_client_gets_the_whole_screen() {
     );
     assert_eq!(display.unacked_frames(), 1);
 }
+
+/// A held display keeps no mirror of a client (GH-163), and copies and
+/// size changes of the remote side still reach the next client.
+#[test]
+fn a_held_display_keeps_no_mirror_of_its_client() {
+    let mut display = Display::new(ImageFormats::default(), true);
+    let mut out = Output::text();
+    display.resize(200, 120, &mut out);
+    let pattern: Vec<u8> = (0..200 * 120)
+        .flat_map(|i: u32| [(i % 251) as u8, (i % 7) as u8 * 31, (i / 200) as u8, 255])
+        .collect();
+    display.put(0, 0, 200, 120, &pattern);
+    display.flush(&mut out);
+    assert_eq!(display.sent.len(), 200 * 120 * 4);
+
+    display.detach();
+    assert!(display.sent.is_empty());
+    out.clear();
+    display.copy(0, 0, 100, 60, 80, 40, &mut out);
+    display.resize(240, 140, &mut out);
+    display.put(220, 0, 20, 20, &[200, 40, 90, 255].repeat(20 * 20));
+    display.copy(220, 0, 0, 120, 20, 20, &mut out);
+    display.flush(&mut out);
+    assert!(display.sent.is_empty());
+
+    let mut client = Client::new();
+    out.clear();
+    display.attach(ImageFormats::default(), &mut out);
+    display.flush(&mut out);
+    display.sync(&mut out);
+    client.apply(&out);
+    assert_eq!((client.width, client.height), (240, 140));
+    assert_eq!(client.pixels, display.pixels);
+}
